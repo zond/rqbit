@@ -1958,16 +1958,29 @@ mod unadvertised_tests {
         assert!(ct.is_finished());
     }
 
-    // The spare bits past the last piece must stay zero (BEP-3): peers drop a connection
-    // over a bitfield with them set. Masking can only clear bits, but assert it.
+    // What goes on the wire, byte for byte: the have-bytes with the held-back bits
+    // cleared, most significant bit first as BEP-3 has it, the same length, and the four
+    // spare bits past the last piece still zero - peers drop a connection over those.
+    //
+    // Written out rather than derived from the have-bytes: an expected value computed the
+    // way the implementation computes it asserts nothing, and masking a source whose
+    // spare bits are already zero cannot produce nonzero ones, so asking only about them
+    // asserts nothing either.
     #[test]
-    fn test_advertised_bitfield_keeps_its_spare_bits_zero() {
+    fn test_advertised_bitfield_is_the_have_bytes_minus_the_held_back_bits() {
         let (l, mut ct) = seeding_tracker();
-        ct.set_pieces_advertised(pieces(&l, 0..1), false);
-        let bytes = ct.advertised_pieces_bytes().into_owned();
-        assert_eq!(bytes.len(), 2);
-        // 12 pieces: the low 4 bits of the second byte are spare.
-        assert_eq!(bytes[1] & 0x0f, 0);
+        // The first piece and the last two: both bytes lose bits, and the bits that go in
+        // the second one are the ones next to the spare bits.
+        assert_eq!(ct.set_pieces_advertised(pieces(&l, 0..1), false), 1);
+        assert_eq!(ct.set_pieces_advertised(pieces(&l, 10..12), false), 2);
+
+        // 12 pieces in 2 bytes, all of them have: 0..7 then 8..11 and four spare.
+        assert_eq!(ct.get_have_pieces().as_bytes(), [0b1111_1111, 0b1111_0000]);
+        // Announced: pieces 1..10.
+        assert_eq!(
+            ct.advertised_pieces_bytes().as_ref(),
+            [0b0111_1111, 0b1100_0000]
+        );
     }
 
     // A moving playback window: advertise what the playhead left, hold back what it
