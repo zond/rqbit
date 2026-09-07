@@ -119,7 +119,7 @@ anyhow.workspace = true
 
 [dev-dependencies]
 # So that "cargo test" builds the example storages: the piece-reclaim test drives one.
-librqbit = { path = ".", features = ["storage_examples"] }
+librqbit = { path = ".", default-features = false, features = ["storage_examples"] }
 tracing-subscriber = { workspace = true, features = ["fmt", "std"] }
 tokio-test.workspace = true
 tempfile.workspace = true
