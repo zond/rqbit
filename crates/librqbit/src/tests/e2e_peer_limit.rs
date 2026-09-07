@@ -372,8 +372,9 @@ async fn forgetting_a_parked_peer_strands_none_of_its_pieces_inner() {
 
     let swarm = swarm("rqbit_peer_limit_forget", SEEDERS, 8_000_000).await;
 
-    // Wait until every peer holds a reserved piece. Whichever nine the cap parks, they
-    // have pieces to strand -- without that this test can pass by proving nothing.
+    // Wait until more peers hold a reserved piece than the cap is about to keep. The
+    // parked ones then include at least one that has pieces to strand -- without that this
+    // test can pass by proving nothing, which is asserted below.
     wait_until(
         || {
             let owners: std::collections::HashSet<_> = swarm
@@ -383,8 +384,8 @@ async fn forgetting_a_parked_peer_strands_none_of_its_pieces_inner() {
                 .map(|(_, owner)| owner)
                 .collect();
             match owners.len() {
-                n if n == SEEDERS => Ok(()),
-                n => bail!("waiting for every peer to reserve a piece, {n} of {SEEDERS} have"),
+                n if n > LOWERED => Ok(()),
+                n => bail!("waiting for more than {LOWERED} peers to reserve a piece, {n} have"),
             }
         },
         WAIT,
@@ -392,17 +393,26 @@ async fn forgetting_a_parked_peer_strands_none_of_its_pieces_inner() {
     .await
     .unwrap();
 
+    // Who holds what, before any of it moves.
+    let held = swarm.live.inflight_piece_owners();
+
     // No await between these two lines either: the tasks whose entries are removed here
     // are all still running.
     swarm.handle.set_peer_limit(LOWERED);
     let forgotten = swarm.live.forget_disconnected_peers();
-    let at_risk = swarm.live.ownerless_inflight_pieces();
     assert_eq!(forgotten, SEEDERS - LOWERED);
+
+    // Of the pieces held a moment ago, the ones whose owner has just been forgotten. Those
+    // are what a task with no entry left to find has to hand back, and asking after the
+    // snapshot rather than of the table now keeps the count from depending on how quickly
+    // those tasks get there.
+    let table = swarm.live.peer_addresses();
+    let at_risk = held.iter().filter(|(_, o)| !table.contains(o)).count();
     assert!(
-        !at_risk.is_empty(),
+        at_risk > 0,
         "the forgotten peers held no pieces, so this test proves nothing"
     );
-    info!(at_risk = at_risk.len(), "forgot the peers the cap parked");
+    info!(at_risk, "forgot the peers the cap parked");
 
     // Wait for those connections to close, seen from the other end, then let the tasks that
     // owned them finish reporting their death.
@@ -597,6 +607,10 @@ async fn a_raise_dials_the_peers_it_parked_before_the_backlog_inner() {
     setup_test_logging();
 
     let swarm = swarm("rqbit_peer_limit_requeue", SEEDERS, 8_000_000).await;
+    // Stood up before the cap moves, so that nothing but the raise itself sits between
+    // the backlog arriving and the slots being handed out.
+    let backlog = tarpits(SEEDERS * 4).await;
+
     swarm.handle.set_peer_limit(LOWERED);
     wait_until(
         || match swarm.peer_stats() {
@@ -614,15 +628,18 @@ async fn a_raise_dials_the_peers_it_parked_before_the_backlog_inner() {
 
     // A swarm naming addresses at a backgrounded client. Every one of them accepts and
     // then says nothing, so a dial spent on one is a dial wedged for the read timeout.
-    let backlog = tarpits(SEEDERS * 4).await;
     for addr in &backlog.addrs {
         assert!(swarm.live.add_peer_if_not_seen(*addr).unwrap());
     }
 
+    let dialled_before = backlog.accepted.load(Ordering::Relaxed);
     swarm.handle.set_peer_limit(SEEDERS);
     wait_until(
         || match swarm.peer_stats() {
-            s if (s.live + s.connecting) as usize == SEEDERS => Ok(()),
+            // Every address the raise asked for has left the queue; only the backlog is
+            // still waiting. Said this way rather than counting live peers, because how
+            // fast a re-dialled seeder finishes its handshake is beside the point here.
+            s if s.queued as usize <= backlog.addrs.len() => Ok(()),
             s => bail!("waiting for the raise to hand out its slots: {s:?}"),
         },
         // Well inside the read timeout a wedged dial would otherwise hold a slot for.
@@ -632,12 +649,14 @@ async fn a_raise_dials_the_peers_it_parked_before_the_backlog_inner() {
     .unwrap();
     // Those slots went to peers we had already talked to. Asked of the other end, which
     // knows for certain, where the peer counters cannot tell a re-queued peer from a fresh
-    // guess. One address is allowed: the adder took it off the queue before the raise and
-    // has been holding it ever since, waiting for a slot to dial it with.
-    let accepted = backlog.accepted.load(Ordering::Relaxed);
+    // guess. Two addresses are allowed for: the adder holds one it took off the queue
+    // before the raise and could not dial until now, and a dial it started while the cap
+    // was low may be accepted only after the count above was read. Nine went this way
+    // before the parked peers had a queue of their own.
+    let dialled = backlog.accepted.load(Ordering::Relaxed) - dialled_before;
     assert!(
-        accepted <= 1,
-        "the raise dialled {accepted} of the backlog ahead of the peers it parked"
+        dialled <= 2,
+        "the raise gave {dialled} of its slots to the backlog, ahead of the peers it parked"
     );
     info!(stats = ?swarm.peer_stats(), "the proven peers came back first");
 }

@@ -1133,6 +1133,12 @@ impl TorrentStateLive {
             .collect()
     }
 
+    /// Every address the peer table has right now, whatever state it is in. Tests only.
+    #[cfg(test)]
+    pub(crate) fn peer_addresses(&self) -> HashSet<SocketAddr> {
+        self.peers.states.iter().map(|pe| *pe.key()).collect()
+    }
+
     /// Of those, the ones reserved for an address the peer table no longer has. Such a
     /// piece is in no queue and has no owner that can still deliver it, so nothing
     /// downloads it until a steal happens by -- see `on_peer_died`, which hands a dying
@@ -1141,7 +1147,7 @@ impl TorrentStateLive {
     #[cfg(test)]
     pub(crate) fn ownerless_inflight_pieces(&self) -> Vec<(u32, SocketAddr)> {
         // Read the table first: the state lock may not be held while it is touched.
-        let known: HashSet<SocketAddr> = self.peers.states.iter().map(|pe| *pe.key()).collect();
+        let known = self.peer_addresses();
         self.inflight_piece_owners()
             .into_iter()
             .filter(|(_, owner)| !known.contains(owner))
