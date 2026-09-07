@@ -632,6 +632,78 @@ impl crate::storage::TorrentStorage for ReleasingStorage {
     }
 }
 
+// When the torrent finishes under an open stream, the peers that have all of it are sent
+// away (there is nothing left to want from them). Dropping pieces keeps the torrent
+// finished, so nothing brings them back when that same stream then seeks into the dropped
+// range: the read parked forever. A stream opened after the drop was fine - creating one
+// reconnects peers when its file is unfinished - and so is a reselect; it is the long-lived
+// reader that seeks, exactly what a player does, that hung. A parked read now asks for the
+// peers back itself.
+async fn e2e_piece_reclaim_seek_back_after_finishing() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (files, torrent_bytes, _server_session, peer) =
+        seeding_server("test_piece_reclaim_seek_back", FILE_SIZE).await?;
+    let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
+
+    let storage = InMemoryPieceStorageFactory::default();
+    let dir = TempDir::with_prefix("test_piece_reclaim_seek_back_client")?;
+    let session = Session::new_with_opts(
+        dir.path().into(),
+        crate::SessionOptions {
+            dht: None,
+            persistence: None,
+            peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent_bytes.to_owned()),
+            Some(crate::AddTorrentOptions {
+                paused: false,
+                initial_peers: Some(vec![peer]),
+                piece_reclaim: true,
+                storage_factory: Some(storage.clone().boxed()),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+
+    // The stream is open while the torrent is still downloading, and stays open across it
+    // finishing: that is what parks the seeder.
+    timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+    let mut stream = handle.clone().stream(0).await?;
+    timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await?;
+    assert_eq!(buf, orig_content);
+
+    // The reader is at EOF, so its lookahead protects nothing and the range goes.
+    release(&storage, &handle, DROP)?;
+    assert!(handle.stats().finished);
+
+    // The player seeks back to the start and reads. Without the fix this parks forever.
+    Pin::new(&mut stream).start_seek(SeekFrom::Start(0))?;
+    let mut piece = vec![0u8; PIECE_LEN as usize];
+    timeout(Duration::from_secs(30), stream.read_exact(&mut piece))
+        .await
+        .context("the read parked: nothing brought the peers back for the dropped range")??;
+    assert_eq!(piece, orig_content[..PIECE_LEN as usize]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_piece_reclaim_seek_back_after_finishing() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_piece_reclaim_seek_back_after_finishing(),
+    )
+    .await?
+}
+
 // A storage that takes every chunk and refuses to commit any piece: what a full disk or
 // a directory that won't take a rename looks like to a storage that stages pieces.
 #[derive(Clone, Default)]
