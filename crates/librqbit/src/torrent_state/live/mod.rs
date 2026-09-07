@@ -48,7 +48,7 @@ use std::{
     collections::HashSet,
     net::{IpAddr, SocketAddr},
     num::NonZeroU32,
-    ops::Range,
+    ops::{Deref, DerefMut, Range},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -185,6 +185,71 @@ pub enum AddIncomingPeerResult {
     Added,
     AlreadyActive,
     ConcurrencyLimitReached,
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    /// How many guards on a live torrent's state lock this thread holds. The peer table
+    /// checks it on every access, see [`peers::PeerTable`].
+    ///
+    /// It is one count across all live torrents, not one per torrent, so it also trips on
+    /// holding torrent A's state lock while touching torrent B's peer table, which cannot
+    /// deadlock on its own. No such path exists: every site takes a torrent's own lock and
+    /// touches its own table, and the check stays that simple for it. A path that needs
+    /// the cross-torrent case would have to key the count by torrent, not just remove the
+    /// assertion.
+    static STATE_LOCKS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether this thread holds a live torrent's state lock. Always false in release builds,
+/// which don't keep track.
+fn state_lock_held_by_this_thread() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        STATE_LOCKS_HELD.with(|c| c.get() > 0)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
+/// A guard on a live torrent's state lock (`TorrentStateLive::_locked`).
+///
+/// In debug builds it counts, per thread, how many such guards the thread holds, so that
+/// the peer table can catch the lock order being inverted (see [`peers::PeerTable`]). The
+/// guard is not `Send`, so the count cannot leak to another thread.
+pub(crate) struct StateGuard<G>(TimedExistence<G>);
+
+impl<G> StateGuard<G> {
+    fn new(guard: G, reason: &'static str) -> Self {
+        #[cfg(debug_assertions)]
+        STATE_LOCKS_HELD.with(|c| c.set(c.get() + 1));
+        Self(TimedExistence::new(guard, reason))
+    }
+}
+
+#[cfg(debug_assertions)]
+impl<G> Drop for StateGuard<G> {
+    fn drop(&mut self) {
+        STATE_LOCKS_HELD.with(|c| c.set(c.get() - 1));
+    }
+}
+
+impl<G> Deref for StateGuard<G> {
+    type Target = G;
+
+    #[inline(always)]
+    fn deref(&self) -> &G {
+        &self.0
+    }
+}
+
+impl<G> DerefMut for StateGuard<G> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut G {
+        &mut self.0
+    }
 }
 
 pub struct TorrentStateLive {
@@ -707,14 +772,14 @@ impl TorrentStateLive {
     pub(crate) fn lock_read(
         &self,
         reason: &'static str,
-    ) -> TimedExistence<RwLockReadGuard<'_, TorrentStateLocked>> {
-        TimedExistence::new(timeit(reason, || self._locked.read()), reason)
+    ) -> StateGuard<RwLockReadGuard<'_, TorrentStateLocked>> {
+        StateGuard::new(timeit(reason, || self._locked.read()), reason)
     }
     pub(crate) fn lock_write(
         &self,
         reason: &'static str,
-    ) -> TimedExistence<RwLockWriteGuard<'_, TorrentStateLocked>> {
-        TimedExistence::new(timeit(reason, || self._locked.write()), reason)
+    ) -> StateGuard<RwLockWriteGuard<'_, TorrentStateLocked>> {
+        StateGuard::new(timeit(reason, || self._locked.write()), reason)
     }
 
     fn set_peer_live(&self, handle: PeerHandle, h: Handshake, connection_kind: ConnectionKind) {
@@ -936,9 +1001,13 @@ impl TorrentStateLive {
     }
 
     pub(crate) fn update_only_files(&self, only_files: &HashSet<usize>) -> anyhow::Result<()> {
-        let mut g = self.lock_write("update_only_files");
-        let pt = g.get_pieces_mut()?;
-        let hns = pt.update_only_files(&self.metadata.file_infos, only_files)?;
+        let hns = self
+            .lock_write("update_only_files")
+            .get_pieces_mut()?
+            .update_only_files(&self.metadata.file_infos, only_files)?;
+        // With the state lock released. A dying peer holds its shard of the peer table
+        // while it asks whether the torrent is finished (on_peer_died), so touching the
+        // table under the state lock is the reverse order, and the two deadlock.
         if !hns.finished() {
             self.reconnect_all_not_needed_peers();
         }

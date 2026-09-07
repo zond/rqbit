@@ -1,4 +1,4 @@
-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+use std::{collections::HashSet, net::SocketAddr, ops::Deref, sync::Arc};
 
 use dashmap::DashMap;
 use librqbit_core::lengths::ValidPieceIndex;
@@ -16,18 +16,45 @@ use super::peer::{LivePeerState, Peer, PeerRx, PeerState, PeerTx};
 
 pub mod stats;
 
+/// The peer table, keyed by peer address.
+///
+/// Lock order: a peer task takes its shard of this table and then, still holding it, the
+/// torrent's state lock - a dying peer asks whether the torrent is finished, the chunk
+/// requester reserves a piece. So the state lock must never be held while touching the
+/// table: that is the reverse order, and one peer dying at the wrong moment deadlocks the
+/// two. Debug builds check it on every access through the table. The one access that is not
+/// through it is the destructor of [`PeerStates`], which consumes the table: it runs only
+/// when the whole `TorrentStateLive` is dropped, and no guard on its state lock can be held
+/// then.
+#[derive(Default)]
+pub(crate) struct PeerTable(DashMap<PeerHandle, Peer>);
+
+impl Deref for PeerTable {
+    type Target = DashMap<PeerHandle, Peer>;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        debug_assert!(
+            !super::state_lock_held_by_this_thread(),
+            "bug: peer table touched while holding the torrent's state lock; peer tasks take the two in the other order, so this deadlocks"
+        );
+        &self.0
+    }
+}
+
 pub(crate) struct PeerStates {
     pub session_stats: Arc<AggregatePeerStatsAtomic>,
 
     // This keeps track of live addresses we connected to, for PEX.
     pub live_outgoing_peers: RwLock<HashSet<PeerHandle>>,
     pub stats: AggregatePeerStatsAtomic,
-    pub states: DashMap<PeerHandle, Peer>,
+    pub states: PeerTable,
 }
 
 impl Drop for PeerStates {
     fn drop(&mut self) {
-        for (_, p) in std::mem::take(&mut self.states).into_iter() {
+        // Not through the checked `Deref`: the table is consumed here, see `PeerTable`.
+        for (_, p) in std::mem::take(&mut self.states).0.into_iter() {
             p.destroy(self);
         }
     }
