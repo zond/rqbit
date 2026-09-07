@@ -1,6 +1,7 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::Context;
+use librqbit_core::hash_id::Id20;
 use librqbit_core::lengths::{Lengths, ValidPieceIndex};
 use parking_lot::RwLock;
 
@@ -134,7 +135,8 @@ impl TorrentStorage for InMemoryExampleStorage {
     }
 }
 
-// What the piece storage holds. The split is the point: see InMemoryPieceStorageFactory.
+// What the piece storage holds for one torrent. The split is the point: see
+// InMemoryPieceStorageFactory.
 #[derive(Default)]
 struct Pieces {
     // Pieces that are all here: fully written, and hash-checked by the time they landed.
@@ -149,6 +151,17 @@ struct Pieces {
     // has not been released yet - and then this one, the newer, is what a read gets. See
     // pread_exact().
     partial: HashMap<ValidPieceIndex, InMemoryPiece>,
+}
+
+// Every torrent the factory serves, kept apart by info hash.
+//
+// A piece is addressed by its index within a torrent, so a store that keyed on the index
+// alone would hand torrent B the bytes of torrent A's piece 0. That isn't hypothetical:
+// what makes this storage persistable is being the session's default_storage_factory, and
+// a session default serves every torrent in the session.
+#[derive(Default)]
+struct Store {
+    torrents: HashMap<Id20, Pieces>,
 }
 
 /// An in-memory storage that can release individual pieces, for use with
@@ -170,22 +183,24 @@ struct Pieces {
 /// to promote the staged copy is itself a read, so serving it the old bytes would have it
 /// check the wrong ones. The same applies to the temporary file on a filesystem.
 ///
-/// The factory is the caller's handle to those pieces: it shares the map with the storage
-/// it creates, so the policy that decides what to reclaim can call
-/// [`crate::ManagedTorrent::drop_pieces`] and then delete exactly what it was handed:
+/// The factory is the caller's handle to those pieces: it owns the store and shares it
+/// with every storage it creates, so the policy that decides what to reclaim can call
+/// [`crate::ManagedTorrent::drop_pieces`] and then delete exactly what it was handed. The
+/// torrent says which pieces those are, so it also says which torrent's pieces they are:
 ///
 /// ```ignore
 /// let dropped = torrent.drop_pieces(0..100)?;
 /// for id in dropped.pieces() {
-///     storage.release_piece(lengths.validate_piece_index(*id).unwrap());
+///     storage.release_piece(torrent.info_hash(), lengths.validate_piece_index(*id).unwrap());
 /// }
 /// drop(dropped); // the claim goes once the storage is gone
 /// ```
 ///
-/// One torrent per factory: the map is shared with everything it creates.
+/// One factory serves any number of torrents, which is what it has to do to be a session's
+/// `default_storage_factory` - the only place it can promise persistence from.
 #[derive(Default, Clone)]
 pub struct InMemoryPieceStorageFactory {
-    pieces: Arc<RwLock<Pieces>>,
+    store: Arc<RwLock<Store>>,
 }
 
 impl InMemoryPieceStorageFactory {
@@ -193,22 +208,33 @@ impl InMemoryPieceStorageFactory {
     ///
     /// This is the "release the storage" half of the reclaim loop, and the caller only
     /// gets to call it for pieces [`crate::ManagedTorrent::drop_pieces`] handed over.
-    pub fn release_piece(&self, piece_id: ValidPieceIndex) -> bool {
-        let mut g = self.pieces.write();
+    pub fn release_piece(&self, info_hash: Id20, piece_id: ValidPieceIndex) -> bool {
+        let mut g = self.store.write();
+        let Some(pieces) = g.torrents.get_mut(&info_hash) else {
+            return false;
+        };
         // A half-written copy of a piece being released is worth just as little as the
         // finished one: it is what the caller asked us to forget.
-        g.partial.remove(&piece_id);
-        g.complete.remove(&piece_id).is_some()
+        pieces.partial.remove(&piece_id);
+        pieces.complete.remove(&piece_id).is_some()
     }
 
     /// Whether the data of a piece is still here, complete.
-    pub fn has_piece(&self, piece_id: ValidPieceIndex) -> bool {
-        self.pieces.read().complete.contains_key(&piece_id)
+    pub fn has_piece(&self, info_hash: Id20, piece_id: ValidPieceIndex) -> bool {
+        self.store
+            .read()
+            .torrents
+            .get(&info_hash)
+            .is_some_and(|p| p.complete.contains_key(&piece_id))
     }
 
-    /// How many whole pieces are held right now.
-    pub fn piece_count(&self) -> usize {
-        self.pieces.read().complete.len()
+    /// How many whole pieces of a torrent are held right now.
+    pub fn piece_count(&self, info_hash: Id20) -> usize {
+        self.store
+            .read()
+            .torrents
+            .get(&info_hash)
+            .map_or(0, |p| p.complete.len())
     }
 }
 
@@ -217,21 +243,23 @@ impl StorageFactory for InMemoryPieceStorageFactory {
 
     fn create(
         &self,
-        _shared: &ManagedTorrentShared,
+        shared: &ManagedTorrentShared,
         metadata: &TorrentMetadata,
     ) -> anyhow::Result<InMemoryPieceStorage> {
         Ok(InMemoryPieceStorage {
+            info_hash: shared.info_hash,
             lengths: *metadata.lengths(),
             file_infos: metadata.file_infos.clone(),
-            pieces: self.pieces.clone(),
+            store: self.store.clone(),
         })
     }
 
-    // The pieces belong to the factory, not to the storage it hands out, so a session
-    // that keeps this factory as its default_storage_factory reaches the same pieces when
-    // it rebuilds the torrent from the persisted record. Across a real restart the map
-    // starts empty and has_piece() says so for every piece, so the resume data is
-    // intersected down to nothing and the torrent downloads again - empty, never wrong.
+    // The pieces belong to the factory, not to the storage it hands out, and they are
+    // keyed by torrent - so a session that keeps this factory as its
+    // default_storage_factory reaches the same pieces when it rebuilds any of its torrents
+    // from the persisted record. Across a real restart the store starts empty and
+    // has_piece() says so for every piece, so the resume data is intersected down to
+    // nothing and the torrent downloads again - empty, never wrong.
     fn ensure_persistable(&self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -242,16 +270,17 @@ impl StorageFactory for InMemoryPieceStorageFactory {
 }
 
 pub struct InMemoryPieceStorage {
+    info_hash: Id20,
     lengths: Lengths,
     file_infos: FileInfos,
-    pieces: Arc<RwLock<Pieces>>,
+    store: Arc<RwLock<Store>>,
 }
 
 impl TorrentStorage for InMemoryPieceStorage {
     fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
         let (piece_id, piece_offset) =
             piece_and_offset(&self.lengths, &self.file_infos, file_id, offset)?;
-        let g = self.pieces.read();
+        let g = self.store.read();
         // A read is served the newest copy of the piece: the one being written if there
         // is one, otherwise the complete one. Hash checking a piece is a read of what was
         // just written, and it happens before the piece is complete - so a piece being
@@ -268,10 +297,14 @@ impl TorrentStorage for InMemoryPieceStorage {
         // reaches storage, and a stream waits for it. The overlap ends at
         // on_piece_completed(), which takes the partial copy out of the map as it
         // promotes it, or at release_piece(), which drops both.
-        let piece = g
+        let pieces = g
+            .torrents
+            .get(&self.info_hash)
+            .context("no pieces for this torrent")?;
+        let piece = pieces
             .partial
             .get(&piece_id)
-            .or_else(|| g.complete.get(&piece_id))
+            .or_else(|| pieces.complete.get(&piece_id))
             .context("piece was released")?;
         buf.copy_from_slice(&piece.bytes[piece_offset..(piece_offset + buf.len())]);
         Ok(())
@@ -280,8 +313,11 @@ impl TorrentStorage for InMemoryPieceStorage {
     fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
         let (piece_id, piece_offset) =
             piece_and_offset(&self.lengths, &self.file_infos, file_id, offset)?;
-        let mut g = self.pieces.write();
+        let mut g = self.store.write();
         let piece = g
+            .torrents
+            .entry(self.info_hash)
+            .or_default()
             .partial
             .entry(piece_id)
             .or_insert_with(|| InMemoryPiece::new(&self.lengths));
@@ -293,9 +329,10 @@ impl TorrentStorage for InMemoryPieceStorage {
     // "write to a temporary name and rename it when it's done", and until it happens
     // has_piece() says no.
     fn on_piece_completed(&self, piece_index: ValidPieceIndex) -> anyhow::Result<()> {
-        let mut g = self.pieces.write();
-        if let Some(piece) = g.partial.remove(&piece_index) {
-            g.complete.insert(piece_index, piece);
+        let mut g = self.store.write();
+        let pieces = g.torrents.entry(self.info_hash).or_default();
+        if let Some(piece) = pieces.partial.remove(&piece_index) {
+            pieces.complete.insert(piece_index, piece);
         }
         Ok(())
     }
@@ -312,9 +349,10 @@ impl TorrentStorage for InMemoryPieceStorage {
         // The pieces stay where they are: a pause must not lose them, and the factory is
         // the caller's handle to them.
         Ok(Box::new(Self {
+            info_hash: self.info_hash,
             lengths: self.lengths,
             file_infos: self.file_infos.clone(),
-            pieces: self.pieces.clone(),
+            store: self.store.clone(),
         }))
     }
 
@@ -334,7 +372,12 @@ impl TorrentStorage for InMemoryPieceStorage {
     // storage over the resume data. Only whole pieces count - a piece half-written when
     // the process died is not one we have.
     fn has_piece(&self, piece_index: ValidPieceIndex) -> anyhow::Result<bool> {
-        Ok(self.pieces.read().complete.contains_key(&piece_index))
+        Ok(self
+            .store
+            .read()
+            .torrents
+            .get(&self.info_hash)
+            .is_some_and(|p| p.complete.contains_key(&piece_index)))
     }
 }
 
@@ -348,7 +391,17 @@ mod tests {
     const PIECE_LEN: u32 = CHUNK_SIZE * 2;
     const NUM_PIECES: u32 = 2;
 
+    fn torrent() -> Id20 {
+        Id20::new([1u8; 20])
+    }
+
     fn storage() -> (InMemoryPieceStorageFactory, InMemoryPieceStorage) {
+        let factory = InMemoryPieceStorageFactory::default();
+        let storage = storage_for(&factory, torrent());
+        (factory, storage)
+    }
+
+    fn storage_for(factory: &InMemoryPieceStorageFactory, info_hash: Id20) -> InMemoryPieceStorage {
         let len = PIECE_LEN as u64 * NUM_PIECES as u64;
         let lengths = Lengths::new(len, PIECE_LEN).unwrap();
         let file_infos: FileInfos = vec![crate::file_info::FileInfo {
@@ -358,13 +411,12 @@ mod tests {
             piece_range: 0..NUM_PIECES,
             attrs: Default::default(),
         }];
-        let factory = InMemoryPieceStorageFactory::default();
-        let storage = InMemoryPieceStorage {
+        InMemoryPieceStorage {
+            info_hash,
             lengths,
             file_infos,
-            pieces: factory.pieces.clone(),
-        };
-        (factory, storage)
+            store: factory.store.clone(),
+        }
     }
 
     // has_piece() must mean "complete", not "started". Chunks arrive 16 KiB at a time,
@@ -382,8 +434,8 @@ mod tests {
             !storage.has_piece(piece).unwrap(),
             "half a piece is not a piece"
         );
-        assert!(!factory.has_piece(piece));
-        assert_eq!(factory.piece_count(), 0);
+        assert!(!factory.has_piece(torrent(), piece));
+        assert_eq!(factory.piece_count(torrent()), 0);
 
         // It is readable while it is being written: that is how it gets hash-checked.
         let mut buf = vec![0u8; CHUNK_SIZE as usize];
@@ -399,16 +451,54 @@ mod tests {
         // Written and hash-checked: now it is here.
         storage.on_piece_completed(piece).unwrap();
         assert!(storage.has_piece(piece).unwrap());
-        assert!(factory.has_piece(piece));
-        assert_eq!(factory.piece_count(), 1);
+        assert!(factory.has_piece(torrent(), piece));
+        assert_eq!(factory.piece_count(torrent()), 1);
         storage.pread_exact(0, 0, &mut buf).unwrap();
         assert_eq!(buf, chunk);
 
         // And released it is gone again.
-        assert!(factory.release_piece(piece));
+        assert!(factory.release_piece(torrent(), piece));
         assert!(!storage.has_piece(piece).unwrap());
-        assert_eq!(factory.piece_count(), 0);
+        assert_eq!(factory.piece_count(torrent()), 0);
         assert!(storage.pread_exact(0, 0, &mut buf).is_err());
+    }
+
+    // A factory serves a whole session, and a piece index means nothing without the
+    // torrent it belongs to. Share the store across two torrents without saying which is
+    // which and torrent B's piece 0 is torrent A's bytes - and the have-set each of them
+    // starts with after a restart is the other one's.
+    #[test]
+    fn test_two_torrents_dont_share_a_piece() {
+        let other = Id20::new([2u8; 20]);
+        let factory = InMemoryPieceStorageFactory::default();
+        let a = storage_for(&factory, torrent());
+        let b = storage_for(&factory, other);
+        let piece = a.lengths.validate_piece_index(0).unwrap();
+
+        let bytes_a = vec![1u8; PIECE_LEN as usize];
+        a.pwrite_all(0, 0, &bytes_a).unwrap();
+        a.on_piece_completed(piece).unwrap();
+
+        assert!(!b.has_piece(piece).unwrap(), "B doesn't have A's piece");
+        assert_eq!(factory.piece_count(other), 0);
+        assert!(
+            b.pread_exact(0, 0, &mut vec![0u8; PIECE_LEN as usize])
+                .is_err(),
+            "B must not be served A's bytes"
+        );
+
+        // And releasing B's piece leaves A's alone.
+        assert!(!factory.release_piece(other, piece));
+        assert!(a.has_piece(piece).unwrap());
+
+        let bytes_b = vec![2u8; PIECE_LEN as usize];
+        b.pwrite_all(0, 0, &bytes_b).unwrap();
+        b.on_piece_completed(piece).unwrap();
+        let mut buf = vec![0u8; PIECE_LEN as usize];
+        a.pread_exact(0, 0, &mut buf).unwrap();
+        assert_eq!(buf, bytes_a, "A's piece was overwritten by B's");
+        assert_eq!(factory.piece_count(torrent()), 1);
+        assert_eq!(factory.piece_count(other), 1);
     }
 
     // A read must see the bytes most recently written. A piece can be downloaded again
@@ -426,7 +516,7 @@ mod tests {
 
         storage.pwrite_all(0, 0, &old).unwrap();
         storage.on_piece_completed(piece).unwrap();
-        assert!(factory.has_piece(piece));
+        assert!(factory.has_piece(torrent(), piece));
 
         // Downloaded again: the first chunk of the new copy lands in the staging area
         // next to the complete one, and a read has to get the new bytes.
@@ -446,7 +536,7 @@ mod tests {
             .pwrite_all(0, CHUNK_SIZE as u64, &new[chunk..])
             .unwrap();
         storage.on_piece_completed(piece).unwrap();
-        assert_eq!(factory.piece_count(), 1);
+        assert_eq!(factory.piece_count(torrent()), 1);
         let mut buf = vec![0u8; PIECE_LEN as usize];
         storage.pread_exact(0, 0, &mut buf).unwrap();
         assert_eq!(buf, new);

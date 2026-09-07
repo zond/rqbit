@@ -260,10 +260,11 @@ async fn a_non_filesystem_storage_is_persisted_and_restored() -> anyhow::Result<
         .into_handle()
         .context("expected a handle")?;
     timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
+    let info_hash = handle.info_hash();
 
     // The data is in the store, and nowhere on disk: the output folder in the record
     // names nothing.
-    assert_eq!(storage.piece_count(), TOTAL_PIECES as usize);
+    assert_eq!(storage.piece_count(info_hash), TOTAL_PIECES as usize);
     assert_eq!(read_back(handle.clone()).await?, orig_content);
     assert!(!output_folder.join("0.data").exists());
 
@@ -276,7 +277,10 @@ async fn a_non_filesystem_storage_is_persisted_and_restored() -> anyhow::Result<
 
     // Half the pieces go while the bitfield isn't looking.
     for id in DROP {
-        assert!(storage.release_piece(piece(id)), "piece {id} wasn't there");
+        assert!(
+            storage.release_piece(info_hash, piece(id)),
+            "piece {id} wasn't there"
+        );
     }
 
     drop(handle);

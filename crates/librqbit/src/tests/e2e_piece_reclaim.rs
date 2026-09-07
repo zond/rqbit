@@ -344,22 +344,33 @@ async fn e2e_piece_reclaim_storage_loop() -> anyhow::Result<()> {
         .context("no metadata")?
         .lengths();
     let piece = |id: u32| lengths.validate_piece_index(id).unwrap();
+    let info_hash = handle.info_hash();
 
     // One entry per piece, which is what makes releasing one meaningful.
-    assert_eq!(storage.piece_count(), TOTAL_PIECES as usize);
+    assert_eq!(storage.piece_count(info_hash), TOTAL_PIECES as usize);
     assert_eq!(read_back(handle.clone()).await?, orig_content);
 
     // The loop: ask what may go, delete exactly that, then let the claim go.
     let dropped = handle.drop_pieces(DROP)?;
     assert_eq!(dropped.pieces(), DROP.collect::<Vec<_>>());
     for id in dropped.pieces() {
-        assert!(storage.release_piece(piece(*id)), "piece {id} wasn't there");
+        assert!(
+            storage.release_piece(info_hash, piece(*id)),
+            "piece {id} wasn't there"
+        );
     }
     drop(dropped);
 
-    assert_eq!(storage.piece_count(), TOTAL_PIECES as usize - DROP.len());
+    assert_eq!(
+        storage.piece_count(info_hash),
+        TOTAL_PIECES as usize - DROP.len()
+    );
     for id in 0..TOTAL_PIECES {
-        assert_eq!(storage.has_piece(piece(id)), !DROP.contains(&id), "{id}");
+        assert_eq!(
+            storage.has_piece(info_hash, piece(id)),
+            !DROP.contains(&id),
+            "{id}"
+        );
     }
 
     // The memory is gone and the torrent is still finished: a piece we threw away on
@@ -371,7 +382,7 @@ async fn e2e_piece_reclaim_storage_loop() -> anyhow::Result<()> {
     assert_eq!(handle.reselect_pieces(DROP)?, DROP.len());
     assert!(!handle.stats().finished);
     timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
-    assert_eq!(storage.piece_count(), TOTAL_PIECES as usize);
+    assert_eq!(storage.piece_count(info_hash), TOTAL_PIECES as usize);
     assert_eq!(read_back(handle.clone()).await?, orig_content);
 
     Ok(())
@@ -410,6 +421,7 @@ async fn e2e_piece_reclaim_claim_survives_pause() -> anyhow::Result<()> {
         .context("no metadata")?
         .lengths();
     let piece = |id: u32| lengths.validate_piece_index(id).unwrap();
+    let info_hash = handle.info_hash();
     let have =
         |id: u32| handle.with_chunk_tracker(|ct| ct.get_have_pieces().as_slice()[id as usize]);
 
@@ -417,7 +429,10 @@ async fn e2e_piece_reclaim_claim_survives_pause() -> anyhow::Result<()> {
     let dropped = handle.drop_pieces(DROP)?;
     assert_eq!(dropped.pieces(), DROP.collect::<Vec<_>>());
     for id in dropped.pieces() {
-        assert!(storage.release_piece(piece(*id)), "piece {id} wasn't there");
+        assert!(
+            storage.release_piece(info_hash, piece(*id)),
+            "piece {id} wasn't there"
+        );
     }
 
     session.pause(&handle).await?;
@@ -435,7 +450,7 @@ async fn e2e_piece_reclaim_claim_survives_pause() -> anyhow::Result<()> {
             "piece {id} was downloaded again while its storage was still being released"
         );
         assert!(
-            !storage.has_piece(piece(id)),
+            !storage.has_piece(info_hash, piece(id)),
             "piece {id} came back in storage"
         );
     }
@@ -443,14 +458,17 @@ async fn e2e_piece_reclaim_claim_survives_pause() -> anyhow::Result<()> {
     // The deletion is done. Now they may come back.
     drop(dropped);
     timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
-    assert_eq!(storage.piece_count(), TOTAL_PIECES as usize);
+    assert_eq!(storage.piece_count(info_hash), TOTAL_PIECES as usize);
     assert_eq!(read_back(handle.clone()).await?, orig_content);
 
     // Same thing, but the caller finishes deleting while the torrent is paused: the
     // paused torrent is what holds the claim then, and it has to take the report.
     let dropped = handle.drop_pieces(DROP)?;
     for id in dropped.pieces() {
-        assert!(storage.release_piece(piece(*id)), "piece {id} wasn't there");
+        assert!(
+            storage.release_piece(info_hash, piece(*id)),
+            "piece {id} wasn't there"
+        );
     }
     session.pause(&handle).await?;
     drop(dropped);
