@@ -11,10 +11,17 @@ readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+# Which TLS backend reqwest uses. librqbit forwards its own; see this crate's
+# http_client module for what the rustls one implies for trust.
+default-tls = ["reqwest/default-tls"]
+rust-tls = ["reqwest/rustls", "dep:webpki-root-certs"]
+
 [dependencies]
 tracing.workspace = true
 anyhow.workspace = true
 reqwest.workspace = true
+webpki-root-certs = { workspace = true, optional = true }
 serde.workspace = true
 serde_derive.workspace = true
 tokio = { workspace = true, features = ["macros"] }

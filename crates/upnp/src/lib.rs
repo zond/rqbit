@@ -3,7 +3,6 @@ use bstr::BStr;
 use futures::{StreamExt, TryFutureExt, stream::FuturesUnordered};
 use librqbit_dualstack_sockets::{BindDevice, UdpSocket};
 use network_interface::{NetworkInterface, NetworkInterfaceConfig};
-use reqwest::Client;
 use serde_derive::Deserialize;
 use std::{
     collections::HashSet,
@@ -13,6 +12,10 @@ use std::{
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tracing::{Instrument, Span, debug, debug_span, trace, warn};
 use url::Url;
+
+pub mod http_client;
+
+pub use http_client::http_client_builder;
 
 const SERVICE_TYPE_WAN_IP_CONNECTION: &str = "urn:schemas-upnp-org:service:WANIPConnection:1";
 const SSDP_MULTICAST_IP: SocketAddr =
@@ -106,7 +109,9 @@ async fn forward_port(
 
     let url = control_url;
 
-    let client = reqwest::Client::new();
+    let client = http_client::http_client_builder()
+        .build()
+        .context("error building HTTP client")?;
     let response = client
         .post(url.clone())
         .header("Content-Type", "text/xml")
@@ -265,7 +270,9 @@ pub struct UpnpDiscoverResponse {
 }
 
 pub async fn discover_services(location: Url) -> anyhow::Result<RootDesc> {
-    let response = Client::new()
+    let response = http_client::http_client_builder()
+        .build()
+        .context("error building HTTP client")?
         .get(location.clone())
         .send()
         .await

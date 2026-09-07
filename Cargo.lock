@@ -3127,6 +3127,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "walkdir",
+ "webpki-root-certs",
  "windows 0.62.2",
 ]
 
@@ -3332,6 +3333,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "webpki-root-certs",
 ]
 
 [[package]]

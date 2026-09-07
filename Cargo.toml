@@ -155,4 +155,7 @@ url = { version = "2", default-features = false }
 urlencoding = "2"
 uuid = "1"
 walkdir = "2"
+# Mozilla's root program in DER form. See librqbit's http_client module for why
+# rqbit's HTTPS trusts these and not the platform store.
+webpki-root-certs = "1"
 windows = "0.62"

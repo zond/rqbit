@@ -69,7 +69,11 @@ impl IpRanges {
             return Self::load_from_file(path).await;
         }
 
-        let response = reqwest::get(parsed_url)
+        let response = crate::http_client_builder()
+            .build()
+            .context("error building HTTP(S) client")?
+            .get(parsed_url)
+            .send()
             .await
             .context("error fetching list")?;
         if !response.status().is_success() {
