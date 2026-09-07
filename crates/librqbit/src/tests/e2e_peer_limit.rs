@@ -8,7 +8,15 @@
 //! address (see `Peer::reconnect_not_needed_peer`), so it comes back only when it redials.
 //! Every client here is outgoing-only, which is the case the raise fully covers.
 
-use std::{net::Ipv4Addr, num::NonZeroU32, sync::Arc, time::Duration};
+use std::{
+    net::Ipv4Addr,
+    num::NonZeroU32,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::bail;
 use tracing::info;
@@ -60,8 +68,8 @@ impl Swarm {
 /// Seeders on ephemeral loopback ports, no DHT, no trackers: the client learns of them
 /// through `initial_peers` and nothing else, so a peer it forgets is gone for good. Each
 /// uploads slowly, so the download outlasts what is asserted about its peers.
-async fn swarm(prefix: &str, seeders: usize) -> Swarm {
-    let tempdir = create_default_random_dir_with_torrents(4, 1_000_000, Some(prefix));
+async fn swarm(prefix: &str, seeders: usize, bytes_per_file: usize) -> Swarm {
+    let tempdir = create_default_random_dir_with_torrents(4, bytes_per_file, Some(prefix));
     let torrent_file = create_torrent(
         tempdir.path(),
         CreateTorrentOptions {
@@ -179,7 +187,7 @@ async fn peer_limit_moves_at_runtime() {
 async fn peer_limit_moves_at_runtime_inner() {
     setup_test_logging();
 
-    let swarm = swarm("rqbit_peer_limit", SEEDERS).await;
+    let swarm = swarm("rqbit_peer_limit", SEEDERS, 1_000_000).await;
     let Swarm {
         ref handle,
         ref live,
@@ -308,7 +316,7 @@ async fn raising_the_cap_before_the_surplus_hangs_up_keeps_every_peer() {
 async fn raising_the_cap_before_the_surplus_hangs_up_keeps_every_peer_inner() {
     setup_test_logging();
 
-    let swarm = swarm("rqbit_peer_limit_raise", SEEDERS).await;
+    let swarm = swarm("rqbit_peer_limit_raise", SEEDERS, 1_000_000).await;
 
     // No await between these two lines. Every parked task is still alive.
     swarm.handle.set_peer_limit(LOWERED);
@@ -362,13 +370,22 @@ async fn forgetting_a_parked_peer_strands_none_of_its_pieces() {
 async fn forgetting_a_parked_peer_strands_none_of_its_pieces_inner() {
     setup_test_logging();
 
-    let swarm = swarm("rqbit_peer_limit_forget", SEEDERS).await;
+    let swarm = swarm("rqbit_peer_limit_forget", SEEDERS, 8_000_000).await;
 
-    // Wait until the peers have actually reserved pieces, or there is nothing to strand.
+    // Wait until every peer holds a reserved piece. Whichever nine the cap parks, they
+    // have pieces to strand -- without that this test can pass by proving nothing.
     wait_until(
-        || match swarm.live.stats_snapshot().fetched_bytes {
-            0 => bail!("waiting for the download to start"),
-            _ => Ok(()),
+        || {
+            let owners: std::collections::HashSet<_> = swarm
+                .live
+                .inflight_piece_owners()
+                .into_iter()
+                .map(|(_, owner)| owner)
+                .collect();
+            match owners.len() {
+                n if n == SEEDERS => Ok(()),
+                n => bail!("waiting for every peer to reserve a piece, {n} of {SEEDERS} have"),
+            }
         },
         WAIT,
     )
@@ -418,6 +435,50 @@ async fn forgetting_a_parked_peer_strands_none_of_its_pieces_inner() {
     swarm.handle.wait_until_completed().await.unwrap();
 }
 
+/// Listeners that accept a connection and then never speak a word of the protocol, so a
+/// peer dialling one wedges waiting for a handshake until it times out.
+struct Tarpits {
+    addrs: Vec<std::net::SocketAddr>,
+    /// Connections accepted, ever.
+    accepted: Arc<AtomicUsize>,
+    /// Of those, the ones the other end has since hung up on.
+    closed: Arc<AtomicUsize>,
+}
+
+async fn tarpits(n: usize) -> Tarpits {
+    let mut addrs = Vec::new();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let closed = Arc::new(AtomicUsize::new(0));
+    for _ in 0..n {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        addrs.push(listener.local_addr().unwrap());
+        let (accepted, closed) = (accepted.clone(), closed.clone());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                accepted.fetch_add(1, Ordering::Relaxed);
+                let closed = closed.clone();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = [0u8; 1024];
+                    while let Ok(read) = sock.read(&mut buf).await {
+                        if read == 0 {
+                            break;
+                        }
+                    }
+                    closed.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+        });
+    }
+    Tarpits {
+        addrs,
+        accepted,
+        closed,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_parked_dial_gives_its_slot_back_at_once() {
     tokio::time::timeout(
@@ -440,33 +501,7 @@ async fn a_parked_dial_gives_its_slot_back_at_once_inner() {
     const TARPITS: usize = 4;
     const KEPT: usize = 1;
 
-    // Listeners that accept and never speak a word of the protocol.
-    let mut addrs = Vec::new();
-    let closed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    for _ in 0..TARPITS {
-        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        addrs.push(listener.local_addr().unwrap());
-        let closed = closed.clone();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                let closed = closed.clone();
-                tokio::spawn(async move {
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = [0u8; 1024];
-                    // Read until the other end goes away. We never write, so the peer
-                    // stays stuck waiting for our handshake.
-                    while let Ok(n) = sock.read(&mut buf).await {
-                        if n == 0 {
-                            break;
-                        }
-                    }
-                    closed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                });
-            }
-        });
-    }
+    let Tarpits { addrs, closed, .. } = tarpits(TARPITS).await;
 
     let tempdir = create_default_random_dir_with_torrents(1, 100_000, Some("rqbit_tarpit"));
     let torrent_file = create_torrent(
@@ -525,11 +560,11 @@ async fn a_parked_dial_gives_its_slot_back_at_once_inner() {
     )
     .await
     .unwrap();
-    assert_eq!(closed.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(closed.load(Ordering::Relaxed), 0);
 
     handle.set_peer_limit(KEPT);
     wait_until(
-        || match closed.load(std::sync::atomic::Ordering::Relaxed) {
+        || match closed.load(Ordering::Relaxed) {
             n if n == TARPITS - KEPT => Ok(()),
             n => bail!("waiting for the parked dials to drop their sockets, {n} so far"),
         },
@@ -542,4 +577,67 @@ async fn a_parked_dial_gives_its_slot_back_at_once_inner() {
     assert_eq!(stats.connecting as usize, KEPT, "{stats:?}");
     assert_eq!(stats.not_needed as usize, TARPITS - KEPT, "{stats:?}");
     info!(stats = ?stats, "the parked dials let go of their slots");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_raise_dials_the_peers_it_parked_before_the_backlog() {
+    tokio::time::timeout(
+        Duration::from_secs(180),
+        a_raise_dials_the_peers_it_parked_before_the_backlog_inner(),
+    )
+    .await
+    .expect("test timed out");
+}
+
+/// While the cap is low the adder drains nothing: it takes one address and then waits for
+/// a slot, so everything a tracker, the DHT or PEX names in the meantime piles up behind
+/// it. On the way back up, those guesses must not be dialled ahead of the peers the cap
+/// parked, which are proven and are the reason the raise happened.
+async fn a_raise_dials_the_peers_it_parked_before_the_backlog_inner() {
+    setup_test_logging();
+
+    let swarm = swarm("rqbit_peer_limit_requeue", SEEDERS, 8_000_000).await;
+    swarm.handle.set_peer_limit(LOWERED);
+    wait_until(
+        || match swarm.peer_stats() {
+            s if (s.live + s.connecting) as usize == LOWERED
+                && s.not_needed as usize == SEEDERS - LOWERED =>
+            {
+                Ok(())
+            }
+            s => bail!("waiting for the surplus to hang up: {s:?}"),
+        },
+        WAIT,
+    )
+    .await
+    .unwrap();
+
+    // A swarm naming addresses at a backgrounded client. Every one of them accepts and
+    // then says nothing, so a dial spent on one is a dial wedged for the read timeout.
+    let backlog = tarpits(SEEDERS * 4).await;
+    for addr in &backlog.addrs {
+        assert!(swarm.live.add_peer_if_not_seen(*addr).unwrap());
+    }
+
+    swarm.handle.set_peer_limit(SEEDERS);
+    wait_until(
+        || match swarm.peer_stats() {
+            s if (s.live + s.connecting) as usize == SEEDERS => Ok(()),
+            s => bail!("waiting for the raise to hand out its slots: {s:?}"),
+        },
+        // Well inside the read timeout a wedged dial would otherwise hold a slot for.
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    // Those slots went to peers we had already talked to. Asked of the other end, which
+    // knows for certain, where the peer counters cannot tell a re-queued peer from a fresh
+    // guess. One address is allowed: the adder took it off the queue before the raise and
+    // has been holding it ever since, waiting for a slot to dial it with.
+    let accepted = backlog.accepted.load(Ordering::Relaxed);
+    assert!(
+        accepted <= 1,
+        "the raise dialled {accepted} of the backlog ahead of the peers it parked"
+    );
+    info!(stats = ?swarm.peer_stats(), "the proven peers came back first");
 }

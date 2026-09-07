@@ -276,6 +276,10 @@ pub struct TorrentStateLive {
 
     // The queue for peer manager to connect to them.
     peer_queue_tx: UnboundedSender<SocketAddr>,
+    // The same queue, for peers we have already talked to and want back: the ones a raised
+    // cap un-parks, and the ones a reselection makes interesting again. The adder drains
+    // this one first. See `reconnect_all_not_needed_peers`.
+    peer_requeue_tx: UnboundedSender<SocketAddr>,
 
     finished_notify: Notify,
     new_pieces_notify: Notify,
@@ -303,6 +307,7 @@ impl TorrentStateLive {
         cancellation_token: CancellationToken,
     ) -> anyhow::Result<Arc<Self>> {
         let (peer_queue_tx, peer_queue_rx) = unbounded_channel();
+        let (peer_requeue_tx, peer_requeue_rx) = unbounded_channel();
         let session = paused
             .shared
             .session
@@ -364,6 +369,7 @@ impl TorrentStateLive {
             peer_permits_to_forget: AtomicUsize::new(0),
             new_pieces_notify: Notify::new(),
             peer_queue_tx,
+            peer_requeue_tx,
             finished_notify: Notify::new(),
             down_speed_estimator,
             up_speed_estimator,
@@ -411,7 +417,9 @@ impl TorrentStateLive {
         state.spawn(
             debug_span!(parent: state.shared.span.clone(), "peer_adder"),
             format!("[{}]peer_adder", state.shared.id),
-            state.clone().task_peer_adder(peer_queue_rx),
+            state
+                .clone()
+                .task_peer_adder(peer_queue_rx, peer_requeue_rx),
         );
 
         state.spawn(
@@ -698,10 +706,20 @@ impl TorrentStateLive {
     async fn task_peer_adder(
         self: Arc<Self>,
         mut peer_queue_rx: UnboundedReceiver<SocketAddr>,
+        mut peer_requeue_rx: UnboundedReceiver<SocketAddr>,
     ) -> crate::Result<()> {
         let state = self;
         loop {
-            let addr = peer_queue_rx.recv().await.ok_or(Error::TorrentIsNotLive)?;
+            // Peers we have already talked to go first. A raised cap asks for every peer
+            // the lowered one parked, and those are the proven ones -- at the back of a
+            // queue holding whatever the trackers and the DHT named while the cap was low,
+            // they would be dialled minutes after the app came back to the foreground.
+            let addr = tokio::select! {
+                biased;
+                addr = peer_requeue_rx.recv() => addr,
+                addr = peer_queue_rx.recv() => addr,
+            }
+            .ok_or(Error::TorrentIsNotLive)?;
             if state.shared.options.disable_upload() && state.is_finished_and_no_active_streams() {
                 debug!(?addr, "ignoring peer as we are finished");
                 state.peers.mark_peer_not_needed(addr);
@@ -1097,16 +1115,11 @@ impl TorrentStateLive {
         Ok(())
     }
 
-    /// The pieces reserved for an address the peer table no longer has, as
-    /// `(piece, owner)`. Such a piece is in no queue and has no owner that can still
-    /// deliver it, so nothing downloads it until a steal happens by -- see `on_peer_died`,
-    /// which hands a dying task's pieces back before it looks the table up at all. Always
-    /// empty except in the instant between a peer being forgotten and its task noticing.
+    /// Every piece being downloaded right now, as `(piece, the address that reserved it)`.
+    /// Tests only.
     #[cfg(test)]
-    pub(crate) fn ownerless_inflight_pieces(&self) -> Vec<(u32, SocketAddr)> {
-        // Read the table first: the state lock may not be held while it is touched.
-        let known: HashSet<SocketAddr> = self.peers.states.iter().map(|pe| *pe.key()).collect();
-        let g = self.lock_read("ownerless_inflight_pieces");
+    pub(crate) fn inflight_piece_owners(&self) -> Vec<(u32, SocketAddr)> {
+        let g = self.lock_read("inflight_piece_owners");
         let Ok(pieces) = g.get_pieces() else {
             return Vec::new();
         };
@@ -1117,6 +1130,20 @@ impl TorrentStateLive {
                     .get_inflight(piece)
                     .map(|inf| (piece.get(), inf.peer))
             })
+            .collect()
+    }
+
+    /// Of those, the ones reserved for an address the peer table no longer has. Such a
+    /// piece is in no queue and has no owner that can still deliver it, so nothing
+    /// downloads it until a steal happens by -- see `on_peer_died`, which hands a dying
+    /// task's pieces back before it looks the table up at all. Always empty except in the
+    /// instant between a peer being forgotten and its task noticing.
+    #[cfg(test)]
+    pub(crate) fn ownerless_inflight_pieces(&self) -> Vec<(u32, SocketAddr)> {
+        // Read the table first: the state lock may not be held while it is touched.
+        let known: HashSet<SocketAddr> = self.peers.states.iter().map(|pe| *pe.key()).collect();
+        self.inflight_piece_owners()
+            .into_iter()
             .filter(|(_, owner)| !known.contains(owner))
             .collect()
     }
@@ -1149,12 +1176,10 @@ impl TorrentStateLive {
     /// no more than that: a dial in flight holds its slot from the moment it takes it, so
     /// the ranking sees every peer that holds one.
     ///
-    /// Raising it hands the peer adder that many more permits and puts the parked peers back
-    /// in the queue to be dialled -- but not at the front of it. See
-    /// [`Self::reconnect_all_not_needed_peers`]: on a torrent with a tracker or the DHT
-    /// running they queue behind whatever addresses piled up while the cap was low, so they
-    /// come back over the following seconds rather than at once. Handing them back their old
-    /// slots would need a queue with a front, which that is not.
+    /// Raising it hands the peer adder that many more permits and asks for the parked peers
+    /// back, ahead of every address a tracker or the DHT has named in the meantime -- see
+    /// [`Self::reconnect_all_not_needed_peers`]. They still come back over a moment rather
+    /// than at once, since each has to be dialled and handshaked again.
     ///
     /// Only peers we have an address to dial come back that way -- one we dialled ourselves,
     /// or one that named its listening port in the extended handshake. A peer that dialled
@@ -1175,10 +1200,13 @@ impl TorrentStateLive {
             // debts are simply written off before any new permit is issued.
             let add = limit - prev;
             let written_off = sub_saturating(&self.peer_permits_to_forget, add);
+            // Ask for the parked peers back before the slots to dial them with exist. The
+            // adder is waiting on a slot with an address already in hand, and takes the
+            // next the instant it has one: put the proven peers where it will look first.
+            self.reconnect_all_not_needed_peers();
             if add > written_off {
                 self.peer_semaphore.add_permits(add - written_off);
             }
-            self.reconnect_all_not_needed_peers();
         } else if limit < prev {
             let remove = prev - limit;
             // Book the debt first, then take what is not out on loan right away. A peer
@@ -1383,16 +1411,17 @@ impl TorrentStateLive {
     /// lowered cap parked, and equally the ones that left cleanly and the seeders parked
     /// when the torrent finished.
     ///
-    /// They go on the tail of the same FIFO channel that `add_peer_if_not_seen` feeds with
-    /// every address the tracker, the DHT and PEX name, and the adder takes them in order as
-    /// permits free up. So this asks for them back; it does not put them first, and on a
-    /// busy torrent a long backlog is dialled ahead of them.
+    /// They go on a queue of their own, which the adder drains before the one
+    /// `add_peer_if_not_seen` feeds with every address a tracker, the DHT and PEX name.
+    /// They are peers we have already talked to, and the backlog on the other queue is a
+    /// list of guesses -- at a low cap nothing drains it, so it is exactly when these peers
+    /// matter most, on the way back from a lowered cap, that it would be longest.
     pub(crate) fn reconnect_all_not_needed_peers(&self) {
         self.peers
             .states
             .iter_mut()
             .filter_map(|mut p| p.value_mut().reconnect_not_needed_peer(&self.peers))
-            .map(|socket_addr| self.peer_queue_tx.send(socket_addr))
+            .map(|socket_addr| self.peer_requeue_tx.send(socket_addr))
             .take_while(|r| r.is_ok())
             .last();
     }
@@ -1900,7 +1929,7 @@ impl PeerHandler {
                         .unwrap_or(false);
                     if should_requeue {
                         self.state
-                            .peer_queue_tx
+                            .peer_requeue_tx
                             .send(handle)
                             .ok()
                             .ok_or(Error::TorrentIsNotLive)?;
