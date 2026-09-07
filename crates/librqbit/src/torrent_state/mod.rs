@@ -213,6 +213,45 @@ pub struct ManagedTorrent {
     pub(crate) locked: RwLock<ManagedTorrentLocked>,
 }
 
+/// The pieces [`ManagedTorrent::drop_pieces`] dropped, and a claim on them.
+///
+/// While this is alive nothing will download those pieces again, so their storage can be
+/// released without racing a piece coming back. Without the claim there is a window: the
+/// have-bit is cleared, but a live stream's lookahead can reach the same piece, download
+/// it and set the bit again before the caller's deletion lands - and the deletion then
+/// removes a piece we have and are advertising.
+///
+/// So: read [`Self::pieces`], release their storage, then drop this. Dropping it is what
+/// tells the torrent the pieces are gone for real and may be downloaded again; a piece
+/// that was reselected in the meantime is queued for download right then.
+#[must_use = "the pieces stay claimed until this is dropped: release their storage first"]
+pub struct DroppedPieces {
+    live: Weak<TorrentStateLive>,
+    pieces: Vec<u32>,
+}
+
+impl DroppedPieces {
+    /// The pieces that were actually dropped, in the order they were passed in.
+    pub fn pieces(&self) -> &[u32] {
+        &self.pieces
+    }
+}
+
+impl std::fmt::Debug for DroppedPieces {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("DroppedPieces").field(&self.pieces).finish()
+    }
+}
+
+impl Drop for DroppedPieces {
+    fn drop(&mut self) {
+        if let Some(live) = self.live.upgrade() {
+            live.finish_release(&self.pieces);
+        }
+        // If the torrent isn't live anymore the claim went away with the piece tracker.
+    }
+}
+
 impl ManagedTorrent {
     pub fn id(&self) -> TorrentId {
         self.shared.id
@@ -300,12 +339,12 @@ impl ManagedTorrent {
 
     /// Drop the pieces in `pieces` that we currently have: forget that we have them,
     /// stop advertising them to peers, and stop wanting them back. Returns the pieces
-    /// that were actually dropped, so the caller can release the storage behind them.
+    /// that were actually dropped, so the caller can release the storage behind them,
+    /// together with a claim on them - see [`DroppedPieces`].
     ///
     /// This is bookkeeping only: it does not touch storage. Storage is one file per
     /// piece, so releasing a dropped piece is a file deletion and the caller owns it -
-    /// which also means it works on any filesystem, and that a crash can never leave the
-    /// have-bitfield disagreeing with the disk, because the disk is the have-set.
+    /// which also means it works on any filesystem.
     ///
     /// This is what makes it possible to keep streaming a torrent that doesn't fit on the
     /// disk while still seeding everything that does. Deciding *which* pieces to drop is
@@ -323,10 +362,13 @@ impl ManagedTorrent {
     ///
     /// NOTE: the want-set is per-session and is not persisted - see
     /// [`crate::AddTorrentOptions::piece_reclaim`].
-    pub fn drop_pieces(&self, pieces: Range<u32>) -> anyhow::Result<Vec<u32>> {
-        self.live()
-            .context("torrent is not live")?
-            .drop_pieces(pieces)
+    pub fn drop_pieces(&self, pieces: Range<u32>) -> anyhow::Result<DroppedPieces> {
+        let live = self.live().context("torrent is not live")?;
+        let pieces = live.drop_pieces(pieces)?;
+        Ok(DroppedPieces {
+            live: Arc::downgrade(&live),
+            pieces,
+        })
     }
 
     /// Make pieces dropped by [`Self::drop_pieces`] wanted again, e.g. after seeking

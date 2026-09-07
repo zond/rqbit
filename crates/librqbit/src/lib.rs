@@ -98,8 +98,8 @@ pub use session::{
 };
 pub use stream_connect::ConnectionOptions;
 pub use torrent_state::{
-    DEFAULT_STREAM_LOOKAHEAD_BYTES, FileStreamOptions, ManagedTorrent, ManagedTorrentShared,
-    ManagedTorrentState, TorrentMetadata, TorrentStats, TorrentStatsState,
+    DEFAULT_STREAM_LOOKAHEAD_BYTES, DroppedPieces, FileStreamOptions, ManagedTorrent,
+    ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats, TorrentStatsState,
 };
 pub use type_aliases::FileInfos;
 
