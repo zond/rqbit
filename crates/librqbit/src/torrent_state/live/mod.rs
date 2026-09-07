@@ -873,15 +873,18 @@ impl TorrentStateLive {
     pub(crate) fn reselect_pieces(&self, pieces: Range<u32>) -> anyhow::Result<usize> {
         let pieces = clamp_piece_range(pieces, &self.lengths)
             .filter_map(|id| self.lengths.validate_piece_index(id));
-        let count = self
+        let res = self
             .lock_write("reselect_pieces")
             .get_pieces_mut()?
             .reselect_pieces(pieces)?;
-        if count > 0 {
+        // Only a piece that went back into the queue is one a peer can do something
+        // about. A piece whose file the user has deselected is wanted again but not
+        // queued, and waking every peer for it wakes them up to find nothing to do.
+        if res.queued > 0 {
             self.reconnect_all_not_needed_peers();
             self.new_pieces_notify.notify_waiters();
         }
-        Ok(count)
+        Ok(res.reselected)
     }
 
     pub(crate) fn update_only_files(&self, only_files: &HashSet<usize>) -> anyhow::Result<()> {

@@ -19,7 +19,7 @@ use librqbit_core::lengths::ValidPieceIndex;
 use peer_binary_protocol::Piece;
 
 use crate::{
-    chunk_tracker::{ChunkMarkingResult, ChunkTracker},
+    chunk_tracker::{ChunkMarkingResult, ChunkTracker, Reselected},
     file_info::FileInfo,
     type_aliases::{FileInfos, FilePriorities, PeerHandle},
 };
@@ -303,7 +303,7 @@ impl PieceTracker {
     pub fn reselect_pieces(
         &mut self,
         pieces: impl IntoIterator<Item = ValidPieceIndex>,
-    ) -> crate::Result<usize> {
+    ) -> crate::Result<Reselected> {
         self.chunks.reselect_pieces(pieces)
     }
 
