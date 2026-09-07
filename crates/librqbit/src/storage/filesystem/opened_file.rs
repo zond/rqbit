@@ -275,6 +275,14 @@ mod tests {
     // 2 GiB is where a 32-bit off_t runs out. On a 64-bit host this still goes through
     // pwritev, so it cannot reproduce the 32-bit failure; on a 32-bit target the same
     // test takes the fallback.
+    //
+    // Unix only, and not because the code under test is: writing at this offset leaves a
+    // 2 GiB hole, which is free where files are sparse by default and is not on NTFS,
+    // where Windows zero-fills it -- six files of it, more than a CI runner has room or
+    // time for. It timed out an unrelated e2e download on the Windows runner of PR #661
+    // before it was gated. Windows takes the seek_write path below, whose offset is a
+    // u64 with no such boundary, so there is nothing there for this test to find.
+    #[cfg(unix)]
     #[test]
     fn test_pwrite_all_vectored_past_2gib() {
         check_pwrite_all_vectored(
