@@ -473,3 +473,215 @@ async fn test_e2e_piece_reclaim_claim_survives_pause() -> anyhow::Result<()> {
     )
     .await?
 }
+
+// A storage whose pieces the caller releases, on top of the filesystem one.
+//
+// It is a middleware in the sense of storage::middleware: it forwards everything to a
+// FilesystemStorage, and forwards is_type_id() too, so session persistence recognizes
+// what is underneath and will serialize a torrent using it.
+//
+// What it adds is a released-set, which is what has_piece() answers from. The bytes of a
+// released piece are still on disk here - deleting them is the caller's job and it hasn't
+// got round to it - and that is the point: the storage is the authority on what we have,
+// not the bytes, and not the resume data.
+#[derive(Clone, Default)]
+struct ReleasingStorageFactory {
+    underlying_factory: crate::storage::filesystem::FilesystemStorageFactory,
+    released: std::sync::Arc<parking_lot::RwLock<std::collections::HashSet<u32>>>,
+}
+
+impl ReleasingStorageFactory {
+    fn release_piece(&self, piece_id: u32) {
+        self.released.write().insert(piece_id);
+    }
+}
+
+impl crate::storage::StorageFactory for ReleasingStorageFactory {
+    type Storage = ReleasingStorage;
+
+    fn create(
+        &self,
+        shared: &crate::ManagedTorrentShared,
+        metadata: &crate::torrent_state::TorrentMetadata,
+    ) -> anyhow::Result<Self::Storage> {
+        Ok(ReleasingStorage {
+            underlying: Box::new(self.underlying_factory.create(shared, metadata)?),
+            released: self.released.clone(),
+        })
+    }
+
+    fn is_type_id(&self, type_id: std::any::TypeId) -> bool {
+        self.underlying_factory.is_type_id(type_id)
+    }
+
+    fn clone_box(&self) -> crate::storage::BoxStorageFactory {
+        self.clone().boxed()
+    }
+}
+
+struct ReleasingStorage {
+    underlying: Box<dyn crate::storage::TorrentStorage>,
+    released: std::sync::Arc<parking_lot::RwLock<std::collections::HashSet<u32>>>,
+}
+
+impl crate::storage::TorrentStorage for ReleasingStorage {
+    fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        self.underlying.pread_exact(file_id, offset, buf)
+    }
+
+    fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+        self.underlying.pwrite_all(file_id, offset, buf)
+    }
+
+    fn remove_file(&self, file_id: usize, filename: &std::path::Path) -> anyhow::Result<()> {
+        self.underlying.remove_file(file_id, filename)
+    }
+
+    fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
+        self.underlying.ensure_file_length(file_id, length)
+    }
+
+    fn take(&self) -> anyhow::Result<Box<dyn crate::storage::TorrentStorage>> {
+        Ok(Box::new(ReleasingStorage {
+            underlying: self.underlying.take()?,
+            released: self.released.clone(),
+        }))
+    }
+
+    fn init(
+        &mut self,
+        shared: &crate::ManagedTorrentShared,
+        metadata: &crate::torrent_state::TorrentMetadata,
+    ) -> anyhow::Result<()> {
+        self.underlying.init(shared, metadata)
+    }
+
+    fn remove_directory_if_empty(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.underlying.remove_directory_if_empty(path)
+    }
+
+    fn has_piece(
+        &self,
+        piece_index: librqbit_core::lengths::ValidPieceIndex,
+    ) -> anyhow::Result<bool> {
+        Ok(!self.released.read().contains(&piece_index.get()))
+    }
+}
+
+// The have-bitfield is flushed lazily (16 MiB of piece completions), so a caller that
+// releases pieces and then dies leaves resume data claiming pieces it no longer has.
+// Startup intersects that resume data with TorrentStorage::has_piece(), and this is that
+// path end to end: download with session persistence on, release half the pieces without
+// flushing anything, then start a second session over the same persistence and storage.
+//
+// Nothing else would catch it: the fastresume hash check validates one piece per file
+// plus at most 64 sampled ones, and here the released pieces' bytes are still on disk, so
+// they would pass it.
+async fn e2e_piece_reclaim_resume_data_is_intersected_with_storage() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (files, torrent_bytes, _server_session, peer) =
+        seeding_server("test_piece_reclaim_resume", FILE_SIZE).await?;
+    let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
+
+    let dir = TempDir::with_prefix("test_piece_reclaim_resume_client")?;
+    let output_folder = dir.path().join("out");
+    let persistence_folder = dir.path().join("session");
+    let storage = ReleasingStorageFactory::default();
+
+    let session_opts = || crate::SessionOptions {
+        dht: None,
+        persistence: Some(crate::SessionPersistenceConfig::Json {
+            folder: Some(persistence_folder.clone()),
+        }),
+        fastresume: true,
+        disable_local_service_discovery: true,
+        peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+        default_storage_factory: Some(storage.clone().boxed()),
+        ..Default::default()
+    };
+
+    let session = Session::new_with_opts(output_folder.clone(), session_opts()).await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent_bytes.clone()),
+            Some(crate::AddTorrentOptions {
+                paused: false,
+                initial_peers: Some(vec![peer]),
+                piece_reclaim: true,
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
+    assert_eq!(
+        std::fs::read(output_folder.join("0.data")).unwrap(),
+        orig_content
+    );
+
+    // The have-bitfield as it stands with everything downloaded. This is what is on disk
+    // at the moment of the crash below: dropping pieces defers the flush to the same
+    // 16 MiB threshold as completing them, and this torrent is 256 KiB.
+    let bitv = std::fs::read_dir(&persistence_folder)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|e| e == "bitv"))
+        .context("expected a .bitv file in the persistence folder")?;
+    let resume_before_drop = std::fs::read(&bitv)?;
+
+    // The caller takes half the pieces and releases their storage.
+    let dropped = handle.drop_pieces(DROP)?;
+    assert_eq!(dropped.pieces(), DROP.collect::<Vec<_>>());
+    for id in dropped.pieces() {
+        storage.release_piece(*id);
+    }
+    drop(dropped);
+
+    // Shut the session down and put back the bitfield a crash would have left. Dropping
+    // the session is an orderly shutdown - DiskBackedBitV flushes on drop - and that is
+    // exactly what a crash doesn't get to do.
+    drop(handle);
+    drop(session);
+    let mut flushed = false;
+    for _ in 0..100 {
+        if std::fs::read(&bitv)? != resume_before_drop {
+            flushed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        flushed,
+        "the shutdown never wrote the bitfield, so putting back the pre-drop one proves nothing"
+    );
+    std::fs::write(&bitv, &resume_before_drop)?;
+
+    let session = Session::new_with_opts(output_folder.clone(), session_opts()).await?;
+    let handle = session
+        .get(crate::api::TorrentIdOrHash::Id(0))
+        .context("expected the torrent to be restored from persistence")?;
+    timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+
+    handle.with_chunk_tracker(|ct| {
+        let have = ct.get_have_pieces().as_slice();
+        for id in 0..TOTAL_PIECES {
+            assert_eq!(
+                have[id as usize],
+                !DROP.contains(&id),
+                "piece {id}: the have-set came from the resume data, not from the storage"
+            );
+        }
+    })?;
+    assert!(!handle.stats().finished);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_piece_reclaim_resume_data_is_intersected_with_storage() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_piece_reclaim_resume_data_is_intersected_with_storage(),
+    )
+    .await?
+}
