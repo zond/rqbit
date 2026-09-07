@@ -52,6 +52,20 @@ impl Peer {
         }
     }
 
+    /// A peer sitting in `state` already, with fresh counters. For tests that exercise a
+    /// decision about a peer without a torrent, a table or a connection behind it -- the
+    /// real transitions all go through [`Self::set_state`], which needs the counters the
+    /// table keeps.
+    #[cfg(test)]
+    pub(crate) fn new_in_state_for_test(addr: SocketAddr, state: PeerState) -> Self {
+        Self {
+            addr,
+            state,
+            stats: Default::default(),
+            outgoing_address: Some(addr),
+        }
+    }
+
     pub fn new_with_outgoing_address(addr: SocketAddr) -> Self {
         Self {
             addr,

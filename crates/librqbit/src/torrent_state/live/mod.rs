@@ -1083,17 +1083,17 @@ impl TorrentStateLive {
 
     /// Change the live-peer cap of a running torrent.
     ///
-    /// Raising it hands the peer adder that many more permits and re-queues the peers a
-    /// lower cap parked (`NotNeeded`), so they are the first to come back. Lowering it takes
-    /// the spare permits away at once and, if more peers are connected than the new cap has
-    /// room for, disconnects the surplus -- least useful first: peers still connecting, then
-    /// peers that have nothing we need and want nothing from us, the fewest bytes exchanged
-    /// first among equals -- and forgets their permits as they come back instead of
-    /// releasing them. A peer asked to go ends like one we drop after finishing: its
-    /// in-flight pieces return to the queue and it stays in the table as `NotNeeded`, so
+    /// Lowering it takes the spare permits away at once and, if more peers are connected
+    /// than the new cap has room for, disconnects the surplus -- least useful first, by the
+    /// order [`surplus_rank`] lays out -- and forgets their permits as they come back
+    /// instead of releasing them. A peer asked to go ends like one we drop after finishing:
+    /// its in-flight pieces return to the queue and it stays in the table as `NotNeeded`, so
     /// nothing re-dials it until the cap is raised; incoming connections beyond the cap are
     /// refused as before. Until the surplus has actually hung up, live peers exceed the cap
     /// by that many, and no more.
+    ///
+    /// Raising it hands the peer adder that many more permits and re-queues the peers a
+    /// lower cap parked (`NotNeeded`), so they are the first to come back.
     ///
     /// Idempotent and cheap: no I/O, the state lock is taken only to read the queue of
     /// pieces still needed, and never while the peer table is touched.
@@ -1135,11 +1135,11 @@ impl TorrentStateLive {
     }
 
     /// Hang up on the peers a cap of `limit` has no room for, least useful first (see
-    /// `set_peer_limit`), the way a peer we no longer need after finishing is dropped: parked
-    /// as `NotNeeded` first, then asked to disconnect. Its task ends on the request, and
-    /// `on_peer_died` finds it parked, hands back the pieces it had in flight and returns its
-    /// permit. A peer still connecting is parked the same way: the handshake then finds no
-    /// `Connecting` state to promote and the queued request closes the writer.
+    /// [`Self::surplus_rank`]), the way a peer we no longer need after finishing is dropped:
+    /// parked as `NotNeeded` first, then asked to disconnect. Its task ends on the request,
+    /// and `on_peer_died` finds it parked, hands back the pieces it had in flight and
+    /// returns its permit. A peer still connecting is parked the same way: the handshake
+    /// then finds no `Connecting` state to promote and the queued request closes the writer.
     fn disconnect_surplus_peers(&self, limit: usize) {
         // Read the queue of pieces still needed first, and let go of the state lock before
         // the table is touched (see `PeerTable` for the lock order).
@@ -1156,22 +1156,11 @@ impl TorrentStateLive {
             })
         };
 
-        // (is live, is useful, bytes exchanged, addr): sorted ascending, the front is the
-        // least worth keeping. A peer we are still connecting to has proven nothing; a
-        // live one is useful if it wants what we have or has what we want.
-        let mut ranked: Vec<(bool, bool, u64, SocketAddr)> = Vec::new();
+        let mut ranked: Vec<(SurplusRank, SocketAddr)> = Vec::new();
         for pe in self.peers.states.iter() {
             let peer = pe.value();
-            match peer.get_state() {
-                PeerState::Connecting(_) => ranked.push((false, false, 0, peer.addr)),
-                PeerState::Live(live) => {
-                    let counters = &peer.stats.counters;
-                    let bytes = counters.fetched_bytes.load(Ordering::Relaxed)
-                        + counters.uploaded_bytes.load(Ordering::Relaxed);
-                    let useful = live.peer_interested || has_needed_piece(&live.bitfield);
-                    ranked.push((true, useful, bytes, peer.addr));
-                }
-                _ => {}
+            if let Some(rank) = surplus_rank(peer, &has_needed_piece) {
+                ranked.push((rank, peer.addr));
             }
         }
         let surplus = ranked.len().saturating_sub(limit);
@@ -1180,7 +1169,7 @@ impl TorrentStateLive {
         }
         ranked.sort_unstable();
         let mut parked = 0usize;
-        for (_, _, _, addr) in ranked.into_iter().take(surplus) {
+        for (_, addr) in ranked.into_iter().take(surplus) {
             self.peers
                 .with_peer_mut(addr, "disconnect_surplus_peers", |peer| {
                     // Gone or changed since the ranking: nothing to hang up on.
@@ -1204,7 +1193,60 @@ impl TorrentStateLive {
             parked, "peer limit lowered, disconnecting the surplus"
         );
     }
+}
 
+/// (talking to us, useful either way, bytes moved recently, bytes moved ever). See
+/// [`surplus_rank`].
+type SurplusRank = (bool, bool, u64, u64);
+
+/// Where a peer stands when a lowered cap has to let some go: sorted ascending, the front
+/// is the least worth keeping. `None` for a peer we are neither talking to nor dialling,
+/// which the cap neither counts nor touches.
+///
+/// The order is, in this order:
+///
+/// 1. a peer still connecting, which has proven nothing;
+/// 2. a peer with nothing to exchange in *either* direction -- not interested in anything
+///    we have, and holding no piece we still want;
+/// 3. fewest bytes moved either way in the recent window
+///    ([`AtomicPeerCounters::bytes_moved_recently`]);
+/// 4. fewest bytes moved either way over the whole connection, which breaks the tie
+///    between peers that have been quiet for a window or two.
+///
+/// Recent bytes ahead of lifetime bytes because the lifetime totals on their own merely
+/// favour whoever connected first: a peer that gave us 50 MB an hour ago and has since
+/// gone silent would outrank one that arrived a minute ago and is feeding us now.
+///
+/// # Both directions count the same
+///
+/// A peer we only upload to and a peer that only feeds us are worth exactly the same
+/// here, and nothing in this function asks whether the torrent is downloading or seeding.
+/// That is deliberate. A torrent crosses between the two constantly -- a stream finishes,
+/// the app goes to the background, the viewer seeks back into what we already have -- and
+/// a rank that changed with the crossing would re-cut the swarm at every one of them, and
+/// would have a regime to misdetect on top. A symmetric rank has neither problem, and the
+/// cap exists to bound memory, which a peer costs the same either way.
+///
+/// Where a peer *is* plays no part either. Latency is a proxy for throughput and a poor
+/// one -- a peer down the street on a saturated uplink is worth less than a distant one
+/// with room -- and the bytes counted above are the very thing it would be standing in
+/// for, measured rather than guessed.
+fn surplus_rank(peer: &Peer, has_needed_piece: &impl Fn(&BF) -> bool) -> Option<SurplusRank> {
+    let counters = &peer.stats.counters;
+    match peer.get_state() {
+        PeerState::Connecting(_) => Some((false, false, 0, 0)),
+        PeerState::Live(live) => Some((
+            true,
+            live.peer_interested || has_needed_piece(&live.bitfield),
+            counters.bytes_moved_recently(),
+            counters.fetched_bytes.load(Ordering::Relaxed)
+                + counters.uploaded_bytes.load(Ordering::Relaxed),
+        )),
+        _ => None,
+    }
+}
+
+impl TorrentStateLive {
     /// Drop from the peer table every peer we are neither talking to nor about to: the ones
     /// that died and are waiting out a backoff (`Dead`) and the ones we hung up on because
     /// there was nothing to exchange (`NotNeeded`). Returns how many.
@@ -1487,6 +1529,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         self.counters
             .uploaded_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.counters.on_bytes_moved(bytes as u64);
         self.state
             .stats
             .uploaded_bytes
@@ -2138,6 +2181,7 @@ impl PeerHandler {
         self.counters
             .fetched_bytes
             .fetch_add(piece.len() as u64, Ordering::Relaxed);
+        self.counters.on_bytes_moved(piece.len() as u64);
         self.counters.fetched_chunks.fetch_add(1, Ordering::Relaxed);
 
         let should_process = self
@@ -2480,8 +2524,16 @@ fn format_peer_client_name(value: &ByteBuf<'_>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::clamp_piece_range;
-    use librqbit_core::lengths::Lengths;
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    use librqbit_core::{hash_id::Id20, lengths::Lengths};
+
+    use super::{
+        BF, Ordering, Peer, PeerState, WriterRequest, clamp_piece_range,
+        peer::{LivePeerState, PeerTx},
+        surplus_rank,
+    };
+    use crate::stream_connect::ConnectionKind;
 
     #[test]
     fn test_clamp_piece_range() {
@@ -2499,5 +2551,115 @@ mod tests {
         let r = clamp_piece_range(100..u32::MAX, &lengths);
         assert!(r.is_empty(), "{r:?}");
         assert_eq!(r.count(), 0);
+    }
+
+    /// A bitfield of eight pieces holding exactly the ones listed.
+    fn bitfield(has: &[usize]) -> BF {
+        let mut bf = BF::from_boxed_slice(vec![0u8; 1].into_boxed_slice());
+        for index in has {
+            bf.set(*index, true);
+        }
+        bf
+    }
+
+    /// A live peer at `port`, with `peer_interested` as given, holding `has`, that has
+    /// fetched `fetched` bytes from us and been sent `uploaded`. `recent` says how much of
+    /// that moved lately.
+    fn live_peer(
+        port: u16,
+        peer_interested: bool,
+        has: &[usize],
+        fetched: u64,
+        uploaded: u64,
+        recent: u64,
+    ) -> Peer {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<WriterRequest>();
+        let tx: PeerTx = tx;
+        let mut live = LivePeerState::new(
+            Id20::new([0u8; 20]),
+            tx,
+            peer_interested,
+            ConnectionKind::Tcp,
+        );
+        live.bitfield = bitfield(has);
+        let peer = Peer::new_in_state_for_test(addr, PeerState::Live(live));
+        peer.stats
+            .counters
+            .fetched_bytes
+            .store(fetched, Ordering::Relaxed);
+        peer.stats
+            .counters
+            .uploaded_bytes
+            .store(uploaded, Ordering::Relaxed);
+        if recent > 0 {
+            peer.stats.counters.on_bytes_moved(recent);
+        }
+        peer
+    }
+
+    /// The cut a lowered cap makes does not care which way a peer's bytes go: one we only
+    /// upload to and one that only feeds us survive it together, and the two peers doing
+    /// nothing either way are the ones dropped.
+    #[test]
+    fn the_surplus_cut_is_blind_to_direction() {
+        // We still want piece 0 and nothing else.
+        let has_needed_piece = |bf: &BF| bf.get(0).is_some_and(|b| *b);
+
+        // Only feeds us: has the piece we want, wants nothing of ours.
+        let feeder = live_peer(1, false, &[0], 4096, 0, 4096);
+        // Only takes from us: wants what we have, holds nothing we need.
+        let consumer = live_peer(2, true, &[1], 0, 4096, 4096);
+        // Neither: nothing we want, wants nothing, and has moved nothing.
+        let idle_a = live_peer(3, false, &[1], 0, 0, 0);
+        let idle_b = live_peer(4, false, &[2], 0, 0, 0);
+        // A peer we have not finished dialling has shown even less than the idle two.
+        let connecting = {
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 5));
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            Peer::new_in_state_for_test(addr, PeerState::Connecting(tx))
+        };
+
+        let rank = |p: &Peer| surplus_rank(p, &has_needed_piece).unwrap();
+        let feeder_rank = rank(&feeder);
+        let consumer_rank = rank(&consumer);
+
+        // The two useful ones are worth the same: same "useful" bit, same bytes, and the
+        // direction those bytes went makes no difference to either.
+        assert_eq!(feeder_rank, consumer_rank);
+
+        let mut ranked = vec![
+            (rank(&idle_a), 3u16),
+            (feeder_rank, 1),
+            (rank(&connecting), 5),
+            (consumer_rank, 2),
+            (rank(&idle_b), 4),
+        ];
+        ranked.sort_unstable();
+        let order: Vec<u16> = ranked.iter().map(|(_, port)| *port).collect();
+
+        // Cut down to two: the peer still connecting goes first, then the idle pair.
+        assert_eq!(&order[..3], &[5, 3, 4], "{ranked:?}");
+        let kept: Vec<u16> = order[3..].to_vec();
+        assert!(kept.contains(&1) && kept.contains(&2), "{kept:?}");
+    }
+
+    /// Between two peers that are equally useful, the one that moved bytes lately beats
+    /// the one whose bytes are all in the past -- otherwise the cut just keeps whoever
+    /// connected first.
+    #[test]
+    fn recent_bytes_outrank_a_long_dead_lifetime_total() {
+        let has_needed_piece = |bf: &BF| bf.get(0).is_some_and(|b| *b);
+        // An old hand: a lot of bytes, none of them recent.
+        let veteran = live_peer(1, false, &[0], 50_000_000, 0, 0);
+        // A newcomer that is working now, and has moved four kilobytes in its whole life.
+        let newcomer = live_peer(2, false, &[0], 4096, 0, 4096);
+
+        let veteran_rank = surplus_rank(&veteran, &has_needed_piece).unwrap();
+        let newcomer_rank = surplus_rank(&newcomer, &has_needed_piece).unwrap();
+        assert!(
+            veteran_rank < newcomer_rank,
+            "{veteran_rank:?} should rank below {newcomer_rank:?}"
+        );
     }
 }
