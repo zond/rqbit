@@ -8,6 +8,10 @@
 //! - QUEUED (available to download)
 //! - IN_FLIGHT (currently being downloaded)
 //! - NOT_NEEDED (not selected for download)
+//!
+//! On top of that, a piece dropped through [`PieceTracker::drop_pieces`] is RELEASING
+//! until the caller reports back through [`PieceTracker::finish_release`]: it is not
+//! HAVE, and nothing may make it HAVE again while the caller is deleting its storage.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -79,6 +83,12 @@ where
 pub struct PieceTracker {
     chunks: ChunkTracker,
     inflight: HashMap<ValidPieceIndex, InflightPiece>,
+
+    // Pieces that drop_pieces() handed to the caller so it can release their storage, and
+    // that the caller hasn't reported back on yet. Nothing may download one of these in
+    // the meantime: we would set the have-bit back, and the deletion the caller is in the
+    // middle of would then remove a piece we have.
+    releasing: HashSet<ValidPieceIndex>,
 }
 
 impl PieceTracker {
@@ -89,6 +99,7 @@ impl PieceTracker {
         Self {
             chunks,
             inflight: HashMap::new(),
+            releasing: HashSet::new(),
         }
     }
 
@@ -136,6 +147,7 @@ impl PieceTracker {
         for piece in &mut req.priority_pieces {
             if !self.chunks.is_piece_have(piece)
                 && !self.inflight.contains_key(&piece)
+                && !self.releasing.contains(&piece)
                 && (req.peer_has_piece)(piece)
             {
                 return self.reserve_piece(piece, req.peer);
@@ -150,7 +162,7 @@ impl PieceTracker {
             .collect();
 
         for piece in queued {
-            if (req.peer_has_piece)(piece) {
+            if (req.peer_has_piece)(piece) && !self.releasing.contains(&piece) {
                 return self.reserve_piece(piece, req.peer);
             }
         }
@@ -291,12 +303,37 @@ impl PieceTracker {
 
     /// Drop pieces we have: see [`ChunkTracker::drop_pieces`]. A piece we have is never
     /// in-flight, so this doesn't interact with inflight tracking.
+    ///
+    /// The pieces it returns are claimed until [`Self::finish_release`] is called for
+    /// them: the caller is about to delete their storage, and until that is done nothing
+    /// may download them again.
     pub fn drop_pieces(
         &mut self,
         file_infos: &FileInfos,
         pieces: impl IntoIterator<Item = ValidPieceIndex>,
     ) -> crate::Result<Vec<ValidPieceIndex>> {
-        self.chunks.drop_pieces(file_infos, pieces)
+        let dropped = self.chunks.drop_pieces(file_infos, pieces)?;
+        self.releasing.extend(dropped.iter().copied());
+        Ok(dropped)
+    }
+
+    /// The caller is done releasing the storage of these pieces, so they may be
+    /// downloaded again. Returns how many of them are queued, i.e. whether anything is
+    /// waiting on them.
+    pub fn finish_release(&mut self, pieces: impl IntoIterator<Item = ValidPieceIndex>) -> usize {
+        let mut queued = 0;
+        for piece in pieces {
+            if self.releasing.remove(&piece) && self.chunks.is_piece_queued(piece) {
+                queued += 1;
+            }
+        }
+        queued
+    }
+
+    /// True if the piece was dropped and the caller hasn't finished releasing its storage.
+    #[allow(dead_code)]
+    pub fn is_releasing(&self, piece: ValidPieceIndex) -> bool {
+        self.releasing.contains(&piece)
     }
 
     /// Make previously dropped pieces wanted again.
@@ -389,6 +426,87 @@ mod tests {
 
     fn make_default_file_priorities(file_infos: &FileInfos) -> FilePriorities {
         (0..file_infos.len()).collect()
+    }
+
+    fn make_reclaim_tracker(num_pieces: u32) -> PieceTracker {
+        let mut chunks = make_test_chunk_tracker(num_pieces);
+        chunks.enable_piece_reclaim();
+        let mut tracker = PieceTracker::new(chunks);
+        // Have everything, so nothing is queued and acquisition has to come from the
+        // piece we drop below.
+        for id in 0..num_pieces {
+            let p = piece(&tracker, id);
+            // Same order as the real thing: reserve it, then mark it good.
+            tracker.chunks.reserve_needed_piece(p);
+            tracker.mark_piece_hash_ok(p);
+        }
+        tracker
+    }
+
+    fn piece(tracker: &PieceTracker, id: u32) -> ValidPieceIndex {
+        tracker
+            .chunks()
+            .get_lengths()
+            .validate_piece_index(id)
+            .unwrap()
+    }
+
+    fn acquire(
+        tracker: &mut PieceTracker,
+        file_infos: &FileInfos,
+        file_priorities: &FilePriorities,
+        priority: Option<ValidPieceIndex>,
+    ) -> AcquireResult {
+        tracker.acquire_piece(AcquireRequest {
+            peer: peer(1),
+            peer_avg_time: None,
+            priority_pieces: priority.into_iter(),
+            file_priorities,
+            file_infos,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+        })
+    }
+
+    // A piece handed to the caller so it can delete the storage behind it must not be
+    // downloaded again until the caller says the deletion is done. Otherwise we set the
+    // have-bit back and the deletion removes a piece we have and are advertising.
+    #[test]
+    fn test_a_dropped_piece_is_not_reacquired_until_released() {
+        let file_infos = make_test_file_infos(3);
+        let file_priorities = make_default_file_priorities(&file_infos);
+        let mut tracker = make_reclaim_tracker(3);
+        let p0 = piece(&tracker, 0);
+
+        assert_eq!(tracker.drop_pieces(&file_infos, [p0]).unwrap(), [p0]);
+        assert!(tracker.is_releasing(p0));
+
+        // The picker's priority path deliberately ignores "dropped" - a reader that seeks
+        // backwards into a reclaimed range gets the piece back on its own. It must not do
+        // that while the storage behind it is being deleted.
+        let res = acquire(&mut tracker, &file_infos, &file_priorities, Some(p0));
+        assert!(
+            matches!(res, AcquireResult::NoneAvailable),
+            "acquired a piece whose storage is being released: {res:?}"
+        );
+
+        // Neither may the queue path, even once the piece is wanted again.
+        tracker.reselect_pieces([p0]).unwrap();
+        let res = acquire(&mut tracker, &file_infos, &file_priorities, None);
+        assert!(
+            matches!(res, AcquireResult::NoneAvailable),
+            "acquired a piece whose storage is being released: {res:?}"
+        );
+
+        // The caller is done deleting: the piece is queued, so this is worth a wake-up,
+        // and now it can be downloaded again.
+        assert_eq!(tracker.finish_release([p0]), 1);
+        assert!(!tracker.is_releasing(p0));
+        let res = acquire(&mut tracker, &file_infos, &file_priorities, None);
+        assert!(
+            matches!(res, AcquireResult::Reserved(p) if p == p0),
+            "{res:?}"
+        );
     }
 
     #[test]

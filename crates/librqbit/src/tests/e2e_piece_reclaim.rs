@@ -12,7 +12,7 @@ use tokio::{io::AsyncSeek, time::timeout};
 use tracing::info;
 
 use crate::{
-    AddTorrent, CreateTorrentOptions, Session, create_torrent,
+    AddTorrent, CreateTorrentOptions, DroppedPieces, Session, create_torrent,
     spawn_utils::BlockingSpawner,
     tests::test_util::{TestPeerMetadata, setup_test_logging},
 };
@@ -136,7 +136,7 @@ async fn e2e_piece_reclaim() -> anyhow::Result<()> {
     // be re-requested at once, and stall the reader in the meantime.
     {
         let _stream = handle.clone().stream(0).await?;
-        assert!(handle.drop_pieces(DROP)?.is_empty());
+        assert!(handle.drop_pieces(DROP)?.pieces().is_empty());
     }
 
     // The guard is evaluated under the write lock, not before taking it: a reader that
@@ -148,7 +148,7 @@ async fn e2e_piece_reclaim() -> anyhow::Result<()> {
         let live = handle.live().context("expected a live torrent")?;
 
         // All sync: holding the state lock across an await would stall the whole runtime.
-        let dropped = tokio::task::block_in_place(|| -> anyhow::Result<Vec<u32>> {
+        let dropped = tokio::task::block_in_place(|| -> anyhow::Result<DroppedPieces> {
             let g = live.lock_write("test_drop_pieces_guard");
             let dropper = std::thread::spawn({
                 let handle = handle.clone();
@@ -163,17 +163,22 @@ async fn e2e_piece_reclaim() -> anyhow::Result<()> {
         })?;
 
         assert!(
-            !dropped.contains(&SEEK_TO),
+            !dropped.pieces().contains(&SEEK_TO),
             "piece {SEEK_TO} was dropped from under a reader that had seeked to it: {dropped:?}"
         );
-        assert_eq!(handle.reselect_pieces(0..TOTAL_PIECES)?, dropped.len());
+        let count = dropped.pieces().len();
+        // Pretend we released the storage: until the claim goes, nothing re-downloads
+        // them, so the reselect below would queue pieces that no peer is allowed to take.
+        drop(dropped);
+        assert_eq!(handle.reselect_pieces(0..TOTAL_PIECES)?, count);
     }
     timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
     assert_eq!(std::fs::read(&downloaded).unwrap(), orig_content);
 
     info!("downloaded, now dropping pieces {DROP:?}");
 
-    assert_eq!(handle.drop_pieces(DROP)?, DROP.collect::<Vec<_>>());
+    let dropped = handle.drop_pieces(DROP)?;
+    assert_eq!(dropped.pieces(), DROP.collect::<Vec<_>>());
 
     // We no longer have them, so we no longer advertise them, and a peer asking for one
     // is refused - is_chunk_ready_to_upload() is the predicate the request path bails on.
@@ -206,6 +211,9 @@ async fn e2e_piece_reclaim() -> anyhow::Result<()> {
     // releases the storage, which with one file per piece is a file deletion.
     assert!(handle.stats().finished);
     assert_eq!(std::fs::read(&downloaded).unwrap(), orig_content);
+
+    // The caller has released the storage of those pieces, so the claim on them goes.
+    drop(dropped);
 
     // Dropping is sticky across a pause, which requeues everything we don't have and is
     // the likeliest place for a dropped piece to come straight back.
@@ -240,7 +248,8 @@ async fn e2e_piece_reclaim() -> anyhow::Result<()> {
     let started = Instant::now();
     let dropped = handle.drop_pieces(TOTAL_PIECES - 2..u32::MAX)?;
     let elapsed = started.elapsed();
-    assert_eq!(dropped, vec![TOTAL_PIECES - 2, TOTAL_PIECES - 1]);
+    assert_eq!(dropped.pieces(), [TOTAL_PIECES - 2, TOTAL_PIECES - 1]);
+    drop(dropped);
     assert!(
         elapsed < Duration::from_secs(1),
         "drop_pieces to u32::MAX took {elapsed:?}"

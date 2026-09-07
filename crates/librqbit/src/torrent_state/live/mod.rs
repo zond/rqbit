@@ -868,6 +868,24 @@ impl TorrentStateLive {
         Ok(dropped.into_iter().map(|id| id.get()).collect())
     }
 
+    /// The caller is done releasing the storage of these pieces: they may be downloaded
+    /// again. See [`crate::DroppedPieces`].
+    pub(crate) fn finish_release(&self, pieces: &[u32]) {
+        let queued = match self.lock_write("finish_release").get_pieces_mut() {
+            Ok(pt) => pt.finish_release(
+                pieces
+                    .iter()
+                    .filter_map(|id| self.lengths.validate_piece_index(*id)),
+            ),
+            // Paused: the claim went away with the piece tracker.
+            Err(_) => return,
+        };
+        if queued > 0 {
+            self.reconnect_all_not_needed_peers();
+            self.new_pieces_notify.notify_waiters();
+        }
+    }
+
     /// Make previously dropped pieces wanted again. Returns how many pieces stopped being
     /// dropped.
     pub(crate) fn reselect_pieces(&self, pieces: Range<u32>) -> anyhow::Result<usize> {
