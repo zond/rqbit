@@ -239,13 +239,17 @@ impl TorrentStateInitializing {
             &self.metadata.file_infos,
         );
 
-        let chunk_tracker = ChunkTracker::new(
+        let mut chunk_tracker = ChunkTracker::new(
             have_pieces.into_dyn(),
             selected_pieces,
             *self.metadata.lengths(),
             &self.metadata.file_infos,
         )
         .context("error creating chunk tracker")?;
+
+        if self.shared.options.piece_reclaim {
+            chunk_tracker.enable_piece_reclaim();
+        }
 
         let hns = chunk_tracker.get_hns();
 

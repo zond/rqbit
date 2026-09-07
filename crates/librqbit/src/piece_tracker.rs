@@ -289,6 +289,24 @@ impl PieceTracker {
         self.chunks.mark_chunk_downloaded(piece)
     }
 
+    /// Drop pieces we have: see [`ChunkTracker::drop_pieces`]. A piece we have is never
+    /// in-flight, so this doesn't interact with inflight tracking.
+    pub fn drop_pieces(
+        &mut self,
+        file_infos: &FileInfos,
+        pieces: impl IntoIterator<Item = ValidPieceIndex>,
+    ) -> crate::Result<Vec<ValidPieceIndex>> {
+        self.chunks.drop_pieces(file_infos, pieces)
+    }
+
+    /// Make previously dropped pieces wanted again.
+    pub fn reselect_pieces(
+        &mut self,
+        pieces: impl IntoIterator<Item = ValidPieceIndex>,
+    ) -> crate::Result<usize> {
+        self.chunks.reselect_pieces(pieces)
+    }
+
     /// Update which files are selected for download.
     pub fn update_only_files(
         &mut self,

@@ -7,6 +7,7 @@ pub mod utils;
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Weak;
@@ -117,6 +118,7 @@ pub(crate) struct ManagedTorrentOptions {
     pub ratelimits: LimitsConfig,
     pub initial_peers: Vec<SocketAddr>,
     pub peer_limit: Option<usize>,
+    pub piece_reclaim: bool,
     #[cfg(feature = "disable-upload")]
     pub _disable_upload: bool,
 }
@@ -294,6 +296,47 @@ impl ManagedTorrent {
     pub fn piece_chunk_progress(&self, piece_index: u32) -> anyhow::Result<PieceChunkProgress> {
         self.with_chunk_tracker(|chunks| chunks.piece_chunk_progress(piece_index))?
             .with_context(|| format!("piece index {piece_index} is out of range"))
+    }
+
+    /// Drop the pieces in `pieces` that we currently have: forget that we have them,
+    /// stop advertising them to peers, and stop wanting them back. Returns the pieces
+    /// that were actually dropped, so the caller can release the storage behind them.
+    ///
+    /// This is bookkeeping only: it does not touch storage. Storage is one file per
+    /// piece, so releasing a dropped piece is a file deletion and the caller owns it -
+    /// which also means it works on any filesystem, and that a crash can never leave the
+    /// have-bitfield disagreeing with the disk, because the disk is the have-set.
+    ///
+    /// This is what makes it possible to keep streaming a torrent that doesn't fit on the
+    /// disk while still seeding everything that does. Deciding *which* pieces to drop is
+    /// the caller's job.
+    ///
+    /// Requires `piece_reclaim` in [`crate::AddTorrentOptions`], and a live torrent.
+    ///
+    /// Pieces we don't have are skipped, and so are pieces that a live stream is about to
+    /// read - dropping those would only make them be re-requested at once.
+    ///
+    /// A dropped piece stays dropped until [`Self::reselect_pieces`] is called for it,
+    /// the file it belongs to is re-selected through `update_only_files`, or a live
+    /// stream's lookahead reaches it: a reader that seeks backwards into a reclaimed
+    /// range gets it back on its own.
+    ///
+    /// NOTE: the want-set is per-session and is not persisted - see
+    /// [`crate::AddTorrentOptions::piece_reclaim`].
+    pub fn drop_pieces(&self, pieces: Range<u32>) -> anyhow::Result<Vec<u32>> {
+        self.live()
+            .context("torrent is not live")?
+            .drop_pieces(pieces)
+    }
+
+    /// Make pieces dropped by [`Self::drop_pieces`] wanted again, e.g. after seeking
+    /// backwards into a range that was reclaimed. Pieces that weren't dropped are left
+    /// alone, and so are pieces belonging to a file the user has deselected. Returns how
+    /// many pieces stopped being dropped.
+    pub fn reselect_pieces(&self, pieces: Range<u32>) -> anyhow::Result<usize> {
+        self.live()
+            .context("torrent is not live")?
+            .reselect_pieces(pieces)
     }
 
     /// Get the live state if the torrent is live.

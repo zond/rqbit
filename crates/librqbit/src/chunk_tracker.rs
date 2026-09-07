@@ -7,6 +7,7 @@ use peer_binary_protocol::Piece;
 use tracing::{debug, trace};
 
 use crate::{
+    Error,
     bitv::{BitV, BoxBitV},
     file_info::FileInfo,
     type_aliases::{BF, BS, FileInfos, FilePriorities},
@@ -33,6 +34,14 @@ pub struct ChunkTracker {
     // The pieces that the user selected. This doesn't change unless update_only_files
     // was called.
     selected: BF,
+
+    // The pieces we dropped after having had them: we no longer have them, and we no
+    // longer want them back. Dropping is deselecting at piece granularity, so this is
+    // subtracted from "selected" everywhere below.
+    //
+    // None unless the torrent opted into piece reclaim, and while it is None every path
+    // in here does exactly what it did before.
+    dropped: Option<BF>,
 
     // How many bytes do we have per each file.
     per_file_bytes: Vec<u64>,
@@ -204,6 +213,7 @@ impl ChunkTracker {
             have: have_pieces,
             hns: HaveNeededSelected::default(),
             per_file_bytes: vec![0; file_infos.len()],
+            dropped: None,
         };
         ct.recalculate_per_file_bytes(file_infos);
         ct.hns = ct.calc_hns();
@@ -222,6 +232,146 @@ impl ChunkTracker {
                 })
                 .sum();
         }
+    }
+
+    // The user's selection, minus what we dropped. This is what the stats are computed
+    // from; with reclaim disabled it is just self.selected.
+    fn is_selected(&self, id: usize) -> bool {
+        self.selected[id] && !self.dropped.as_ref().is_some_and(|d| d[id])
+    }
+
+    /// Opt this torrent into the piece-level want-set, which makes [`Self::drop_pieces`]
+    /// and [`Self::reselect_pieces`] work. Until this is called nothing in here behaves
+    /// differently from a tracker that has never heard of dropping.
+    pub fn enable_piece_reclaim(&mut self) {
+        if self.dropped.is_none() {
+            self.dropped = Some(BF::from_boxed_slice(
+                vec![0u8; self.lengths.piece_bitfield_bytes()].into_boxed_slice(),
+            ));
+        }
+    }
+
+    pub(crate) fn is_piece_dropped(&self, index: ValidPieceIndex) -> bool {
+        self.dropped
+            .as_ref()
+            .is_some_and(|d| d[index.get() as usize])
+    }
+
+    /// Drop the pieces we have out of the given ones: forget that we have them and stop
+    /// wanting them back. Returns the pieces that were actually dropped, in the order
+    /// given, so the caller can release the storage behind them.
+    ///
+    /// This is bookkeeping only - it does not touch storage. Storage is one file per
+    /// piece, so releasing a dropped piece is a file deletion, and the caller owns it.
+    ///
+    /// Pieces we don't have are skipped. It is the caller's job not to pass pieces that a
+    /// live stream still needs.
+    pub fn drop_pieces(
+        &mut self,
+        file_infos: &FileInfos,
+        pieces: impl IntoIterator<Item = ValidPieceIndex>,
+    ) -> crate::Result<Vec<ValidPieceIndex>> {
+        if self.dropped.is_none() {
+            return Err(Error::PieceReclaimDisabled);
+        }
+        Ok(pieces
+            .into_iter()
+            .filter(|id| self.drop_piece(file_infos, *id))
+            .collect())
+    }
+
+    /// Make previously dropped pieces wanted again, e.g. after seeking backwards into a
+    /// range we reclaimed. Pieces that weren't dropped are left alone. Returns how many
+    /// pieces stopped being dropped.
+    pub fn reselect_pieces(
+        &mut self,
+        pieces: impl IntoIterator<Item = ValidPieceIndex>,
+    ) -> crate::Result<usize> {
+        if self.dropped.is_none() {
+            return Err(Error::PieceReclaimDisabled);
+        }
+        let mut count = 0;
+        for id in pieces {
+            if !self.undrop_piece(id) {
+                continue;
+            }
+            count += 1;
+            // Only queue it if the user still wants the file it lives in. Queuing
+            // unconditionally would break "queued is a subset of selected or have" and
+            // download a file the user deselected - the same invariant update_only_files
+            // goes out of its way to maintain.
+            if self.selected[id.get() as usize] {
+                // Puts it back in the queue and resets its chunks.
+                self.mark_piece_broken_if_not_have(id);
+            }
+        }
+        Ok(count)
+    }
+
+    // Returns true if the piece was dropped, i.e. if we had it.
+    fn drop_piece(&mut self, file_infos: &FileInfos, index: ValidPieceIndex) -> bool {
+        let id = index.get() as usize;
+        if !self.have.as_slice()[id] {
+            return false;
+        }
+        match self.dropped.as_mut() {
+            Some(d) => d.set(id, true),
+            None => return false,
+        }
+        self.have.as_slice_mut().set(id, false);
+        if let Some(s) = self.chunk_status.get_mut(self.lengths.chunk_range(index)) {
+            s.fill(false);
+        }
+        // Not have AND not wanted. Clearing only the have-bit would put the piece straight
+        // back into the queue, and we would delete it and download it again.
+        self.queue_pieces.set(id, false);
+
+        let len = self.lengths.piece_length(index) as u64;
+        self.hns.have_bytes -= len;
+        if self.selected[id] {
+            // needed_bytes doesn't move: the piece wasn't needed (we had it), and it still
+            // isn't (we don't want it). That keeps the torrent "finished" and progress at
+            // 100% instead of re-opening a torrent the user already finished.
+            self.hns.selected_bytes -= len;
+        }
+
+        for (file_id, fi) in file_infos
+            .iter()
+            .enumerate()
+            .filter(|(_, fi)| fi.piece_range.contains(&index.get()))
+        {
+            let in_file =
+                self.lengths
+                    .size_of_piece_in_file(index.get(), fi.offset_in_torrent, fi.len);
+            let slot = &mut self.per_file_bytes[file_id];
+            // Without this a file that had completed is never looked at by
+            // iter_queued_pieces() again, and re-selecting inside it can't be serviced.
+            *slot = slot.saturating_sub(in_file);
+        }
+
+        debug!("dropped piece={index}");
+        true
+    }
+
+    // Returns true if the piece was dropped and is now wanted again.
+    fn undrop_piece(&mut self, index: ValidPieceIndex) -> bool {
+        let id = index.get() as usize;
+        match self.dropped.as_mut() {
+            Some(d) => {
+                if !d.replace(id, false) {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+        if self.selected[id] {
+            let len = self.lengths.piece_length(index) as u64;
+            self.hns.selected_bytes += len;
+            if !self.have.as_slice()[id] {
+                self.hns.needed_bytes += len;
+            }
+        }
+        true
     }
 
     pub fn get_lengths(&self) -> &Lengths {
@@ -250,7 +400,7 @@ impl ChunkTracker {
             let id = piece.piece_index.get() as usize;
             let len = piece.len as u64;
             let is_have = self.have.as_slice()[id];
-            let is_selected = self.selected[id];
+            let is_selected = self.is_selected(id);
             let is_needed = is_selected && !is_have;
             hns.have_bytes += len * (is_have as u64);
             hns.selected_bytes += len * (is_selected as u64);
@@ -289,13 +439,23 @@ impl ChunkTracker {
             return;
         }
         debug!("marking piece={} as broken", index);
-        self.queue_pieces.set(index.get() as usize, true);
+        // A dropped piece is not wanted. This is reached on hash failure, on every peer
+        // disconnect and on every pause, so requeuing here would be the "delete it and
+        // download it again" loop that the want-set exists to prevent. Its chunks are
+        // still reset below: a live stream's priority window can pull the piece back in
+        // without going through the queue, and if it does it must start from scratch.
+        if !self.is_piece_dropped(index) {
+            self.queue_pieces.set(index.get() as usize, true);
+        }
         if let Some(s) = self.chunk_status.get_mut(self.lengths.chunk_range(index)) {
             s.fill(false);
         }
     }
 
     pub fn mark_piece_downloaded(&mut self, idx: ValidPieceIndex) {
+        // A piece we have is by definition not dropped. A live stream's priority window
+        // can download a dropped piece without it ever going through the queue.
+        self.undrop_piece(idx);
         let id = idx.get() as usize;
         if !self.have.as_slice()[id] {
             self.have.as_slice_mut().set(id, true);
@@ -398,6 +558,10 @@ impl ChunkTracker {
             for idx in b.iter_ones() {
                 #[allow(clippy::cast_possible_truncation)]
                 if let Some(idx) = self.lengths.validate_piece_index(idx as u32) {
+                    // The user just asked back for a file we had dropped pieces of. That
+                    // outranks the drop, and it has to happen before the requeue below,
+                    // which refuses to queue a dropped piece.
+                    self.undrop_piece(idx);
                     self.mark_piece_broken_if_not_have(idx);
                 }
             }
@@ -869,5 +1033,380 @@ mod tests {
                 verified: true,
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod piece_reclaim_tests {
+    use librqbit_core::{constants::CHUNK_SIZE, lengths::Lengths};
+    use std::collections::HashSet;
+
+    use crate::{
+        Error, bitv::BitV, chunk_tracker::HaveNeededSelected, file_info::FileInfo, type_aliases::BF,
+    };
+
+    use super::ChunkTracker;
+
+    // Two files over 3 whole pieces: file 0 is pieces 0 and 1, file 1 is piece 2.
+    const PIECE_LEN: u32 = CHUNK_SIZE * 2;
+
+    fn lengths() -> Lengths {
+        let l = Lengths::new(PIECE_LEN as u64 * 3, PIECE_LEN).unwrap();
+        assert_eq!(l.total_pieces(), 3);
+        l
+    }
+
+    fn file_infos() -> Vec<FileInfo> {
+        vec![
+            FileInfo {
+                relative_filename: "0".into(),
+                offset_in_torrent: 0,
+                piece_range: 0..2,
+                len: PIECE_LEN as u64 * 2,
+                attrs: Default::default(),
+            },
+            FileInfo {
+                relative_filename: "1".into(),
+                offset_in_torrent: PIECE_LEN as u64 * 2,
+                piece_range: 2..3,
+                len: PIECE_LEN as u64,
+                attrs: Default::default(),
+            },
+        ]
+    }
+
+    fn tracker_with_have(l: Lengths, file_infos: &[FileInfo], have: BF) -> ChunkTracker {
+        let mut selected =
+            BF::from_boxed_slice(vec![0u8; l.piece_bitfield_bytes()].into_boxed_slice());
+        selected.get_mut(0..3).unwrap().fill(true);
+        ChunkTracker::new(have.into_dyn(), selected, l, &file_infos.to_vec()).unwrap()
+    }
+
+    fn tracker(l: Lengths, file_infos: &[FileInfo]) -> ChunkTracker {
+        let have = BF::from_boxed_slice(vec![0u8; l.piece_bitfield_bytes()].into_boxed_slice());
+        tracker_with_have(l, file_infos, have)
+    }
+
+    fn queued(ct: &ChunkTracker) -> Vec<usize> {
+        ct.queue_pieces.iter_ones().collect()
+    }
+
+    fn have(ct: &ChunkTracker) -> Vec<usize> {
+        ct.have.as_slice().iter_ones().collect()
+    }
+
+    fn selected(ct: &ChunkTracker) -> Vec<usize> {
+        ct.get_selected_pieces().iter_ones().collect()
+    }
+
+    // Everything the want-set could possibly touch, so a "nothing changed" assertion is
+    // actually about everything.
+    fn snapshot(ct: &ChunkTracker) -> (Vec<usize>, Vec<usize>, HaveNeededSelected, Vec<u64>) {
+        (
+            queued(ct),
+            have(ct),
+            *ct.get_hns(),
+            ct.per_file_have_bytes().to_vec(),
+        )
+    }
+
+    fn piece(l: &Lengths, id: u32) -> librqbit_core::lengths::ValidPieceIndex {
+        l.validate_piece_index(id).unwrap()
+    }
+
+    fn download(ct: &mut ChunkTracker, l: &Lengths, id: u32) {
+        // Same order as the real thing: reserve it, then mark it good.
+        ct.reserve_needed_piece(piece(l, id));
+        ct.mark_piece_downloaded(piece(l, id));
+        for (file_id, fi) in file_infos().iter().enumerate() {
+            if fi.piece_range.contains(&id) {
+                ct.update_file_have_on_piece_completed(piece(l, id), file_id, fi);
+            }
+        }
+    }
+
+    // The regression test that guards the default: with nobody opting in, the tracker is
+    // the upstream tracker. If a want-set check ever leaks into a default code path, this
+    // fails.
+    #[test]
+    fn test_without_opt_in_behaviour_is_unchanged() {
+        let l = lengths();
+        let fi = file_infos();
+        let mut ct = tracker(l, &fi);
+
+        // The API is refused, and refusing it touches nothing.
+        let before = snapshot(&ct);
+        assert!(matches!(
+            ct.drop_pieces(&fi, [piece(&l, 0)]),
+            Err(Error::PieceReclaimDisabled)
+        ));
+        assert!(matches!(
+            ct.reselect_pieces([piece(&l, 0)]),
+            Err(Error::PieceReclaimDisabled)
+        ));
+        assert_eq!(snapshot(&ct), before);
+
+        // queued = selected & !have, from the start.
+        assert_eq!(queued(&ct), vec![0, 1, 2]);
+        assert_eq!(
+            *ct.get_hns(),
+            HaveNeededSelected {
+                have_bytes: 0,
+                needed_bytes: PIECE_LEN as u64 * 3,
+                selected_bytes: PIECE_LEN as u64 * 3,
+            }
+        );
+
+        // Reserving takes a piece out of the queue, completing it puts it in "have".
+        ct.reserve_needed_piece(piece(&l, 0));
+        assert_eq!(queued(&ct), vec![1, 2]);
+        download(&mut ct, &l, 0);
+        assert_eq!(have(&ct), vec![0]);
+        assert_eq!(queued(&ct), vec![1, 2]);
+        assert_eq!(ct.per_file_have_bytes(), [PIECE_LEN as u64, 0]);
+
+        // A peer dying (or a pause, or a hash failure) requeues what we don't have...
+        ct.reserve_needed_piece(piece(&l, 1));
+        assert_eq!(queued(&ct), vec![2]);
+        ct.mark_piece_broken_if_not_have(piece(&l, 1));
+        assert_eq!(queued(&ct), vec![1, 2]);
+
+        // ...and leaves what we do have alone.
+        ct.mark_piece_broken_if_not_have(piece(&l, 0));
+        assert_eq!(queued(&ct), vec![1, 2]);
+        assert_eq!(have(&ct), vec![0]);
+
+        // Deselecting a file cancels its pieces, reselecting it requeues them.
+        ct.update_only_files(&fi, &HashSet::from_iter([0])).unwrap();
+        assert_eq!(queued(&ct), vec![1]);
+        assert_eq!(
+            *ct.get_hns(),
+            HaveNeededSelected {
+                have_bytes: PIECE_LEN as u64,
+                needed_bytes: PIECE_LEN as u64,
+                selected_bytes: PIECE_LEN as u64 * 2,
+            }
+        );
+        ct.update_only_files(&fi, &HashSet::from_iter([0, 1]))
+            .unwrap();
+        assert_eq!(queued(&ct), vec![1, 2]);
+        assert_eq!(
+            *ct.get_hns(),
+            HaveNeededSelected {
+                have_bytes: PIECE_LEN as u64,
+                needed_bytes: PIECE_LEN as u64 * 2,
+                selected_bytes: PIECE_LEN as u64 * 3,
+            }
+        );
+    }
+
+    #[test]
+    fn test_dropped_piece_is_not_have_not_wanted_not_advertised() {
+        let l = lengths();
+        let fi = file_infos();
+        let mut ct = tracker(l, &fi);
+        ct.enable_piece_reclaim();
+
+        for id in 0..3 {
+            download(&mut ct, &l, id);
+        }
+        assert!(ct.is_finished());
+        assert_eq!(queued(&ct), Vec::<usize>::new());
+
+        assert_eq!(ct.drop_pieces(&fi, [piece(&l, 0)]).unwrap(), [piece(&l, 0)]);
+
+        // Not have. This is what stops it being advertised in the bitfield we send, and
+        // what makes on_download_request() refuse a request for it: both read the
+        // have-bitfield and nothing else.
+        assert!(!ct.is_piece_have(piece(&l, 0)));
+        assert_eq!(have(&ct), vec![1, 2]);
+        assert!(!ct.get_have_pieces().as_slice()[0]);
+
+        // A request for a dropped piece is refused: is_chunk_ready_to_upload() is the
+        // predicate the peer request path bails on, and the one it re-checks after rate
+        // limiting in case the piece went away in between.
+        let chunk = l
+            .chunk_info_from_received_data(piece(&l, 0), 0, CHUNK_SIZE)
+            .unwrap();
+        assert!(!ct.is_chunk_ready_to_upload(&chunk));
+        let kept = l
+            .chunk_info_from_received_data(piece(&l, 1), 0, CHUNK_SIZE)
+            .unwrap();
+        assert!(ct.is_chunk_ready_to_upload(&kept));
+
+        // Not wanted.
+        assert_eq!(queued(&ct), Vec::<usize>::new());
+        assert!(ct.is_piece_dropped(piece(&l, 0)));
+
+        // The torrent is still finished and still 100%: a piece we deliberately threw
+        // away is not a piece we're missing.
+        assert!(ct.is_finished());
+        assert_eq!(
+            *ct.get_hns(),
+            HaveNeededSelected {
+                have_bytes: PIECE_LEN as u64 * 2,
+                needed_bytes: 0,
+                selected_bytes: PIECE_LEN as u64 * 2,
+            }
+        );
+
+        // The file it's in is no longer complete, so iter_queued_pieces() will look at it
+        // again if we ever re-select inside it.
+        assert_eq!(
+            ct.per_file_have_bytes(),
+            [PIECE_LEN as u64, PIECE_LEN as u64]
+        );
+
+        // A peer dying, a pause, or a hash failure must not put it back: that is the
+        // delete-it-and-download-it-again loop this whole thing exists to avoid.
+        ct.mark_piece_broken_if_not_have(piece(&l, 0));
+        assert_eq!(queued(&ct), Vec::<usize>::new());
+
+        // Neither may a no-op selection change.
+        ct.update_only_files(&fi, &HashSet::from_iter([0, 1]))
+            .unwrap();
+        assert_eq!(queued(&ct), Vec::<usize>::new());
+        assert!(ct.is_piece_dropped(piece(&l, 0)));
+        assert!(ct.is_finished());
+
+        // Dropping what we don't have is a no-op, so a policy can be sloppy about it.
+        assert!(ct.drop_pieces(&fi, [piece(&l, 0)]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_reselecting_a_dropped_range_makes_it_wanted_again() {
+        let l = lengths();
+        let fi = file_infos();
+        let mut ct = tracker(l, &fi);
+        ct.enable_piece_reclaim();
+
+        for id in 0..3 {
+            download(&mut ct, &l, id);
+        }
+        ct.drop_pieces(&fi, [piece(&l, 0), piece(&l, 1)]).unwrap();
+        assert_eq!(queued(&ct), Vec::<usize>::new());
+
+        assert_eq!(ct.reselect_pieces([piece(&l, 0)]).unwrap(), 1);
+        assert!(!ct.is_piece_dropped(piece(&l, 0)));
+        assert_eq!(queued(&ct), vec![0]);
+        assert!(!ct.is_finished());
+        assert_eq!(
+            *ct.get_hns(),
+            HaveNeededSelected {
+                have_bytes: PIECE_LEN as u64,
+                needed_bytes: PIECE_LEN as u64,
+                selected_bytes: PIECE_LEN as u64 * 2,
+            }
+        );
+
+        // Reselecting something that wasn't dropped does nothing.
+        assert_eq!(ct.reselect_pieces([piece(&l, 0), piece(&l, 2)]).unwrap(), 0);
+        assert_eq!(queued(&ct), vec![0]);
+
+        // Downloading it again restores everything.
+        download(&mut ct, &l, 0);
+        assert_eq!(have(&ct), vec![0, 2]);
+        assert_eq!(
+            ct.per_file_have_bytes(),
+            [PIECE_LEN as u64, PIECE_LEN as u64]
+        );
+        assert_eq!(
+            *ct.get_hns(),
+            HaveNeededSelected {
+                have_bytes: PIECE_LEN as u64 * 2,
+                needed_bytes: 0,
+                selected_bytes: PIECE_LEN as u64 * 2,
+            }
+        );
+    }
+
+    // Undropping must not queue a piece the user has deselected: "queued" has to stay a
+    // subset of "selected | have", which is the invariant update_only_files() goes out of
+    // its way to maintain.
+    #[test]
+    fn test_reselecting_a_dropped_piece_in_a_deselected_file_does_not_queue_it() {
+        let l = lengths();
+        let fi = file_infos();
+        let mut ct = tracker(l, &fi);
+        ct.enable_piece_reclaim();
+
+        for id in 0..3 {
+            download(&mut ct, &l, id);
+        }
+        ct.drop_pieces(&fi, [piece(&l, 2)]).unwrap();
+
+        // Deselect file 1, which is where the dropped piece lives.
+        ct.update_only_files(&fi, &HashSet::from_iter([0])).unwrap();
+        assert_eq!(selected(&ct), vec![0, 1]);
+        assert!(ct.is_piece_dropped(piece(&l, 2)));
+
+        // Undropping it must not make it wanted: the user doesn't want that file.
+        assert_eq!(ct.reselect_pieces([piece(&l, 2)]).unwrap(), 1);
+        assert!(!ct.is_piece_dropped(piece(&l, 2)));
+        assert_eq!(selected(&ct), vec![0, 1]);
+        assert_eq!(queued(&ct), Vec::<usize>::new());
+        assert!(ct.is_finished());
+
+        // Asking for the file back is what makes it wanted.
+        ct.update_only_files(&fi, &HashSet::from_iter([0, 1]))
+            .unwrap();
+        assert_eq!(queued(&ct), vec![2]);
+        assert!(!ct.is_finished());
+    }
+
+    // Asking for a file back outranks a drop inside it: otherwise the user re-selects a
+    // file and it silently never completes.
+    #[test]
+    fn test_reselecting_a_file_undrops_its_pieces() {
+        let l = lengths();
+        let fi = file_infos();
+        let mut ct = tracker(l, &fi);
+        ct.enable_piece_reclaim();
+
+        for id in 0..3 {
+            download(&mut ct, &l, id);
+        }
+        ct.drop_pieces(&fi, [piece(&l, 2)]).unwrap();
+        assert!(ct.is_piece_dropped(piece(&l, 2)));
+
+        ct.update_only_files(&fi, &HashSet::from_iter([0])).unwrap();
+        assert!(ct.is_piece_dropped(piece(&l, 2)));
+        assert_eq!(queued(&ct), Vec::<usize>::new());
+
+        ct.update_only_files(&fi, &HashSet::from_iter([0, 1]))
+            .unwrap();
+        assert!(!ct.is_piece_dropped(piece(&l, 2)));
+        assert_eq!(queued(&ct), vec![2]);
+        assert!(!ct.is_finished());
+    }
+
+    // Defect 3, pinned: the want-set is per-session. The have-bitfield is the only
+    // per-piece state that crosses a restart, and `piece_reclaim` is not part of
+    // SerializedTorrent, so a restored torrent wants its dropped pieces back. That is the
+    // right default - the storage behind them is gone, so "missing and wanted" is the
+    // truth - and a caller that wants them to stay dropped re-supplies both the flag and
+    // its own dropped set, exactly as it re-supplies every other AddTorrentOptions field.
+    #[test]
+    fn test_the_want_set_does_not_survive_a_restart() {
+        let l = lengths();
+        let fi = file_infos();
+        let mut ct = tracker(l, &fi);
+        ct.enable_piece_reclaim();
+
+        for id in 0..3 {
+            download(&mut ct, &l, id);
+        }
+        ct.drop_pieces(&fi, [piece(&l, 0)]).unwrap();
+        assert_eq!(queued(&ct), Vec::<usize>::new());
+
+        // Restart: everything that is rebuilt from persisted state is rebuilt, and the
+        // have-bitfield is all of it.
+        let persisted_have = BF::from_bitslice(ct.get_have_pieces().as_slice());
+        let restarted = tracker_with_have(l, &fi, persisted_have);
+
+        assert_eq!(have(&restarted), vec![1, 2]);
+        assert_eq!(queued(&restarted), vec![0]);
+        assert!(!restarted.is_finished());
+        assert!(!restarted.is_piece_dropped(piece(&l, 0)));
     }
 }
