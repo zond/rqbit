@@ -134,6 +134,19 @@ impl TorrentStorage for InMemoryExampleStorage {
     }
 }
 
+// What the piece storage holds. The split is the point: see InMemoryPieceStorageFactory.
+#[derive(Default)]
+struct Pieces {
+    // Pieces that are all here: fully written, and hash-checked by the time they landed.
+    // This is what has_piece() answers from, and what a reader may be served.
+    complete: HashMap<ValidPieceIndex, InMemoryPiece>,
+
+    // Pieces being written. A piece appears here on its first 16 KiB chunk and moves to
+    // `complete` in on_piece_completed(). Keeping it out of `complete` until then is what
+    // makes "the storage has this piece" mean "complete" rather than "started".
+    partial: HashMap<ValidPieceIndex, InMemoryPiece>,
+}
+
 /// An in-memory storage that can release individual pieces, for use with
 /// [`crate::AddTorrentOptions::piece_reclaim`].
 ///
@@ -141,6 +154,11 @@ impl TorrentStorage for InMemoryExampleStorage {
 /// do: a piece is either there in full or not there at all, so what the storage holds is
 /// exactly the have-set. A filesystem storage that writes into whole files can't do this
 /// - it can only punch holes, and the have-bitfield and the disk drift apart.
+///
+/// A piece is written into a staging area and moved into place in `on_piece_completed`,
+/// so that its presence means "complete" and not "started" - see
+/// [`crate::storage::TorrentStorage::has_piece`], where a wrong yes is silent corruption.
+/// On a filesystem that move is writing to a temporary name and renaming it.
 ///
 /// The factory is the caller's handle to those pieces: it shares the map with the storage
 /// it creates, so the policy that decides what to reclaim can call
@@ -157,26 +175,30 @@ impl TorrentStorage for InMemoryExampleStorage {
 /// One torrent per factory: the map is shared with everything it creates.
 #[derive(Default, Clone)]
 pub struct InMemoryPieceStorageFactory {
-    pieces: Arc<RwLock<HashMap<ValidPieceIndex, InMemoryPiece>>>,
+    pieces: Arc<RwLock<Pieces>>,
 }
 
 impl InMemoryPieceStorageFactory {
-    /// Forget the data of a piece. Returns true if it was there.
+    /// Forget the data of a piece. Returns true if it was there, complete.
     ///
     /// This is the "release the storage" half of the reclaim loop, and the caller only
     /// gets to call it for pieces [`crate::ManagedTorrent::drop_pieces`] handed over.
     pub fn release_piece(&self, piece_id: ValidPieceIndex) -> bool {
-        self.pieces.write().remove(&piece_id).is_some()
+        let mut g = self.pieces.write();
+        // A half-written copy of a piece being released is worth just as little as the
+        // finished one: it is what the caller asked us to forget.
+        g.partial.remove(&piece_id);
+        g.complete.remove(&piece_id).is_some()
     }
 
-    /// Whether the data of a piece is still here.
+    /// Whether the data of a piece is still here, complete.
     pub fn has_piece(&self, piece_id: ValidPieceIndex) -> bool {
-        self.pieces.read().contains_key(&piece_id)
+        self.pieces.read().complete.contains_key(&piece_id)
     }
 
-    /// How many pieces are held right now.
+    /// How many whole pieces are held right now.
     pub fn piece_count(&self) -> usize {
-        self.pieces.read().len()
+        self.pieces.read().complete.len()
     }
 }
 
@@ -203,7 +225,7 @@ impl StorageFactory for InMemoryPieceStorageFactory {
 pub struct InMemoryPieceStorage {
     lengths: Lengths,
     file_infos: FileInfos,
-    pieces: Arc<RwLock<HashMap<ValidPieceIndex, InMemoryPiece>>>,
+    pieces: Arc<RwLock<Pieces>>,
 }
 
 impl TorrentStorage for InMemoryPieceStorage {
@@ -211,7 +233,13 @@ impl TorrentStorage for InMemoryPieceStorage {
         let (piece_id, piece_offset) =
             piece_and_offset(&self.lengths, &self.file_infos, file_id, offset)?;
         let g = self.pieces.read();
-        let piece = g.get(&piece_id).context("piece was released")?;
+        // A piece being written is readable: hash checking it is a read of what was just
+        // written, and it happens before the piece is complete.
+        let piece = g
+            .complete
+            .get(&piece_id)
+            .or_else(|| g.partial.get(&piece_id))
+            .context("piece was released")?;
         buf.copy_from_slice(&piece.bytes[piece_offset..(piece_offset + buf.len())]);
         Ok(())
     }
@@ -221,9 +249,21 @@ impl TorrentStorage for InMemoryPieceStorage {
             piece_and_offset(&self.lengths, &self.file_infos, file_id, offset)?;
         let mut g = self.pieces.write();
         let piece = g
+            .partial
             .entry(piece_id)
             .or_insert_with(|| InMemoryPiece::new(&self.lengths));
         piece.bytes[piece_offset..(piece_offset + buf.len())].copy_from_slice(buf);
+        Ok(())
+    }
+
+    // The piece is written and hash-checked: move it into place. This is the rename in
+    // "write to a temporary name and rename it when it's done", and until it happens
+    // has_piece() says no.
+    fn on_piece_completed(&self, piece_index: ValidPieceIndex) -> anyhow::Result<()> {
+        let mut g = self.pieces.write();
+        if let Some(piece) = g.partial.remove(&piece_index) {
+            g.complete.insert(piece_index, piece);
+        }
         Ok(())
     }
 
@@ -258,8 +298,83 @@ impl TorrentStorage for InMemoryPieceStorage {
     }
 
     // The whole point: a piece that was released is gone, and startup has to believe the
-    // storage over the resume data.
+    // storage over the resume data. Only whole pieces count - a piece half-written when
+    // the process died is not one we have.
     fn has_piece(&self, piece_index: ValidPieceIndex) -> anyhow::Result<bool> {
-        Ok(self.pieces.read().contains_key(&piece_index))
+        Ok(self.pieces.read().complete.contains_key(&piece_index))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use librqbit_core::{constants::CHUNK_SIZE, lengths::Lengths};
+
+    use super::*;
+    use crate::storage::TorrentStorage;
+
+    const PIECE_LEN: u32 = CHUNK_SIZE * 2;
+    const NUM_PIECES: u32 = 2;
+
+    fn storage() -> (InMemoryPieceStorageFactory, InMemoryPieceStorage) {
+        let len = PIECE_LEN as u64 * NUM_PIECES as u64;
+        let lengths = Lengths::new(len, PIECE_LEN).unwrap();
+        let file_infos: FileInfos = vec![crate::file_info::FileInfo {
+            relative_filename: "test.dat".into(),
+            offset_in_torrent: 0,
+            len,
+            piece_range: 0..NUM_PIECES,
+            attrs: Default::default(),
+        }];
+        let factory = InMemoryPieceStorageFactory::default();
+        let storage = InMemoryPieceStorage {
+            lengths,
+            file_infos,
+            pieces: factory.pieces.clone(),
+        };
+        (factory, storage)
+    }
+
+    // has_piece() must mean "complete", not "started". Chunks arrive 16 KiB at a time,
+    // and a storage that answers yes as soon as the first one lands leaves a have-bit
+    // over a half-written piece if the process dies in between - and startup's
+    // intersection only ever clears bits, so nothing takes it back and we serve garbage.
+    #[test]
+    fn test_a_piece_is_not_there_until_it_is_complete() {
+        let (factory, storage) = storage();
+        let piece = storage.lengths.validate_piece_index(0).unwrap();
+        let chunk = vec![1u8; CHUNK_SIZE as usize];
+
+        storage.pwrite_all(0, 0, &chunk).unwrap();
+        assert!(
+            !storage.has_piece(piece).unwrap(),
+            "half a piece is not a piece"
+        );
+        assert!(!factory.has_piece(piece));
+        assert_eq!(factory.piece_count(), 0);
+
+        // It is readable while it is being written: that is how it gets hash-checked.
+        let mut buf = vec![0u8; CHUNK_SIZE as usize];
+        storage.pread_exact(0, 0, &mut buf).unwrap();
+        assert_eq!(buf, chunk);
+
+        storage.pwrite_all(0, CHUNK_SIZE as u64, &chunk).unwrap();
+        assert!(
+            !storage.has_piece(piece).unwrap(),
+            "a piece that hasn't been hash-checked yet is not a piece we have"
+        );
+
+        // Written and hash-checked: now it is here.
+        storage.on_piece_completed(piece).unwrap();
+        assert!(storage.has_piece(piece).unwrap());
+        assert!(factory.has_piece(piece));
+        assert_eq!(factory.piece_count(), 1);
+        storage.pread_exact(0, 0, &mut buf).unwrap();
+        assert_eq!(buf, chunk);
+
+        // And released it is gone again.
+        assert!(factory.release_piece(piece));
+        assert!(!storage.has_piece(piece).unwrap());
+        assert_eq!(factory.piece_count(), 0);
+        assert!(storage.pread_exact(0, 0, &mut buf).is_err());
     }
 }
