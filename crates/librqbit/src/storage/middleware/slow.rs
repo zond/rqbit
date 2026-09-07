@@ -110,6 +110,18 @@ impl<U: TorrentStorage> TorrentStorage for SlowStorage<U> {
         self.underlying.pwrite_all(file_id, offset, buf)
     }
 
+    fn pwrite_all_vectored(
+        &self,
+        file_id: usize,
+        offset: u64,
+        bufs: [std::io::IoSlice<'_>; 2],
+    ) -> anyhow::Result<usize> {
+        // One write, so one sleep: the default would split it into two pwrite_all() calls
+        // and charge the caller twice for a write the storage does once.
+        sleep_from_reader(&self.pwrite_all_bufread);
+        self.underlying.pwrite_all_vectored(file_id, offset, bufs)
+    }
+
     fn remove_file(&self, file_id: usize, filename: &std::path::Path) -> anyhow::Result<()> {
         self.underlying.remove_file(file_id, filename)
     }
@@ -152,8 +164,9 @@ mod tests {
     fn test_the_defaulted_methods_reach_the_underlying_storage() {
         let storage = SlowStorage {
             underlying: Probe::default(),
-            pwrite_all_bufread: Mutex::new(Box::new(std::iter::empty())),
-            pread_exact_bufread: Mutex::new(Box::new(std::iter::empty())),
+            // Sleep for nothing at all, however many times it is asked to.
+            pwrite_all_bufread: Mutex::new(Box::new(std::iter::repeat(0))),
+            pread_exact_bufread: Mutex::new(Box::new(std::iter::repeat(0))),
         };
         assert_forwards_defaults(&storage, &storage.underlying);
     }

@@ -96,6 +96,24 @@ impl<U: TorrentStorage> TorrentStorage for TimingStorage<U> {
         )
     }
 
+    fn pwrite_all_vectored(
+        &self,
+        file_id: usize,
+        offset: u64,
+        bufs: [std::io::IoSlice<'_>; 2],
+    ) -> anyhow::Result<usize> {
+        let storage = &self.name;
+        let len = bufs[0].len() + bufs[1].len();
+        timeit!(
+            "pwrite_all_vectored",
+            self.underlying.pwrite_all_vectored(file_id, offset, bufs),
+            file_id,
+            offset,
+            storage,
+            len
+        )
+    }
+
     fn remove_file(&self, file_id: usize, filename: &std::path::Path) -> anyhow::Result<()> {
         self.underlying.remove_file(file_id, filename)
     }

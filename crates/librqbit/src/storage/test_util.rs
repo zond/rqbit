@@ -5,7 +5,7 @@
 // gives a default, because forgetting one still compiles and then answers something
 // plausible of its own instead of asking the storage underneath.
 
-use std::path::Path;
+use std::{io::IoSlice, path::Path};
 
 use librqbit_core::{
     constants::CHUNK_SIZE,
@@ -30,6 +30,8 @@ pub(crate) fn piece(id: u32) -> ValidPieceIndex {
 pub(crate) struct Probe {
     /// The pieces on_piece_completed() was called for, in order.
     pub completed: Mutex<Vec<u32>>,
+    /// The vectored writes that arrived as one call, as (offset, total length).
+    pub vectored: Mutex<Vec<(u64, usize)>>,
 }
 
 impl TorrentStorage for Probe {
@@ -65,6 +67,17 @@ impl TorrentStorage for Probe {
         anyhow::bail!("not used")
     }
 
+    fn pwrite_all_vectored(
+        &self,
+        _file_id: usize,
+        offset: u64,
+        bufs: [IoSlice<'_>; 2],
+    ) -> anyhow::Result<usize> {
+        let len = bufs[0].len() + bufs[1].len();
+        self.vectored.lock().push((offset, len));
+        Ok(len)
+    }
+
     fn on_piece_completed(&self, piece_index: ValidPieceIndex) -> anyhow::Result<()> {
         self.completed.lock().push(piece_index.get());
         Ok(())
@@ -91,5 +104,17 @@ pub(crate) fn assert_forwards_defaults<S: TorrentStorage>(storage: &S, probe: &P
         !storage.has_piece(piece(1)).unwrap(),
         "has_piece() didn't reach the storage: it answered the default yes over a piece \
          the storage says is gone"
+    );
+
+    let (a, b) = (&[1u8; 4][..], &[2u8; 6][..]);
+    let written = storage
+        .pwrite_all_vectored(0, 0, [IoSlice::new(a), IoSlice::new(b)])
+        .unwrap();
+    assert_eq!(written, a.len() + b.len());
+    assert_eq!(
+        *probe.vectored.lock(),
+        vec![(0, a.len() + b.len())],
+        "pwrite_all_vectored() didn't reach the storage whole: the default split it into \
+         two pwrite_all()s, which is the one call this exists to avoid"
     );
 }
