@@ -25,4 +25,15 @@ impl TorrentStatePaused {
     pub(crate) fn hns(&self) -> &HaveNeededSelected {
         self.chunk_tracker.get_hns()
     }
+
+    /// The caller is done releasing the storage of these pieces. Nothing to wake up: a
+    /// paused torrent has no peers, and unpausing picks the queue up as it finds it.
+    pub(crate) fn finish_release(&mut self, pieces: &[u32]) {
+        let lengths = *self.chunk_tracker.get_lengths();
+        self.chunk_tracker.finish_release(
+            pieces
+                .iter()
+                .filter_map(|id| lengths.validate_piece_index(*id)),
+        );
+    }
 }

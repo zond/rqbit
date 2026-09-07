@@ -804,7 +804,10 @@ impl TorrentStateLive {
             .pieces
             .take()
             .context("bug: pausing already paused torrent")?;
-        // into_chunks() will requeue any in-flight pieces
+        // into_chunks() will requeue any in-flight pieces. It also carries over the claim
+        // on pieces the caller is releasing (see crate::DroppedPieces) - the whole point
+        // of that living in the ChunkTracker is that requeuing must not hand a peer a
+        // piece whose storage is being deleted.
         let chunk_tracker = piece_tracker.into_chunks();
 
         Ok(TorrentStatePaused {
@@ -886,6 +889,9 @@ impl TorrentStateLive {
 
     /// The caller is done releasing the storage of these pieces: they may be downloaded
     /// again. See [`crate::DroppedPieces`].
+    ///
+    /// Called with the torrent's state lock held, which is what makes the piece tracker
+    /// certain to be here: pausing takes that lock before it takes the tracker.
     pub(crate) fn finish_release(&self, pieces: &[u32]) {
         let queued = match self.lock_write("finish_release").get_pieces_mut() {
             Ok(pt) => pt.finish_release(
@@ -893,8 +899,15 @@ impl TorrentStateLive {
                     .iter()
                     .filter_map(|id| self.lengths.validate_piece_index(*id)),
             ),
-            // Paused: the claim went away with the piece tracker.
-            Err(_) => return,
+            Err(e) => {
+                warn!(
+                    id = self.shared.id,
+                    info_hash = ?self.shared.info_hash,
+                    pieces = pieces.len(),
+                    "bug: a live torrent has no piece tracker to release pieces into: {e:#}"
+                );
+                return;
+            }
         };
         if queued > 0 {
             self.reconnect_all_not_needed_peers();

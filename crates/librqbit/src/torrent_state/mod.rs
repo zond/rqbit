@@ -224,9 +224,17 @@ pub struct ManagedTorrent {
 /// So: read [`Self::pieces`], release their storage, then drop this. Dropping it is what
 /// tells the torrent the pieces are gone for real and may be downloaded again; a piece
 /// that was reselected in the meantime is queued for download right then.
+///
+/// The claim survives pausing and unpausing the torrent: it is held by the chunk tracker,
+/// which is what a pause keeps. It does not survive the torrent being re-checked
+/// (`error` -> `initializing`, i.e. restarting a torrent that hit a fatal error) or
+/// removed from the session: the have-set is then rebuilt from
+/// [`crate::storage::TorrentStorage::has_piece`], so a piece the caller has not deleted
+/// yet comes back as one we have. Dropping the claim in that state logs a warning and
+/// does nothing else. Finish releasing before restarting an errored torrent.
 #[must_use = "the pieces stay claimed until this is dropped: release their storage first"]
 pub struct DroppedPieces {
-    live: Weak<TorrentStateLive>,
+    torrent: Weak<ManagedTorrent>,
     pieces: Vec<u32>,
 }
 
@@ -245,10 +253,10 @@ impl std::fmt::Debug for DroppedPieces {
 
 impl Drop for DroppedPieces {
     fn drop(&mut self) {
-        if let Some(live) = self.live.upgrade() {
-            live.finish_release(&self.pieces);
+        if let Some(torrent) = self.torrent.upgrade() {
+            torrent.finish_release(&self.pieces);
         }
-        // If the torrent isn't live anymore the claim went away with the piece tracker.
+        // If the torrent is gone from the session there is nothing left to claim.
     }
 }
 
@@ -367,13 +375,37 @@ impl ManagedTorrent {
     ///
     /// NOTE: the want-set is per-session and is not persisted - see
     /// [`crate::AddTorrentOptions::piece_reclaim`].
-    pub fn drop_pieces(&self, pieces: Range<u32>) -> anyhow::Result<DroppedPieces> {
+    pub fn drop_pieces(self: &Arc<Self>, pieces: Range<u32>) -> anyhow::Result<DroppedPieces> {
         let live = self.live().context("torrent is not live")?;
         let pieces = live.drop_pieces(pieces)?;
         Ok(DroppedPieces {
-            live: Arc::downgrade(&live),
+            torrent: Arc::downgrade(self),
             pieces,
         })
+    }
+
+    /// The caller is done releasing the storage of the pieces it was handed: they may be
+    /// downloaded again. See [`DroppedPieces`], which is what calls this.
+    ///
+    /// Both a live and a paused torrent hold the claim - it lives in the chunk tracker,
+    /// which a pause keeps - so this works in either state. Anything else and there is no
+    /// chunk tracker to tell: say so instead of dropping it on the floor.
+    pub(crate) fn finish_release(&self, pieces: &[u32]) {
+        let mut g = self.locked.write();
+        match &mut g.state {
+            // Under this lock a live torrent still has its piece tracker: pause() and
+            // stop_with_error() both take it before they can take the tracker away.
+            ManagedTorrentState::Live(live) => live.finish_release(pieces),
+            ManagedTorrentState::Paused(paused) => paused.finish_release(pieces),
+            state => warn!(
+                id = self.shared.id,
+                info_hash = ?self.shared.info_hash,
+                state = state.name(),
+                pieces = pieces.len(),
+                "released pieces have nowhere to be reported to: the torrent will decide \
+                 what it has by asking the storage, so make sure it is done being deleted"
+            ),
+        }
     }
 
     /// Make pieces dropped by [`Self::drop_pieces`] wanted again, e.g. after seeking
