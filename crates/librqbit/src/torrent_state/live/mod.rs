@@ -48,6 +48,7 @@ use std::{
     collections::HashSet,
     net::{IpAddr, SocketAddr},
     num::NonZeroU32,
+    ops::Range,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -458,6 +459,25 @@ impl TorrentStateLive {
                     }
                 }
             }
+            // The have-check in on_download_request happened before rate limiting, which
+            // can take a long time. If the piece was dropped in between, the storage
+            // behind it may already be gone, and reading it would fail deep inside the
+            // peer's writer - or worse, succeed and serve whatever is there now. Vanilla
+            // BitTorrent has no "reject request", so the only way to tell the peer is to
+            // hang up: it reconnects and gets a bitfield without the piece in it.
+            // Guarded on the opt-in flag so the default path takes no extra lock.
+            if self.shared.options.piece_reclaim
+                && !self
+                    .lock_read("recheck_chunk_ready_to_upload")
+                    .get_chunks()
+                    .is_ok_and(|ct| ct.is_chunk_ready_to_upload(&ci))
+            {
+                let _ = tx.send(WriterRequest::Disconnect(Err(anyhow::anyhow!(
+                    "piece {} was dropped while the request for it was queued",
+                    ci.piece_index
+                ))));
+                continue;
+            }
             let _ = tx.send(WriterRequest::ReadChunkRequest(ci));
         }
         Ok(())
@@ -799,6 +819,56 @@ impl TorrentStateLive {
             warn!(id=self.shared.id, info_hash=?self.shared.info_hash, "there's nowhere to send fatal error, receiver is dead");
         }
         Err(res)
+    }
+
+    /// Drop the pieces in the given range that we have: forget that we have them, stop
+    /// advertising them and stop wanting them back. Bookkeeping only - releasing the
+    /// storage is the caller's job.
+    ///
+    /// Pieces we don't have, and pieces a live stream is about to read, are skipped.
+    pub(crate) fn drop_pieces(&self, pieces: Range<u32>) -> anyhow::Result<Vec<u32>> {
+        let candidates = pieces
+            .filter_map(|id| self.lengths.validate_piece_index(id))
+            .filter(|id| !self.streams.is_piece_wanted(*id, &self.lengths))
+            .collect::<Vec<_>>();
+
+        let mut g = self.lock_write("drop_pieces");
+        let locked = &mut **g;
+        let dropped = locked
+            .get_pieces_mut()?
+            .drop_pieces(&self.metadata.file_infos, candidates)?;
+
+        for id in dropped.iter() {
+            self.stats
+                .have_bytes
+                .fetch_sub(self.lengths.piece_length(*id) as u64, Ordering::Relaxed);
+            locked.unflushed_bitv_bytes += self.lengths.piece_length(*id) as u64;
+        }
+        // Same deal as on piece completion: let the bitfield drift until it's worth a
+        // write. Nothing is lost if a crash beats the flush - the storage the caller is
+        // about to release is what decides the have-set at startup, and a stale have-bit
+        // over storage that is gone is caught by the usual hash check.
+        if locked.unflushed_bitv_bytes >= FLUSH_BITV_EVERY_BYTES {
+            locked.try_flush_bitv(&self.shared, true);
+        }
+        drop(g);
+
+        Ok(dropped.into_iter().map(|id| id.get()).collect())
+    }
+
+    /// Make previously dropped pieces wanted again. Returns how many pieces stopped being
+    /// dropped.
+    pub(crate) fn reselect_pieces(&self, pieces: Range<u32>) -> anyhow::Result<usize> {
+        let pieces = pieces.filter_map(|id| self.lengths.validate_piece_index(id));
+        let count = self
+            .lock_write("reselect_pieces")
+            .get_pieces_mut()?
+            .reselect_pieces(pieces)?;
+        if count > 0 {
+            self.reconnect_all_not_needed_peers();
+            self.new_pieces_notify.notify_waiters();
+        }
+        Ok(count)
     }
 
     pub(crate) fn update_only_files(&self, only_files: &HashSet<usize>) -> anyhow::Result<()> {

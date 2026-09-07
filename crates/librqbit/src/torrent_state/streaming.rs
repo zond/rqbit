@@ -57,7 +57,9 @@ impl StreamState {
         lengths.compute_current_piece(self.position, self.file_abs_offset)
     }
 
-    fn queue<'a>(&self, lengths: &'a Lengths) -> impl Iterator<Item = ValidPieceIndex> + use<'a> {
+    // The pieces from the reader's position up to its lookahead, i.e. what it is about
+    // to want next.
+    fn queue_range(&self, lengths: &Lengths) -> std::ops::Range<u32> {
         let start = self.file_abs_offset + self.position;
         let end = start
             .saturating_add(self.lookahead_bytes)
@@ -65,7 +67,12 @@ impl StreamState {
         let dpl = lengths.default_piece_length();
         let start_id = (start / dpl as u64).try_into().unwrap();
         let end_id = end.div_ceil(dpl as u64).try_into().unwrap();
-        (start_id..end_id).filter_map(|i| lengths.validate_piece_index(i))
+        start_id..end_id
+    }
+
+    fn queue<'a>(&self, lengths: &'a Lengths) -> impl Iterator<Item = ValidPieceIndex> + use<'a> {
+        self.queue_range(lengths)
+            .filter_map(|i| lengths.validate_piece_index(i))
     }
 }
 
@@ -145,6 +152,14 @@ impl TorrentStreams {
 
     pub(crate) fn streamed_file_ids(&self) -> impl Iterator<Item = usize> + '_ {
         self.streams.iter().map(|s| s.value().file_id)
+    }
+
+    // True if any live reader is about to want this piece. Dropping such a piece would
+    // just make it be re-requested at once, and stall the reader in the meantime.
+    pub(crate) fn is_piece_wanted(&self, piece_id: ValidPieceIndex, lengths: &Lengths) -> bool {
+        self.streams
+            .iter()
+            .any(|s| s.value().queue_range(lengths).contains(&piece_id.get()))
     }
 }
 

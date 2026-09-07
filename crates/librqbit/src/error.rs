@@ -92,6 +92,9 @@ pub enum Error {
     #[error("chunk tracker empty, torrent was paused")]
     ChunkTrackerEmpty,
 
+    #[error("piece reclaim was not enabled for this torrent")]
+    PieceReclaimDisabled,
+
     #[error("rate limiting: insufficient capacity: {0:#}")]
     RateLimitInsufficientCapacity(
         #[from]

@@ -280,6 +280,22 @@ pub struct AddTorrentOptions {
     /// Initial peers to start of with.
     pub initial_peers: Option<Vec<SocketAddr>>,
 
+    /// Allow dropping pieces we already have without them being immediately re-queued,
+    /// so the caller can release the storage behind them. See
+    /// [`crate::ManagedTorrent::drop_pieces`].
+    ///
+    /// Off by default, and while it's off nothing decides on its own to drop anything -
+    /// this only makes the API available.
+    ///
+    /// NOTE: like every other field here except `only_files` and `paused`, this is not
+    /// part of the persisted session state, so a torrent restored at startup comes back
+    /// with it false unless the caller sets it again. That is deliberate: the set of
+    /// dropped pieces is per-session policy, and on restart the have-set is recomputed
+    /// from what is actually on disk, so a piece whose storage was released simply comes
+    /// back as missing and wanted - which is the right default.
+    #[serde(default)]
+    pub piece_reclaim: bool,
+
     /// Max concurrent connected peers.
     pub peer_limit: Option<usize>,
 
@@ -1355,6 +1371,7 @@ impl Session {
                     ratelimits: opts.ratelimits,
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
+                    piece_reclaim: opts.piece_reclaim,
                     #[cfg(feature = "disable-upload")]
                     _disable_upload: self._disable_upload,
                 },
