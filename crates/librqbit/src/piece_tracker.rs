@@ -26,7 +26,6 @@ use peer_binary_protocol::Piece;
 
 use crate::{
     chunk_tracker::{ChunkMarkingResult, ChunkTracker, Reselected},
-    file_info::FileInfo,
     type_aliases::{FileInfos, FilePriorities, PeerHandle},
 };
 
@@ -236,9 +235,10 @@ impl PieceTracker {
         Some(inflight.started.elapsed())
     }
 
-    /// Mark piece as downloaded after successful hash verification.
-    pub fn mark_piece_hash_ok(&mut self, piece: ValidPieceIndex) {
-        self.chunks.mark_piece_downloaded(piece);
+    /// Mark piece as downloaded after successful hash verification. Moves the per-file
+    /// counts with it: see [`ChunkTracker::mark_piece_downloaded`].
+    pub fn mark_piece_hash_ok(&mut self, piece: ValidPieceIndex, file_infos: &FileInfos) {
+        self.chunks.mark_piece_downloaded(piece, file_infos);
     }
 
     /// Mark piece as failed after hash verification failure - requeues the piece.
@@ -343,17 +343,6 @@ impl PieceTracker {
         self.chunks.update_only_files(file_infos, new_only_files)
     }
 
-    /// Update per-file have bytes when a piece completes. Returns remaining bytes for the file.
-    pub fn update_file_have_on_piece_completed(
-        &mut self,
-        piece_id: ValidPieceIndex,
-        file_id: usize,
-        file_info: &FileInfo,
-    ) -> u64 {
-        self.chunks
-            .update_file_have_on_piece_completed(piece_id, file_id, file_info)
-    }
-
     /// Flush the have pieces bitfield to disk.
     pub fn flush_have_pieces(&mut self, flush_async: bool) -> anyhow::Result<()> {
         self.chunks.get_have_pieces_mut().flush(flush_async)
@@ -454,7 +443,7 @@ mod tests {
             let p = piece(&tracker, id);
             // Same order as the real thing: reserve it, then mark it good.
             tracker.chunks.reserve_needed_piece(p);
-            tracker.mark_piece_hash_ok(p);
+            tracker.mark_piece_hash_ok(p, &file_infos);
         }
         tracker
     }
@@ -568,7 +557,7 @@ mod tests {
         tracker.reselect_pieces([p0]).unwrap();
 
         // The hash passes.
-        tracker.mark_piece_hash_ok(p0);
+        tracker.mark_piece_hash_ok(p0, &file_infos);
         assert!(tracker.chunks().is_piece_have(p0));
         assert!(
             !tracker.chunks().is_piece_queued(p0),
@@ -752,7 +741,7 @@ mod tests {
         assert!(duration.is_some());
         assert!(!tracker.is_inflight(piece));
         // Simulate successful hash check
-        tracker.mark_piece_hash_ok(piece);
+        tracker.mark_piece_hash_ok(piece, &file_infos);
         assert!(tracker.chunks().is_piece_have(piece));
     }
 
