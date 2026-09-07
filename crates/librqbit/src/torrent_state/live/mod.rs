@@ -2229,11 +2229,11 @@ impl PeerHandler {
             }
         };
 
-        // Peer chunk/byte counters.
+        // Peer chunk/byte counters. These count what came off the wire, whether we can
+        // use it or not.
         self.counters
             .fetched_bytes
             .fetch_add(piece.len() as u64, Ordering::Relaxed);
-        self.counters.on_bytes_moved(piece.len() as u64);
         self.counters.fetched_chunks.fetch_add(1, Ordering::Relaxed);
 
         let should_process = self
@@ -2258,6 +2258,12 @@ impl PeerHandler {
         if !should_process {
             return Ok(());
         }
+
+        // Only now, past the check: a chunk that arrives after we cancelled the request
+        // is thrown away, and a peer whose every chunk is thrown away has moved nothing.
+        // A lowered cap ranks by this, and would otherwise keep exactly the peers whose
+        // pipeline someone else's steal has poisoned.
+        self.counters.on_bytes_moved(piece.len() as u64);
 
         // This one is used to calculate download speed.
         self.state

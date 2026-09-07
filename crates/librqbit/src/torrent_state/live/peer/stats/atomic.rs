@@ -91,6 +91,10 @@ impl PeerCountersAtomic {
     /// Count bytes that just went one way or the other into the recent window. The
     /// direction is deliberately not kept: what reads this -- the cut a lowered peer
     /// limit makes -- weighs a byte we sent exactly as much as one we received.
+    ///
+    /// Count only bytes that were of use. A chunk arriving after we cancelled the request
+    /// for it is discarded, and a peer whose pipeline is full of such chunks has moved
+    /// nothing however busy its link looks.
     pub(crate) fn on_bytes_moved(&self, bytes: u64) {
         self.recent_bytes.add(bytes);
     }
