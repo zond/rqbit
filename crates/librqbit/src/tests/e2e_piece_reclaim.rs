@@ -639,9 +639,15 @@ impl crate::storage::TorrentStorage for ReleasingStorage {
 // have, so nothing could be done about it: every relaunch refilled the disk that reclaim
 // was keeping small. Now the flag is persisted, and the caller re-applies its want-set on
 // the restored torrent while it is still paused, so no peer gets a chance to fill a hole.
+//
+// Paused is not the record's choice to make. The torrent here is live when the process
+// dies - a kill, a crash, the ENOSPC that ended the torrent - and its record says so; a
+// restore that believed it would come back live and wanting the holes, with a seeder that
+// has them, and the caller's drop would land after the first pieces did. A reclaim torrent
+// comes back paused whatever the record says.
 async fn e2e_piece_reclaim_want_set_is_reapplied_after_a_restart() -> anyhow::Result<()> {
     setup_test_logging();
-    let (files, torrent_bytes, _server_session, peer) =
+    let (files, torrent_bytes, server_session, peer) =
         seeding_server("test_piece_reclaim_restart", FILE_SIZE).await?;
     let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
 
@@ -649,6 +655,8 @@ async fn e2e_piece_reclaim_want_set_is_reapplied_after_a_restart() -> anyhow::Re
     let output_folder = dir.path().join("out");
     let persistence_folder = dir.path().join("session");
     let storage = InMemoryPieceStorageFactory::default();
+    // The client listens, so the seeder can come to it after the restart: a restored
+    // torrent has no peers of its own, and a hole nobody can reach proves nothing.
     let session_opts = || crate::SessionOptions {
         dht: None,
         persistence: Some(crate::SessionPersistenceConfig::Json {
@@ -657,6 +665,10 @@ async fn e2e_piece_reclaim_want_set_is_reapplied_after_a_restart() -> anyhow::Re
         disable_local_service_discovery: true,
         peer_id: Some(TestPeerMetadata::good().as_peer_id()),
         default_storage_factory: Some(storage.clone().boxed()),
+        listen: Some(crate::listen::ListenerOptions {
+            listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
+            ..Default::default()
+        }),
         ..Default::default()
     };
 
@@ -676,11 +688,10 @@ async fn e2e_piece_reclaim_want_set_is_reapplied_after_a_restart() -> anyhow::Re
         .context("expected a handle")?;
     timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
 
-    // Half the pieces go, then the torrent is paused: the record says so, and the restart
-    // comes up paused.
+    // Half the pieces go, and the process dies with the torrent live: the record says live.
     release(&storage, &handle, DROP)?;
     let held = storage_has(&storage, &handle)?;
-    session.pause(&handle).await?;
+    assert!(!handle.is_paused());
     drop(handle);
     drop(session);
 
@@ -689,11 +700,34 @@ async fn e2e_piece_reclaim_want_set_is_reapplied_after_a_restart() -> anyhow::Re
         .get(crate::api::TorrentIdOrHash::Id(0))
         .context("expected the torrent to be restored from persistence")?;
     timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
-    assert!(handle.with_state(|s| matches!(s, crate::ManagedTorrentState::Paused(_))));
+    assert!(
+        handle.with_state(|s| matches!(s, crate::ManagedTorrentState::Paused(_))),
+        "a reclaim torrent that was live at shutdown was not restored paused"
+    );
 
     // The have-set is the storage's, holes included, and every hole is wanted.
     assert_eq!(torrent_has(&handle)?, held);
     assert!(!handle.stats().finished);
+
+    // A seeder with all of it comes knocking before the caller has spoken. Paused, the
+    // torrent doesn't answer, and the holes stay holes.
+    let listen_addr = session
+        .listen_addr()
+        .context("expected the client to listen")?;
+    server_session
+        .get(crate::api::TorrentIdOrHash::Id(0))
+        .context("expected the seeder's torrent")?
+        .live()
+        .context("expected the seeder to be live")?
+        .add_peer_if_not_seen(listen_addr)?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(handle.with_state(|s| matches!(s, crate::ManagedTorrentState::Paused(_))));
+    assert_eq!(
+        storage.piece_count(handle.info_hash()),
+        TOTAL_PIECES as usize - DROP.len(),
+        "a hole was filled before the caller re-applied its want-set"
+    );
+    assert_eq!(torrent_has(&handle)?, held);
 
     // The caller re-applies its want-set: the same range, none of which we have now.
     let dropped = handle

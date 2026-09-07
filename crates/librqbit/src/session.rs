@@ -294,8 +294,17 @@ pub struct AddTorrentOptions {
     /// the caller released from one that was never downloaded: both are holes. So a
     /// restored torrent wants every hole, and a caller whose want-set is narrower re-applies
     /// it with [`crate::ManagedTorrent::drop_pieces`], which takes pieces we don't have
-    /// and works on a paused torrent - restore paused, drop, unpause, and no peer gets a
-    /// chance to fill the holes in between.
+    /// and works on a paused torrent.
+    ///
+    /// For that to be possible the torrent must come back paused, so it does: a restored
+    /// torrent with this set is paused whatever its record says about `paused`, live at
+    /// shutdown or not, and stays so until the caller unpauses it. The caller's flow at
+    /// every start is drop what isn't wanted, then unpause, and no peer gets a chance to
+    /// fill a hole in between. This is not optional, since a restore that came back live
+    /// would download whatever a connected peer had of the holes before the caller could
+    /// speak - and a caller whose want-set is everything loses nothing but one unpause.
+    /// What a caller loses is the distinction between a torrent it had paused and one it
+    /// hadn't, which it keeps on its own if it needs it.
     ///
     /// A storage used with this must be able to release a single piece and must
     /// implement `has_piece` - the only thing that keeps the have-set honest across a

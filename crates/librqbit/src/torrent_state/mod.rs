@@ -377,9 +377,9 @@ impl ManagedTorrent {
     /// whether we ever had it doesn't come into that. This is what re-applies a want-set
     /// after a restart. The want-set is per-session - see
     /// [`crate::AddTorrentOptions::piece_reclaim`] - and the have-set a restart comes up
-    /// with is what the storage holds, holes and all, every one of them wanted; a caller
-    /// whose want-set is narrower restores the torrent paused, drops what it doesn't
-    /// want, and unpauses, so no peer gets a chance to fill a hole in between. There is
+    /// with is what the storage holds, holes and all, every one of them wanted. That is
+    /// why a restored reclaim torrent is always paused: the caller drops what it doesn't
+    /// want and unpauses, and no peer gets a chance to fill a hole in between. There is
     /// nothing of ours to release behind such a piece, but a half-finished download may
     /// have left something, and the piece is in the returned list so that can go too.
     ///

@@ -53,7 +53,12 @@ impl SerializedTorrent {
         };
 
         let opts = AddTorrentOptions {
-            paused: self.is_paused,
+            // A reclaim torrent comes back paused whatever the record says. Its want-set
+            // is the caller's and did not survive with the record, so it wants every hole
+            // in the storage until the caller re-applies it - and restored live, that is
+            // what connected peers would start filling. See
+            // `AddTorrentOptions::piece_reclaim`.
+            paused: self.is_paused || self.piece_reclaim,
             output_folder: Some(
                 self.output_folder
                     .to_str()
