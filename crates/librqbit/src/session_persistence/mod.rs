@@ -30,6 +30,9 @@ pub struct SerializedTorrent {
     output_folder: PathBuf,
     only_files: Option<Vec<usize>>,
     is_paused: bool,
+    // Records written before this field existed have no such torrents.
+    #[serde(default)]
+    piece_reclaim: bool,
 }
 
 impl SerializedTorrent {
@@ -59,6 +62,7 @@ impl SerializedTorrent {
             ),
             only_files: self.only_files,
             overwrite: true,
+            piece_reclaim: self.piece_reclaim,
             ..Default::default()
         };
 

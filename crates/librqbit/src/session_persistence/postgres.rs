@@ -26,6 +26,7 @@ struct TorrentsTableRecord {
     output_folder: String,
     only_files: Option<Vec<i32>>,
     is_paused: bool,
+    piece_reclaim: bool,
 }
 
 impl TorrentsTableRecord {
@@ -41,6 +42,7 @@ impl TorrentsTableRecord {
                     .only_files
                     .map(|v| v.into_iter().map(|v| v as usize).collect()),
                 is_paused: self.is_paused,
+                piece_reclaim: self.piece_reclaim,
             },
         ))
     }
@@ -75,11 +77,15 @@ impl PostgresSessionStorage {
           trackers TEXT[] NOT NULL,
           output_folder TEXT NOT NULL,
           only_files INTEGER[],
-          is_paused BOOLEAN NOT NULL
+          is_paused BOOLEAN NOT NULL,
+          piece_reclaim BOOLEAN NOT NULL DEFAULT FALSE
         )"
         );
 
         exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS have_bitfield BYTEA");
+        exec!(
+            "ALTER TABLE torrents ADD COLUMN IF NOT EXISTS piece_reclaim BOOLEAN NOT NULL DEFAULT FALSE"
+        );
 
         Ok(Self { pool })
     }
@@ -102,8 +108,8 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .as_ref()
             .map(|i| i.torrent_bytes.clone())
             .unwrap_or_default();
-        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused)
-        VALUES($1, $2, $3, $4, $5, $6, $7)
+        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused, piece_reclaim)
+        VALUES($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT(id) DO NOTHING";
         sqlx::query(q)
             .bind::<i32>(id.try_into()?)
@@ -132,6 +138,7 @@ impl SessionPersistenceStore for PostgresSessionStorage {
                     .collect::<Vec<i32>>()
             }))
             .bind(torrent.is_paused())
+            .bind(torrent.shared().options.piece_reclaim)
             .execute(&self.pool)
             .await
             .context("error executing INSERT INTO torrents")?;
