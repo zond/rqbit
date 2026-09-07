@@ -1,12 +1,14 @@
 use std::{
+    io::SeekFrom,
     net::Ipv4Addr,
+    pin::Pin,
     time::{Duration, Instant},
 };
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use librqbit_core::constants::CHUNK_SIZE;
 use tempfile::TempDir;
-use tokio::time::timeout;
+use tokio::{io::AsyncSeek, time::timeout};
 use tracing::info;
 
 use crate::{
@@ -21,6 +23,7 @@ const PIECE_LEN: u32 = CHUNK_SIZE;
 const TOTAL_PIECES: u32 = 16;
 const FILE_SIZE: usize = (PIECE_LEN * TOTAL_PIECES) as usize;
 const DROP: std::ops::Range<u32> = 0..TOTAL_PIECES / 2;
+const SEEK_TO: u32 = TOTAL_PIECES / 2;
 
 type Client = (
     std::sync::Arc<Session>,
@@ -135,6 +138,38 @@ async fn e2e_piece_reclaim() -> anyhow::Result<()> {
         let _stream = handle.clone().stream(0).await?;
         assert!(handle.drop_pieces(DROP)?.is_empty());
     }
+
+    // The guard is evaluated under the write lock, not before taking it: a reader that
+    // seeks while drop_pieces() waits for a contended lock must not lose its lookahead.
+    {
+        let mut stream = handle.clone().stream(0).await?;
+        // At EOF the reader's lookahead covers nothing, so everything may go.
+        Pin::new(&mut stream).start_seek(SeekFrom::Start(FILE_SIZE as u64))?;
+        let live = handle.live().context("expected a live torrent")?;
+
+        // All sync: holding the state lock across an await would stall the whole runtime.
+        let dropped = tokio::task::block_in_place(|| -> anyhow::Result<Vec<u32>> {
+            let g = live.lock_write("test_drop_pieces_guard");
+            let dropper = std::thread::spawn({
+                let handle = handle.clone();
+                move || handle.drop_pieces(0..TOTAL_PIECES)
+            });
+            // Let it block on the lock, then seek back. The reader now wants SEEK_TO
+            // onwards, and that is what the guard has to see.
+            std::thread::sleep(Duration::from_millis(200));
+            Pin::new(&mut stream).start_seek(SeekFrom::Start((SEEK_TO * PIECE_LEN) as u64))?;
+            drop(g);
+            dropper.join().map_err(|_| anyhow!("dropper panicked"))?
+        })?;
+
+        assert!(
+            !dropped.contains(&SEEK_TO),
+            "piece {SEEK_TO} was dropped from under a reader that had seeked to it: {dropped:?}"
+        );
+        assert_eq!(handle.reselect_pieces(0..TOTAL_PIECES)?, dropped.len());
+    }
+    timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
+    assert_eq!(std::fs::read(&downloaded).unwrap(), orig_content);
 
     info!("downloaded, now dropping pieces {DROP:?}");
 
