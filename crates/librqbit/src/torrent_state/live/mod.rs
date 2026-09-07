@@ -1092,8 +1092,12 @@ impl TorrentStateLive {
     /// refused as before. Until the surplus has actually hung up, live peers exceed the cap
     /// by that many, and no more.
     ///
-    /// Raising it hands the peer adder that many more permits and re-queues the peers a
-    /// lower cap parked (`NotNeeded`), so they are the first to come back.
+    /// Raising it hands the peer adder that many more permits and puts the parked peers back
+    /// in the queue to be dialled -- but not at the front of it. See
+    /// [`Self::reconnect_all_not_needed_peers`]: on a torrent with a tracker or the DHT
+    /// running they queue behind whatever addresses piled up while the cap was low, so they
+    /// come back over the following seconds rather than at once. Handing them back their old
+    /// slots would need a queue with a front, which that is not.
     ///
     /// Idempotent and cheap: no I/O, the state lock is taken only to read the queue of
     /// pieces still needed, and never while the peer table is touched.
@@ -1289,6 +1293,14 @@ impl TorrentStateLive {
         }
     }
 
+    /// Put every `NotNeeded` outgoing peer back in the queue to be dialled: the ones a
+    /// lowered cap parked, and equally the ones that left cleanly and the seeders parked
+    /// when the torrent finished.
+    ///
+    /// They go on the tail of the same FIFO channel that `add_peer_if_not_seen` feeds with
+    /// every address the tracker, the DHT and PEX name, and the adder takes them in order as
+    /// permits free up. So this asks for them back; it does not put them first, and on a
+    /// busy torrent a long backlog is dialled ahead of them.
     pub(crate) fn reconnect_all_not_needed_peers(&self) {
         self.peers
             .states
