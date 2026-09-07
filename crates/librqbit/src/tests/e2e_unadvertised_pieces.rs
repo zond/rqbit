@@ -2,8 +2,9 @@
 //!
 //! Two paths carry the have-set to a peer, and a held-back piece has to be missing from
 //! both: the bitfield sent at handshake, and the Have broadcast a completed piece sets
-//! off. These tests drive them over a real connection between two sessions, so a leak
-//! shows up as the other side downloading a piece it was never told about.
+//! off. These tests drive them over real connections between real sessions, so a leak
+//! shows up as the other side learning of a piece it was never told about - and, given
+//! long enough, downloading it.
 
 use std::{net::Ipv4Addr, ops::Range, time::Duration};
 
@@ -313,6 +314,166 @@ async fn test_e2e_unadvertised_pieces_default_is_unchanged() -> anyhow::Result<(
     timeout(
         Duration::from_secs(120),
         e2e_unadvertised_pieces_default_is_unchanged(),
+    )
+    .await?
+}
+
+// A session that starts with nothing, knows nobody, and listens - so a peer can connect
+// to it and watch what it announces while it fills up. Nothing reaches it until the test
+// hands it a peer.
+async fn middle(
+    prefix: &str,
+    torrent_bytes: &[u8],
+) -> anyhow::Result<(TempDir, Client, std::net::SocketAddr)> {
+    let dir = TempDir::with_prefix(prefix)?;
+    let session = Session::new_with_opts(
+        dir.path().into(),
+        crate::SessionOptions {
+            dht: None,
+            persistence: None,
+            peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+            listen: Some(crate::listen::ListenerOptions {
+                listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent_bytes.to_owned()),
+            Some(crate::AddTorrentOptions {
+                paused: false,
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+    let addr = session
+        .listen_addr()
+        .context("expected listen_addr to be set")?;
+    Ok((dir, (session, handle), addr))
+}
+
+// How many peers this torrent is connected to right now, and how many of them it thinks
+// have the whole torrent. The second number is what a peer's Haves add up to: it moves
+// the moment one arrives, without waiting for anything to be asked for or sent.
+fn live_peers(handle: &ManagedTorrent) -> anyhow::Result<(u32, u32)> {
+    let stats = handle
+        .live()
+        .context("expected a live torrent")?
+        .stats_snapshot();
+    Ok((stats.peer_stats.live, stats.peer_stats.live_seeders))
+}
+
+// Wait until this torrent has `n` peers connected, so what happens next happens on
+// connections that are already open.
+async fn wait_for_live_peers(handle: &ManagedTorrent, n: u32) -> anyhow::Result<()> {
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if handle.live().is_some() && live_peers(handle)?.0 >= n {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await?
+}
+
+// The Have path, which the bitfield path cannot reach: a peer that is already connected
+// when a held-back piece completes. It got no bitfield - we had nothing to send one about
+// - so a Have is the only thing that could tell it, and there must not be one.
+//
+// Three sessions, because the piece has to complete on the session being watched: a
+// seeder, a middle that downloads from it with everything held back, and a watcher that
+// knows only the middle and so can have learnt nothing anywhere else.
+async fn e2e_unadvertised_pieces_completing_while_held_back() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (seeder_files, torrent_bytes, (_seeder_session, _seeder), seeder_addr) =
+        seeder("test_unadvertised_pieces_completing").await?;
+    let orig_content = std::fs::read(seeder_files.path().join("0.data")).unwrap();
+
+    // Held back before the middle has a single piece, and before it has anywhere to get
+    // one: every piece it ever completes, it completes held back.
+    let (_middle_dir, (_middle_session, middle), middle_addr) =
+        middle("test_unadvertised_pieces_completing_middle", &torrent_bytes).await?;
+    assert_eq!(
+        middle.set_pieces_advertised(0..TOTAL_PIECES, false)?,
+        TOTAL_PIECES as usize
+    );
+    assert_eq!(have_pieces(&middle)?, Vec::<u32>::new());
+
+    // The watcher connects while there is still nothing to announce, so the handshake
+    // bitfield tells it nothing and cannot be what tells it anything later.
+    let watcher_dir = TempDir::with_prefix("test_unadvertised_pieces_completing_watcher")?;
+    let (_watcher_session, watcher) = leecher(&watcher_dir, &torrent_bytes, middle_addr).await?;
+    // Both sides, and the middle's side is the one that matters: it must have the watcher
+    // to broadcast to before it has a piece to broadcast about.
+    wait_for_live_peers(&watcher, 1).await?;
+    wait_for_live_peers(&middle, 1).await?;
+    assert_eq!(
+        have_pieces(&middle)?,
+        Vec::<u32>::new(),
+        "the middle got a piece before the watcher was connected"
+    );
+
+    info!("watcher is connected, giving the middle a seeder");
+
+    // Only now does the middle get a source. Every piece completes with the watcher on
+    // the other end of a connection that is already open.
+    middle
+        .live()
+        .context("expected a live torrent")?
+        .add_peer_if_not_seen(seeder_addr)?;
+    timeout(Duration::from_secs(30), middle.wait_until_completed()).await??;
+    assert_eq!(have_pieces(&middle)?, (0..TOTAL_PIECES).collect::<Vec<_>>());
+
+    // Long enough for a Have queued behind the completion to have gone out, been asked
+    // about and answered. Watched throughout rather than sampled at the end: a Have moves
+    // the watcher's picture of us the instant it lands, and it would move back if the
+    // connection were replaced by a fresh handshake.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        assert_eq!(
+            live_peers(&watcher)?.1,
+            0,
+            "the watcher was told about a piece that completed while held back"
+        );
+        assert_eq!(
+            have_pieces(&watcher)?,
+            Vec::<u32>::new(),
+            "the watcher got a piece that completed while held back"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Silence, not a dead peer: it spent all of that connected to the session that had
+    // every piece and said nothing.
+    assert_eq!(live_peers(&watcher)?.0, 1);
+
+    info!("nothing leaked, now advertising the lot");
+
+    // The control, and the reason the silence above means something: the same connection
+    // carries every one of those pieces the moment they are put back.
+    assert_eq!(
+        middle.set_pieces_advertised(0..TOTAL_PIECES, true)?,
+        TOTAL_PIECES as usize
+    );
+    timeout(Duration::from_secs(30), watcher.wait_until_completed()).await??;
+    assert_eq!(
+        std::fs::read(watcher_dir.path().join("0.data")).unwrap(),
+        orig_content
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_unadvertised_pieces_completing_while_held_back() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_unadvertised_pieces_completing_while_held_back(),
     )
     .await?
 }
