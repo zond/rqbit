@@ -995,9 +995,10 @@ impl TorrentStateLive {
     ///
     /// Only a torrent that opted into reclaim can lose a piece it had, and only a torrent
     /// that has held something back has anything to hide, so only those pay for the lock.
-    /// The `unadvertised_pieces` gate is a fast path and not the truth: it is set before
-    /// the set it summarises, so it can be true with nothing held back - which costs a
-    /// lock and answers correctly - but never false while something is.
+    /// The `unadvertised_pieces` gate is a fast path and not the truth: it goes up before
+    /// the set it summarises and comes down only under the lock that set changes under,
+    /// so it can be true with nothing held back - which costs a lock and answers
+    /// correctly - but never false while something is.
     pub(crate) fn should_advertise_have(&self, id: ValidPieceIndex) -> bool {
         if !self.shared.options.piece_reclaim
             && !self.shared.unadvertised_pieces.load(Ordering::Relaxed)

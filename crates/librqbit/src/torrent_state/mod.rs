@@ -198,8 +198,20 @@ pub struct ManagedTorrentShared {
     pub(crate) peer_limit: AtomicUsize,
     /// Whether [`ManagedTorrent::set_pieces_advertised`] has anything held back, so the
     /// Have path can answer "announce it" without taking the state lock when it doesn't.
-    /// A fast-path gate and not the truth - it is set before the set it summarises, so it
-    /// can be true with nothing held back, but never false while something is.
+    ///
+    /// Written only inside [`ManagedTorrent::set_pieces_advertised`], which holds
+    /// [`ManagedTorrent::locked`] for write from before the gate goes up to after it is
+    /// written back down. That is not the lock the set changes under - the set lives in
+    /// the chunk tracker, reached through [`TorrentStateLive`]'s own lock on the live
+    /// path and through no lock at all on the paused one - it is a lock held *around*
+    /// that, and it is what serialises the pair, because that call is the only thing in
+    /// the crate that changes the set. So two callers run one after the other, and each
+    /// leaves the gate agreeing with the set it left behind.
+    ///
+    /// It is a fast-path gate and not the truth: it can be true with nothing held back -
+    /// while a hold-back call is in flight, and after a re-check throws the set away -
+    /// which costs a lock and answers correctly. It is never false while something is
+    /// held back.
     pub(crate) unadvertised_pieces: AtomicBool,
     pub(crate) connector: Arc<StreamConnector>,
     pub(crate) storage_factory: BoxStorageFactory,
@@ -509,29 +521,32 @@ impl ManagedTorrent {
         pieces: Range<u32>,
         advertised: bool,
     ) -> anyhow::Result<usize> {
+        let mut g = self.locked.write();
         if !advertised {
-            // Before the set itself changes, never after. The gate is what lets the Have
-            // path skip the lock, and the window between the two may only cost a lock,
-            // not let out a piece the caller has just asked us to hold back.
+            // Before the set itself changes, never after, so the window between the two
+            // may only cost the Have path a lock and not let out a piece the caller has
+            // just asked us to hold back. Inside the lock, because holding that lock
+            // across both writes is what orders this against another caller doing the
+            // same thing - see the field's doc.
             self.shared
                 .unadvertised_pieces
                 .store(true, Ordering::Relaxed);
         }
-        let mut g = self.locked.write();
         let (changed, still_held_back) = match &mut g.state {
             ManagedTorrentState::Live(live) => live.set_pieces_advertised(pieces, advertised)?,
             ManagedTorrentState::Paused(paused) => paused.set_pieces_advertised(pieces, advertised),
             state => bail!("torrent is neither live nor paused: {}", state.name()),
         };
+        // Recomputed rather than cleared, since this call may have put back only part of
+        // what is held back - and unconditionally, so a hold-back that held nothing back
+        // does not leave the gate stuck on. Still under the lock: two callers write the
+        // gate in the order they wrote the set, so whoever goes last leaves the gate
+        // saying what the set says. Store it after the lock and the loser of that race
+        // stores what the set looked like before the winner changed it.
+        self.shared
+            .unadvertised_pieces
+            .store(still_held_back, Ordering::Relaxed);
         drop(g);
-        if advertised {
-            // Recomputed, not cleared: this call may have put back only part of what is
-            // held back. The Have path goes back to skipping the lock only once the set
-            // is empty again.
-            self.shared
-                .unadvertised_pieces
-                .store(still_held_back, Ordering::Relaxed);
-        }
         Ok(changed)
     }
 

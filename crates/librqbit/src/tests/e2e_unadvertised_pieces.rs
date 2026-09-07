@@ -477,3 +477,176 @@ async fn test_e2e_unadvertised_pieces_completing_while_held_back() -> anyhow::Re
     )
     .await?
 }
+
+// Whether the Have path can skip the state lock, which is the whole cost of this feature
+// for a torrent that never uses it.
+fn gate(handle: &ManagedTorrent) -> bool {
+    handle
+        .shared
+        .unadvertised_pieces
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn anything_held_back(handle: &ManagedTorrent) -> anyhow::Result<bool> {
+    handle.with_chunk_tracker(|ct| ct.has_unadvertised_pieces())
+}
+
+// The gate is allowed to be true with nothing held back - it costs a lock and the lock
+// gives the right answer. It is not allowed to be false while something is held back:
+// false is the fast path that never looks at the set, so a Have would go out for a piece
+// the caller is holding back.
+//
+// That holds only if both writes to the gate happen inside the write guard on
+// ManagedTorrent::locked that the call takes and keeps around the change to the set. That
+// guard is not the lock the set itself changes under - it is held around it - but it is
+// what keeps two callers off each other. This is the half of it a single caller can show:
+// the gate must not move before the guard is taken, because a caller already holding it
+// can be about to compute "nothing held back" and store that over the top.
+async fn e2e_unadvertised_pieces_gate_waits_for_the_lock() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (_files, _torrent_bytes, (_session, handle), _addr) =
+        seeder("test_unadvertised_pieces_gate").await?;
+    assert!(!gate(&handle));
+
+    // All sync: holding the state lock across an await would stall the whole runtime.
+    tokio::task::block_in_place(|| -> anyhow::Result<()> {
+        let g = handle.locked.write();
+        let holder = std::thread::spawn({
+            let handle = handle.clone();
+            move || handle.set_pieces_advertised(HELD_BACK, false)
+        });
+        // Long enough for it to have got as far as it is going to get, which is the lock.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !gate(&handle),
+            "the gate went up before the lock the call holds around the change to the set"
+        );
+        drop(g);
+        holder
+            .join()
+            .map_err(|_| anyhow::anyhow!("the holding-back thread panicked"))??;
+        Ok(())
+    })?;
+
+    assert!(gate(&handle));
+    assert!(anything_held_back(&handle)?);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_unadvertised_pieces_gate_waits_for_the_lock() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_unadvertised_pieces_gate_waits_for_the_lock(),
+    )
+    .await?
+}
+
+// And the other half, which needs two callers: one holding pieces back while another puts
+// pieces back. Whichever of them changes the set last must be the one whose answer the
+// gate ends up with. Store the gate outside that guard and it is not: the advertiser can
+// read "nothing held back" off a set the other thread has not touched yet, and write that
+// after the other thread has held pieces back.
+//
+// A leak like that is not a moment, it is a state: the gate stays wrong until the next
+// call to this API, which is why looking after the threads are done finds it.
+async fn e2e_unadvertised_pieces_gate_survives_two_callers() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (_files, _torrent_bytes, (_session, handle), _addr) =
+        seeder("test_unadvertised_pieces_race").await?;
+
+    // Two threads that live for the whole test and are let off a barrier together, rather
+    // than a pair spawned per round: spawning them is slow enough that the first would be
+    // done before the second started, and there would be no race to lose. The window a
+    // wrong ordering leaves open is a few instructions wide, so the rounds are many and
+    // cheap - the whole thing is under a second, and it caught the bad ordering on every
+    // one of eight runs.
+    const ROUNDS: usize = 60000;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let failed = std::sync::Arc::new(parking_lot::Mutex::new(None));
+    let caller = |advertised: bool| {
+        let handle = handle.clone();
+        let barrier = barrier.clone();
+        let failed = failed.clone();
+        std::thread::spawn(move || {
+            for _ in 0..ROUNDS {
+                barrier.wait();
+                if let Err(e) = handle.set_pieces_advertised(HELD_BACK, advertised) {
+                    *failed.lock() = Some(e);
+                }
+                // Never skipped, whatever happened: the other two are waiting on it.
+                barrier.wait();
+            }
+        })
+    };
+
+    let threads =
+        tokio::task::block_in_place(|| -> anyhow::Result<[std::thread::JoinHandle<()>; 2]> {
+            let threads = [caller(false), caller(true)];
+            for round in 0..ROUNDS {
+                // Between rounds, with both threads parked on the barrier.
+                handle.set_pieces_advertised(0..TOTAL_PIECES, true)?;
+                assert!(!gate(&handle), "round {round}: the reset left the gate up");
+
+                barrier.wait();
+                barrier.wait();
+
+                if let Some(e) = failed.lock().take() {
+                    return Err(e);
+                }
+                assert!(
+                    !anything_held_back(&handle)? || gate(&handle),
+                    "round {round}: pieces are held back and the gate says nothing is, \
+                     so the Have path will announce them without ever looking"
+                );
+            }
+            Ok(threads)
+        })?;
+    for t in threads {
+        t.join()
+            .map_err(|_| anyhow::anyhow!("a calling thread panicked"))?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_unadvertised_pieces_gate_survives_two_callers() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_unadvertised_pieces_gate_survives_two_callers(),
+    )
+    .await?
+}
+
+// A hold-back that holds nothing back - an empty range, or one past the last piece - must
+// leave the gate down. It goes up on the way in, before the set is touched, because at
+// that point we do not yet know; what brings it down again is that the gate is written
+// from the set on the way out whichever direction the call was going.
+async fn e2e_unadvertised_pieces_gate_comes_back_down() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (_files, _torrent_bytes, (_session, handle), _addr) =
+        seeder("test_unadvertised_pieces_gate_down").await?;
+
+    assert_eq!(handle.set_pieces_advertised(0..0, false)?, 0);
+    assert!(!anything_held_back(&handle)?);
+    assert!(
+        !gate(&handle),
+        "a hold-back that held nothing back left the Have path taking the lock forever"
+    );
+
+    assert_eq!(
+        handle.set_pieces_advertised(TOTAL_PIECES..TOTAL_PIECES + 8, false)?,
+        0
+    );
+    assert!(!gate(&handle));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_unadvertised_pieces_gate_comes_back_down() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_unadvertised_pieces_gate_comes_back_down(),
+    )
+    .await?
+}
