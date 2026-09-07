@@ -187,6 +187,16 @@ async fn e2e_piece_reclaim() -> anyhow::Result<()> {
         .load_full()
         .context("no metadata")?
         .lengths();
+    let live = handle.live().context("expected a live torrent")?;
+    for id in 0..TOTAL_PIECES {
+        // A Have queued before the drop must not go out after it: the peer would ask for
+        // the piece, we couldn't serve it, and it would hang up on us.
+        assert_eq!(
+            live.should_advertise_have(lengths.validate_piece_index(id).unwrap()),
+            !DROP.contains(&id),
+            "piece {id}"
+        );
+    }
     handle.with_chunk_tracker(|ct| {
         let have = ct.get_have_pieces().as_slice();
         for id in 0..TOTAL_PIECES {
