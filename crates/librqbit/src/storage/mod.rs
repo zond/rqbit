@@ -60,12 +60,52 @@ pub trait StorageFactory: Send + Sync + Any {
 
     /// Whether this factory, or the one it ultimately wraps, is of the given type.
     ///
-    /// It has to survive both wrapping and boxing: this is how e.g. session persistence
-    /// asks whether it's dealing with a FilesystemStorageFactory, and a middleware in
-    /// between must not hide it. A middleware forwards this to what it wraps.
+    /// It has to survive both wrapping and boxing: what the session holds is a
+    /// [`BoxStorageFactory`], and a middleware in between must not hide what it wraps.
+    /// A middleware forwards this to what it wraps.
     fn is_type_id(&self, type_id: TypeId) -> bool {
         Self::type_id(self) == type_id
     }
+
+    /// Whether a torrent kept in this storage can be persisted across a restart - and
+    /// if not, what this storage can't promise.
+    ///
+    /// The persisted record is the torrent, an output folder, a file selection and a
+    /// paused flag, plus a have-bitfield beside it. What it doesn't carry is the
+    /// storage: on restart the session replays the record through
+    /// [`crate::Session::add_torrent`] with no factory of its own, so the torrent comes
+    /// back on whatever that session has as its `default_storage_factory`. Two things
+    /// follow, and a storage that answers Ok here promises both.
+    ///
+    /// One: the storage the restart builds addresses the same data as this one. The
+    /// filesystem storage gets that for free - the record carries the output folder and
+    /// the bytes are laid out as the torrent's own files, so any FilesystemStorage over
+    /// that folder finds them again. A storage that keeps a layout of its own has to be
+    /// the session's default factory, and the instance the next process builds has to
+    /// reach the same data. A factory handed to a single add_torrent call, holding state
+    /// nothing outside this process can reconstruct, can't promise this - the torrent
+    /// would come back on the session default, which is some other storage entirely.
+    ///
+    /// Two: the have-bitfield is not believed over the storage. It is a claim the
+    /// previous run wrote, and startup intersects it with [`TorrentStorage::has_piece`],
+    /// which can only take pieces away. So either the data is still there, or has_piece
+    /// says which pieces are gone. A storage that loses data across a restart and leaves
+    /// the default has_piece standing ("yes, and I would know otherwise") has rqbit
+    /// advertising and serving pieces that aren't there: the fastresume hash check
+    /// samples ~65 pieces of a torrent however large, and will not catch it.
+    ///
+    /// The default is no, so that session persistence refuses such a torrent when it is
+    /// added rather than discovering it at the next restart. Like [`Self::is_type_id`],
+    /// this has to survive wrapping and boxing, and a middleware forwards it to what it
+    /// wraps.
+    fn ensure_persistable(&self) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "{} doesn't promise that a restart finds its data again, so a torrent using \
+             it can't be persisted. Implement StorageFactory::ensure_persistable if it can.",
+            std::any::type_name::<Self>()
+        )
+    }
+
     fn clone_box(&self) -> BoxStorageFactory;
 }
 
@@ -97,6 +137,10 @@ impl<SF: StorageFactory> StorageFactoryExt for SF {
                 self.sf.is_type_id(type_id)
             }
 
+            fn ensure_persistable(&self) -> anyhow::Result<()> {
+                self.sf.ensure_persistable()
+            }
+
             fn clone_box(&self) -> BoxStorageFactory {
                 self.sf.clone_box()
             }
@@ -119,6 +163,10 @@ impl<U: StorageFactory + ?Sized> StorageFactory for Box<U> {
 
     fn is_type_id(&self, type_id: TypeId) -> bool {
         (**self).is_type_id(type_id)
+    }
+
+    fn ensure_persistable(&self) -> anyhow::Result<()> {
+        (**self).ensure_persistable()
     }
 
     fn clone_box(&self) -> BoxStorageFactory {
@@ -286,6 +334,31 @@ mod tests {
             self.underlying_factory.is_type_id(type_id)
         }
 
+        fn ensure_persistable(&self) -> anyhow::Result<()> {
+            self.underlying_factory.ensure_persistable()
+        }
+
+        fn clone_box(&self) -> BoxStorageFactory {
+            self.clone().boxed()
+        }
+    }
+
+    // A factory that overrides nothing: it promises session persistence nothing, and the
+    // default is what has to say so.
+    #[derive(Clone)]
+    struct Opaque {}
+
+    impl StorageFactory for Opaque {
+        type Storage = Box<dyn super::TorrentStorage>;
+
+        fn create(
+            &self,
+            _shared: &ManagedTorrentShared,
+            _metadata: &TorrentMetadata,
+        ) -> anyhow::Result<Self::Storage> {
+            anyhow::bail!("not used")
+        }
+
         fn clone_box(&self) -> BoxStorageFactory {
             self.clone().boxed()
         }
@@ -315,6 +388,53 @@ mod tests {
             }
             .boxed()
             .is_type_id(TypeId::of::<Middleware<FilesystemStorageFactory>>())
+        );
+    }
+
+    // Whether a storage can be persisted is something it promises, and the promise has to
+    // survive the trip to the session, which holds a BoxStorageFactory. Losing it through
+    // boxing would refuse torrents that are perfectly persistable; inventing it for a
+    // storage that never made it is the expensive direction - resume data outliving the
+    // data it describes.
+    #[test]
+    fn test_ensure_persistable_survives_boxing() {
+        assert!(
+            FilesystemStorageFactory::default()
+                .ensure_persistable()
+                .is_ok()
+        );
+        assert!(
+            FilesystemStorageFactory::default()
+                .boxed()
+                .ensure_persistable()
+                .is_ok()
+        );
+
+        // Through a middleware, and through the copy clone_box() makes of it.
+        let wrapped = Middleware {
+            underlying_factory: FilesystemStorageFactory::default(),
+        };
+        assert!(wrapped.clone().boxed().ensure_persistable().is_ok());
+        assert!(wrapped.boxed().clone_box().ensure_persistable().is_ok());
+
+        // The default is no, and it names the factory that didn't promise anything so
+        // that whoever added the torrent knows what to fix.
+        let err = format!("{:#}", Opaque {}.ensure_persistable().unwrap_err());
+        assert!(err.contains("Opaque"), "{err}");
+        assert!(err.contains("ensure_persistable"), "{err}");
+        assert_eq!(
+            format!("{:#}", Opaque {}.boxed().ensure_persistable().unwrap_err()),
+            err
+        );
+
+        // And a middleware over it doesn't launder it into a yes.
+        assert!(
+            Middleware {
+                underlying_factory: Opaque {},
+            }
+            .boxed()
+            .ensure_persistable()
+            .is_err()
         );
     }
 }

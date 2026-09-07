@@ -227,6 +227,15 @@ impl StorageFactory for InMemoryPieceStorageFactory {
         })
     }
 
+    // The pieces belong to the factory, not to the storage it hands out, so a session
+    // that keeps this factory as its default_storage_factory reaches the same pieces when
+    // it rebuilds the torrent from the persisted record. Across a real restart the map
+    // starts empty and has_piece() says so for every piece, so the resume data is
+    // intersected down to nothing and the torrent downloads again - empty, never wrong.
+    fn ensure_persistable(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn clone_box(&self) -> crate::storage::BoxStorageFactory {
         self.clone().boxed()
     }

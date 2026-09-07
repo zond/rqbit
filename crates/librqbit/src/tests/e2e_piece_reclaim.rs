@@ -477,8 +477,8 @@ async fn test_e2e_piece_reclaim_claim_survives_pause() -> anyhow::Result<()> {
 // A storage whose pieces the caller releases, on top of the filesystem one.
 //
 // It is a middleware in the sense of storage::middleware: it forwards everything to a
-// FilesystemStorage, and forwards is_type_id() too, so session persistence recognizes
-// what is underneath and will serialize a torrent using it.
+// FilesystemStorage, and forwards ensure_persistable() too, so it makes the same promise
+// to session persistence that the storage underneath does.
 //
 // What it adds is a released-set, which is what has_piece() answers from. The bytes of a
 // released piece are still on disk here - deleting them is the caller's job and it hasn't
@@ -510,8 +510,8 @@ impl crate::storage::StorageFactory for ReleasingStorageFactory {
         })
     }
 
-    fn is_type_id(&self, type_id: std::any::TypeId) -> bool {
-        self.underlying_factory.is_type_id(type_id)
+    fn ensure_persistable(&self) -> anyhow::Result<()> {
+        self.underlying_factory.ensure_persistable()
     }
 
     fn clone_box(&self) -> crate::storage::BoxStorageFactory {

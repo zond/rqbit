@@ -33,6 +33,14 @@ impl StorageFactory for FilesystemStorageFactory {
         })
     }
 
+    // The bytes are laid out as the torrent's own files under the output folder, and the
+    // record carries that folder - so the FilesystemStorage the next process builds finds
+    // exactly the same data. Files here only grow, never lose a piece behind our back, so
+    // the default has_piece() is the truth and the resume data can be believed.
+    fn ensure_persistable(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn clone_box(&self) -> crate::storage::BoxStorageFactory {
         self.boxed()
     }
