@@ -234,12 +234,16 @@ pub trait TorrentStorage: Send + Sync {
 
     /// Whether the data of this piece is still here, **complete**.
     ///
-    /// Called at startup for every piece the resume data claims we have, and the have-set
-    /// we start with is the intersection of the two - so this can only take a piece away,
-    /// never add one. It exists for storages that can lose a single piece behind our back:
-    /// with [`crate::AddTorrentOptions::piece_reclaim`] the caller deletes the storage of
-    /// a dropped piece itself, and if the process dies before the bitfield reaches the
-    /// disk, the resume data outlives the data it describes.
+    /// Startup asks this before it believes anything else about a piece. With resume data
+    /// it is asked for every piece the data claims we have, and the have-set we start with
+    /// is the intersection of the two; without resume data (fastresume off, which is the
+    /// default, or a torrent restarted after a fatal error) the full check asks it for
+    /// every piece before reading it, and a piece it says is gone is not read at all.
+    /// Either way it can only take a piece away, never add one: a yes still has to pass
+    /// the hash check where there is one. It exists for storages that can lose a single
+    /// piece behind our back: with [`crate::AddTorrentOptions::piece_reclaim`] the caller
+    /// deletes the storage of a dropped piece itself, and if the process dies before the
+    /// bitfield reaches the disk, the resume data outlives the data it describes.
     ///
     /// Complete is the whole of the contract, and the errors are not symmetric. A wrong
     /// "no" costs a re-download. A wrong "yes" is silent corruption: the intersection

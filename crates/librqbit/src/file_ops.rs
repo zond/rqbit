@@ -120,6 +120,22 @@ impl<'a> FileOps<'a> {
             let mut some_files_broken = false;
             progress.fetch_add(piece_info.len as u64, Ordering::Relaxed);
 
+            // Ask the storage before reading anything. A storage that can lose a single
+            // piece (see AddTorrentOptions::piece_reclaim) answers for what it holds, and
+            // that answer is the have-set: not the bytes, which may still be there after a
+            // release, and not a read error, which is per file below and would write off
+            // every later piece of the file over one hole. The default says yes, so a
+            // storage that can't lose a piece is checked the way it always was.
+            let storage_has_piece =
+                self.files
+                    .has_piece(piece_info.piece_index)
+                    .with_context(|| {
+                        format!(
+                            "error asking the storage if it has piece {}",
+                            piece_info.piece_index
+                        )
+                    })?;
+
             while piece_remaining > 0 {
                 let mut to_read_in_file: usize =
                     std::cmp::min(current_file.remaining(), piece_remaining as u64).try_into()?;
@@ -139,7 +155,7 @@ impl<'a> FileOps<'a> {
                 piece_remaining -= to_read_in_file;
                 current_file.mark_processed_bytes(to_read_in_file as u64);
 
-                if current_file.is_broken {
+                if current_file.is_broken || !storage_has_piece {
                     // no need to read.
                     continue;
                 }
@@ -160,6 +176,14 @@ impl<'a> FileOps<'a> {
                     current_file.is_broken = true;
                     some_files_broken = true;
                 }
+            }
+
+            if !storage_has_piece {
+                trace!(
+                    "piece {} is not in the storage, marking as needed",
+                    piece_info.piece_index
+                );
+                continue;
             }
 
             if some_files_broken {
@@ -359,5 +383,221 @@ impl<'a> FileOps<'a> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashSet,
+        path::Path,
+        sync::atomic::{AtomicBool, AtomicU64},
+    };
+
+    use anyhow::bail;
+    use librqbit_core::{constants::CHUNK_SIZE, lengths::ValidPieceIndex};
+
+    use super::FileOps;
+    use crate::{
+        CreateTorrentOptions, ManagedTorrentShared, create_torrent, spawn_utils::BlockingSpawner,
+        storage::TorrentStorage, tests::test_util::create_default_random_dir_with_torrents,
+        torrent_state::TorrentMetadata,
+    };
+
+    const PIECE_LEN: u32 = CHUNK_SIZE;
+    const NUM_PIECES: u32 = 8;
+
+    // A single-file torrent held whole in memory, minus the pieces the storage says it no
+    // longer has - the shape of a storage whose pieces the caller can release.
+    struct HoleyStorage {
+        bytes: Vec<u8>,
+        missing: HashSet<u32>,
+        // Whether a missing piece still reads back. On a filesystem the bytes of a
+        // released piece are there until the caller deletes them; in a store with one
+        // entry per piece they are gone, and a read of them is an error.
+        readable_when_missing: bool,
+    }
+
+    impl HoleyStorage {
+        fn new(bytes: Vec<u8>, missing: impl IntoIterator<Item = u32>, readable: bool) -> Self {
+            Self {
+                bytes,
+                missing: missing.into_iter().collect(),
+                readable_when_missing: readable,
+            }
+        }
+    }
+
+    impl TorrentStorage for HoleyStorage {
+        fn init(
+            &mut self,
+            _shared: &ManagedTorrentShared,
+            _metadata: &TorrentMetadata,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn pread_exact(&self, _file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+            let piece: u32 = (offset / PIECE_LEN as u64).try_into()?;
+            if self.missing.contains(&piece) && !self.readable_when_missing {
+                bail!("piece {piece} was released");
+            }
+            let offset: usize = offset.try_into()?;
+            buf.copy_from_slice(&self.bytes[offset..offset + buf.len()]);
+            Ok(())
+        }
+
+        fn pwrite_all(&self, _file_id: usize, _offset: u64, _buf: &[u8]) -> anyhow::Result<()> {
+            bail!("not used")
+        }
+
+        fn remove_file(&self, _file_id: usize, _filename: &Path) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn remove_directory_if_empty(&self, _path: &Path) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn ensure_file_length(&self, _file_id: usize, _length: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+            bail!("not used")
+        }
+
+        fn has_piece(&self, piece_index: ValidPieceIndex) -> anyhow::Result<bool> {
+            Ok(!self.missing.contains(&piece_index.get()))
+        }
+    }
+
+    // A storage that can't say what it has.
+    struct Clueless;
+
+    impl TorrentStorage for Clueless {
+        fn init(
+            &mut self,
+            _shared: &ManagedTorrentShared,
+            _metadata: &TorrentMetadata,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn pread_exact(&self, _file_id: usize, _offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+            buf.fill(0);
+            Ok(())
+        }
+
+        fn pwrite_all(&self, _file_id: usize, _offset: u64, _buf: &[u8]) -> anyhow::Result<()> {
+            bail!("not used")
+        }
+
+        fn remove_file(&self, _file_id: usize, _filename: &Path) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn remove_directory_if_empty(&self, _path: &Path) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn ensure_file_length(&self, _file_id: usize, _length: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+            bail!("not used")
+        }
+
+        fn has_piece(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<bool> {
+            bail!("no idea")
+        }
+    }
+
+    // A real torrent, so that the hashes are real: NUM_PIECES pieces of random bytes in
+    // one file, and the bytes themselves.
+    async fn torrent() -> (TorrentMetadata, Vec<u8>) {
+        let dir = create_default_random_dir_with_torrents(
+            1,
+            (PIECE_LEN * NUM_PIECES) as usize,
+            Some("test_initial_check"),
+        );
+        let torrent = create_torrent(
+            dir.path(),
+            CreateTorrentOptions {
+                name: None,
+                piece_length: Some(PIECE_LEN),
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap();
+        let bytes = std::fs::read(dir.path().join("0.data")).unwrap();
+        let torrent_bytes = torrent.as_bytes().unwrap();
+        let metadata = TorrentMetadata::new(
+            torrent.meta.info.data.validate().unwrap(),
+            torrent_bytes,
+            Default::default(),
+        )
+        .unwrap();
+        (metadata, bytes)
+    }
+
+    fn initial_check(
+        metadata: &TorrentMetadata,
+        storage: &dyn TorrentStorage,
+    ) -> anyhow::Result<Vec<usize>> {
+        let have = FileOps::new(&metadata.info, storage, &metadata.file_infos)
+            .initial_check(&AtomicU64::new(0), &AtomicBool::new(false))?;
+        Ok(have.iter_ones().collect())
+    }
+
+    // The full check is what startup falls back to whenever there is no resume data to
+    // intersect with the storage: fastresume off (the default), a torrent restarted
+    // after a fatal error, a bitfield that didn't match. It has to ask the storage too,
+    // or a storage with holes in it is checked as if it were a whole file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_initial_check_asks_the_storage_before_reading() {
+        let (metadata, bytes) = torrent().await;
+        let all: Vec<usize> = (0..NUM_PIECES as usize).collect();
+
+        // Nothing missing, nothing to ask about: the check is the hash check.
+        let whole = HoleyStorage::new(bytes.clone(), [], false);
+        assert_eq!(initial_check(&metadata, &whole).unwrap(), all);
+
+        // One released piece whose bytes are gone. A read of it fails, and a read error
+        // used to write the whole file off from there on - every later piece marked
+        // needed without a read. The hole is what the storage says it is: one piece.
+        let hole = HoleyStorage::new(bytes.clone(), [3], false);
+        assert_eq!(
+            initial_check(&metadata, &hole).unwrap(),
+            vec![0, 1, 2, 4, 5, 6, 7],
+            "a hole in the storage wrote off every piece of the file after it"
+        );
+
+        // The same hole with the bytes still readable, as on a filesystem where the
+        // caller hasn't deleted them yet. They would hash fine, and the storage is still
+        // the one that decides: a piece it says is gone is not one we have.
+        let stale = HoleyStorage::new(bytes.clone(), [3], true);
+        assert_eq!(
+            initial_check(&metadata, &stale).unwrap(),
+            vec![0, 1, 2, 4, 5, 6, 7],
+            "the check believed the bytes over the storage"
+        );
+
+        // has_piece is a claim about presence, not a hash check: a piece the storage
+        // holds but whose bytes are wrong still fails the check.
+        let mut corrupt = bytes.clone();
+        corrupt[(5 * PIECE_LEN) as usize] ^= 0xff;
+        let corrupt = HoleyStorage::new(corrupt, [3], false);
+        assert_eq!(
+            initial_check(&metadata, &corrupt).unwrap(),
+            vec![0, 1, 2, 4, 6, 7]
+        );
+
+        // A storage that can't answer fails the check rather than have it guess: the
+        // full check is the last resort, and there is nothing to fall back to from here.
+        assert!(initial_check(&metadata, &Clueless).is_err());
     }
 }
