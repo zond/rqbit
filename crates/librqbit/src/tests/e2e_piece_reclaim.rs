@@ -144,6 +144,14 @@ async fn seeding_server(
     Ok((files, torrent_bytes.to_vec(), server_session, peer))
 }
 
+// Read the file back through the torrent, which is what a consumer of these pieces does.
+async fn read_back(handle: std::sync::Arc<crate::ManagedTorrent>) -> anyhow::Result<Vec<u8>> {
+    let mut stream = handle.stream(0).await?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await?;
+    Ok(buf)
+}
+
 async fn e2e_piece_reclaim() -> anyhow::Result<()> {
     setup_test_logging();
     let (files, torrent_bytes, _server_session, peer) =
@@ -339,12 +347,6 @@ async fn e2e_piece_reclaim_storage_loop() -> anyhow::Result<()> {
 
     // One entry per piece, which is what makes releasing one meaningful.
     assert_eq!(storage.piece_count(), TOTAL_PIECES as usize);
-    let read_back = |handle: std::sync::Arc<crate::ManagedTorrent>| async move {
-        let mut stream = handle.stream(0).await?;
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).await?;
-        Ok::<_, anyhow::Error>(buf)
-    };
     assert_eq!(read_back(handle.clone()).await?, orig_content);
 
     // The loop: ask what may go, delete exactly that, then let the claim go.
@@ -378,4 +380,96 @@ async fn e2e_piece_reclaim_storage_loop() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_e2e_piece_reclaim_storage_loop() -> anyhow::Result<()> {
     timeout(Duration::from_secs(120), e2e_piece_reclaim_storage_loop()).await?
+}
+
+// A claim on dropped pieces has to survive a pause: pausing takes the piece tracker
+// apart and unpausing builds a new one, and if the claim went with it, an unpaused
+// torrent would download pieces whose storage the caller is still deleting - and the
+// deletion would then remove pieces we have and are advertising. A pause is an ordinary
+// user action, and also what a fatal error does.
+async fn e2e_piece_reclaim_claim_survives_pause() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (files, torrent_bytes, _server_session, peer) =
+        seeding_server("test_piece_reclaim_pause", FILE_SIZE).await?;
+    let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
+
+    let storage = InMemoryPieceStorageFactory::default();
+    let dir = TempDir::with_prefix("test_piece_reclaim_pause_client")?;
+    let (session, handle) = add_client_with_storage(
+        &dir,
+        &torrent_bytes,
+        peer,
+        true,
+        Some(storage.clone().boxed()),
+    )
+    .await?;
+
+    let lengths = *handle
+        .metadata
+        .load_full()
+        .context("no metadata")?
+        .lengths();
+    let piece = |id: u32| lengths.validate_piece_index(id).unwrap();
+    let have =
+        |id: u32| handle.with_chunk_tracker(|ct| ct.get_have_pieces().as_slice()[id as usize]);
+
+    // Take the pieces and delete them, but hold on to the claim: we are "still deleting".
+    let dropped = handle.drop_pieces(DROP)?;
+    assert_eq!(dropped.pieces(), DROP.collect::<Vec<_>>());
+    for id in dropped.pieces() {
+        assert!(storage.release_piece(piece(*id)), "piece {id} wasn't there");
+    }
+
+    session.pause(&handle).await?;
+    session.unpause(&handle).await?;
+    timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+
+    // Reselecting is the loudest way to ask for them back, and the one a reader's seek
+    // does by itself. It may queue them, but nothing may take them off the queue yet.
+    assert_eq!(handle.reselect_pieces(DROP)?, DROP.len());
+    assert!(!handle.stats().finished);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for id in DROP {
+        assert!(
+            !have(id)?,
+            "piece {id} was downloaded again while its storage was still being released"
+        );
+        assert!(
+            !storage.has_piece(piece(id)),
+            "piece {id} came back in storage"
+        );
+    }
+
+    // The deletion is done. Now they may come back.
+    drop(dropped);
+    timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
+    assert_eq!(storage.piece_count(), TOTAL_PIECES as usize);
+    assert_eq!(read_back(handle.clone()).await?, orig_content);
+
+    // Same thing, but the caller finishes deleting while the torrent is paused: the
+    // paused torrent is what holds the claim then, and it has to take the report.
+    let dropped = handle.drop_pieces(DROP)?;
+    for id in dropped.pieces() {
+        assert!(storage.release_piece(piece(*id)), "piece {id} wasn't there");
+    }
+    session.pause(&handle).await?;
+    drop(dropped);
+    session.unpause(&handle).await?;
+    timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+    assert_eq!(handle.reselect_pieces(DROP)?, DROP.len());
+    // Nothing is holding them back anymore, so this finishes - if the report had gone
+    // nowhere, these pieces would stay unpickable forever and this would time out.
+    timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
+    assert_eq!(read_back(handle.clone()).await?, orig_content);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_piece_reclaim_claim_survives_pause() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_piece_reclaim_claim_survives_pause(),
+    )
+    .await?
 }

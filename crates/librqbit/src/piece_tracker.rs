@@ -12,6 +12,8 @@
 //! On top of that, a piece dropped through [`PieceTracker::drop_pieces`] is RELEASING
 //! until the caller reports back through [`PieceTracker::finish_release`]: it is not
 //! HAVE, and nothing may make it HAVE again while the caller is deleting its storage.
+//! That state lives in the ChunkTracker, because unlike the in-flight map it has to
+//! survive a pause - see [`ChunkTracker::is_releasing`].
 
 use std::{
     collections::{HashMap, HashSet},
@@ -83,12 +85,6 @@ where
 pub struct PieceTracker {
     chunks: ChunkTracker,
     inflight: HashMap<ValidPieceIndex, InflightPiece>,
-
-    // Pieces that drop_pieces() handed to the caller so it can release their storage, and
-    // that the caller hasn't reported back on yet. Nothing may download one of these in
-    // the meantime: we would set the have-bit back, and the deletion the caller is in the
-    // middle of would then remove a piece we have.
-    releasing: HashSet<ValidPieceIndex>,
 }
 
 impl PieceTracker {
@@ -99,7 +95,6 @@ impl PieceTracker {
         Self {
             chunks,
             inflight: HashMap::new(),
-            releasing: HashSet::new(),
         }
     }
 
@@ -147,7 +142,7 @@ impl PieceTracker {
         for piece in &mut req.priority_pieces {
             if !self.chunks.is_piece_have(piece)
                 && !self.inflight.contains_key(&piece)
-                && !self.releasing.contains(&piece)
+                && !self.chunks.is_releasing(piece)
                 && (req.peer_has_piece)(piece)
             {
                 return self.reserve_piece(piece, req.peer);
@@ -162,7 +157,7 @@ impl PieceTracker {
             .collect();
 
         for piece in queued {
-            if (req.peer_has_piece)(piece) && !self.releasing.contains(&piece) {
+            if (req.peer_has_piece)(piece) && !self.chunks.is_releasing(piece) {
                 return self.reserve_piece(piece, req.peer);
             }
         }
@@ -312,28 +307,20 @@ impl PieceTracker {
         file_infos: &FileInfos,
         pieces: impl IntoIterator<Item = ValidPieceIndex>,
     ) -> crate::Result<Vec<ValidPieceIndex>> {
-        let dropped = self.chunks.drop_pieces(file_infos, pieces)?;
-        self.releasing.extend(dropped.iter().copied());
-        Ok(dropped)
+        self.chunks.drop_pieces(file_infos, pieces)
     }
 
     /// The caller is done releasing the storage of these pieces, so they may be
     /// downloaded again. Returns how many of them are queued, i.e. whether anything is
     /// waiting on them.
     pub fn finish_release(&mut self, pieces: impl IntoIterator<Item = ValidPieceIndex>) -> usize {
-        let mut queued = 0;
-        for piece in pieces {
-            if self.releasing.remove(&piece) && self.chunks.is_piece_queued(piece) {
-                queued += 1;
-            }
-        }
-        queued
+        self.chunks.finish_release(pieces)
     }
 
     /// True if the piece was dropped and the caller hasn't finished releasing its storage.
     #[allow(dead_code)]
     pub fn is_releasing(&self, piece: ValidPieceIndex) -> bool {
-        self.releasing.contains(&piece)
+        self.chunks.is_releasing(piece)
     }
 
     /// Make previously dropped pieces wanted again. A piece a peer already owns is left
@@ -583,6 +570,40 @@ mod tests {
         // and now it can be downloaded again.
         assert_eq!(tracker.finish_release([p0]), 1);
         assert!(!tracker.is_releasing(p0));
+        let res = acquire(&mut tracker, &file_infos, &file_priorities, None);
+        assert!(
+            matches!(res, AcquireResult::Reserved(p) if p == p0),
+            "{res:?}"
+        );
+    }
+
+    // Pausing takes the PieceTracker apart and keeps the ChunkTracker, and unpausing
+    // builds a new PieceTracker around it. A claim that didn't survive that would let an
+    // unpaused torrent download pieces the caller is still deleting - and a pause is an
+    // ordinary user action, and also what stop_with_error() does.
+    #[test]
+    fn test_a_claim_survives_a_pause() {
+        let file_infos = reclaim_file_infos(3);
+        let file_priorities = make_default_file_priorities(&file_infos);
+        let mut tracker = make_reclaim_tracker(3);
+        let p0 = piece(&tracker, 0);
+
+        assert_eq!(tracker.drop_pieces(&file_infos, [p0]).unwrap(), [p0]);
+
+        // Pause, then unpause.
+        let mut tracker = PieceTracker::new(tracker.into_chunks());
+        assert!(tracker.is_releasing(p0), "the claim died with the pause");
+
+        // Same as without the pause: the piece is wanted again but nothing may take it
+        // until the caller says the deletion is done.
+        tracker.reselect_pieces([p0]).unwrap();
+        let res = acquire(&mut tracker, &file_infos, &file_priorities, None);
+        assert!(
+            matches!(res, AcquireResult::NoneAvailable),
+            "acquired a piece whose storage is being released: {res:?}"
+        );
+
+        assert_eq!(tracker.finish_release([p0]), 1);
         let res = acquire(&mut tracker, &file_infos, &file_priorities, None);
         assert!(
             matches!(res, AcquireResult::Reserved(p) if p == p0),

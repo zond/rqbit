@@ -13,6 +13,26 @@ use crate::{
     type_aliases::{BF, BS, FileInfos, FilePriorities},
 };
 
+// State that only a torrent using the piece-level want-set has, boxed so that a torrent
+// that has never heard of dropping carries one pointer for all of it.
+struct PieceReclaim {
+    // The pieces we dropped after having had them: we no longer have them, and we no
+    // longer want them back. Dropping is deselecting at piece granularity, so this is
+    // subtracted from "selected" everywhere below.
+    dropped: BF,
+
+    // Pieces that drop_pieces() handed to the caller so it can release their storage, and
+    // that the caller hasn't reported back on through finish_release() yet. Nothing may
+    // download one of these in the meantime: we would set the have-bit back, and the
+    // deletion the caller is in the middle of would then remove a piece we have.
+    //
+    // It lives here, and not next to the in-flight map in PieceTracker, so that it
+    // survives a pause: pausing takes the PieceTracker apart and keeps the ChunkTracker,
+    // and a claim that died there would let an unpaused torrent download pieces whose
+    // storage the caller is still deleting.
+    releasing: HashSet<ValidPieceIndex>,
+}
+
 pub struct ChunkTracker {
     // This forms the basis of a "queue" to pull from.
     // It's set to 1 if we need a piece, but the moment we start requesting a peer,
@@ -35,13 +55,9 @@ pub struct ChunkTracker {
     // was called.
     selected: BF,
 
-    // The pieces we dropped after having had them: we no longer have them, and we no
-    // longer want them back. Dropping is deselecting at piece granularity, so this is
-    // subtracted from "selected" everywhere below.
-    //
-    // None unless the torrent opted into piece reclaim, and while it is None every path
-    // in here does exactly what it did before.
-    dropped: Option<BF>,
+    // The piece-level want-set. None unless the torrent opted into piece reclaim, and
+    // while it is None every path in here does exactly what it did before.
+    reclaim: Option<Box<PieceReclaim>>,
 
     // How many bytes do we have per each file.
     per_file_bytes: Vec<u64>,
@@ -225,7 +241,7 @@ impl ChunkTracker {
             have: have_pieces,
             hns: HaveNeededSelected::default(),
             per_file_bytes: vec![0; file_infos.len()],
-            dropped: None,
+            reclaim: None,
         };
         ct.recalculate_per_file_bytes(file_infos);
         ct.hns = ct.calc_hns();
@@ -249,24 +265,27 @@ impl ChunkTracker {
     // The user's selection, minus what we dropped. This is what the stats are computed
     // from; with reclaim disabled it is just self.selected.
     fn is_selected(&self, id: usize) -> bool {
-        self.selected[id] && !self.dropped.as_ref().is_some_and(|d| d[id])
+        self.selected[id] && !self.reclaim.as_ref().is_some_and(|r| r.dropped[id])
     }
 
     /// Opt this torrent into the piece-level want-set, which makes [`Self::drop_pieces`]
     /// and [`Self::reselect_pieces`] work. Until this is called nothing in here behaves
     /// differently from a tracker that has never heard of dropping.
     pub fn enable_piece_reclaim(&mut self) {
-        if self.dropped.is_none() {
-            self.dropped = Some(BF::from_boxed_slice(
-                vec![0u8; self.lengths.piece_bitfield_bytes()].into_boxed_slice(),
-            ));
+        if self.reclaim.is_none() {
+            self.reclaim = Some(Box::new(PieceReclaim {
+                dropped: BF::from_boxed_slice(
+                    vec![0u8; self.lengths.piece_bitfield_bytes()].into_boxed_slice(),
+                ),
+                releasing: HashSet::new(),
+            }));
         }
     }
 
     pub(crate) fn is_piece_dropped(&self, index: ValidPieceIndex) -> bool {
-        self.dropped
+        self.reclaim
             .as_ref()
-            .is_some_and(|d| d[index.get() as usize])
+            .is_some_and(|r| r.dropped[index.get() as usize])
     }
 
     /// Drop the pieces we have out of the given ones: forget that we have them and stop
@@ -283,13 +302,41 @@ impl ChunkTracker {
         file_infos: &FileInfos,
         pieces: impl IntoIterator<Item = ValidPieceIndex>,
     ) -> crate::Result<Vec<ValidPieceIndex>> {
-        if self.dropped.is_none() {
+        if self.reclaim.is_none() {
             return Err(Error::PieceReclaimDisabled);
         }
-        Ok(pieces
+        let dropped: Vec<ValidPieceIndex> = pieces
             .into_iter()
             .filter(|id| self.drop_piece(file_infos, *id))
-            .collect())
+            .collect();
+        if let Some(r) = self.reclaim.as_mut() {
+            r.releasing.extend(dropped.iter().copied());
+        }
+        Ok(dropped)
+    }
+
+    /// The caller is done releasing the storage of these pieces, so they may be
+    /// downloaded again. Returns how many of them are queued, i.e. whether anything is
+    /// waiting on them.
+    pub fn finish_release(&mut self, pieces: impl IntoIterator<Item = ValidPieceIndex>) -> usize {
+        let mut queued = 0;
+        for piece in pieces {
+            let was_releasing = self
+                .reclaim
+                .as_mut()
+                .is_some_and(|r| r.releasing.remove(&piece));
+            if was_releasing && self.is_piece_queued(piece) {
+                queued += 1;
+            }
+        }
+        queued
+    }
+
+    /// True if the piece was dropped and the caller hasn't finished releasing its storage.
+    pub fn is_releasing(&self, piece: ValidPieceIndex) -> bool {
+        self.reclaim
+            .as_ref()
+            .is_some_and(|r| r.releasing.contains(&piece))
     }
 
     /// Make previously dropped pieces wanted again, e.g. after seeking backwards into a
@@ -303,7 +350,7 @@ impl ChunkTracker {
         pieces: impl IntoIterator<Item = ValidPieceIndex>,
         is_inflight: impl Fn(ValidPieceIndex) -> bool,
     ) -> crate::Result<Reselected> {
-        if self.dropped.is_none() {
+        if self.reclaim.is_none() {
             return Err(Error::PieceReclaimDisabled);
         }
         let mut res = Reselected::default();
@@ -336,8 +383,8 @@ impl ChunkTracker {
         if !self.have.as_slice()[id] {
             return false;
         }
-        match self.dropped.as_mut() {
-            Some(d) => d.set(id, true),
+        match self.reclaim.as_mut() {
+            Some(r) => r.dropped.set(id, true),
             None => return false,
         }
         self.have.as_slice_mut().set(id, false);
@@ -378,9 +425,9 @@ impl ChunkTracker {
     // Returns true if the piece was dropped and is now wanted again.
     fn undrop_piece(&mut self, index: ValidPieceIndex) -> bool {
         let id = index.get() as usize;
-        match self.dropped.as_mut() {
-            Some(d) => {
-                if !d.replace(id, false) {
+        match self.reclaim.as_mut() {
+            Some(r) => {
+                if !r.dropped.replace(id, false) {
                     return false;
                 }
             }
