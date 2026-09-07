@@ -1076,6 +1076,30 @@ impl TorrentStateLive {
         Ok(())
     }
 
+    /// The pieces reserved for an address the peer table no longer has, as
+    /// `(piece, owner)`. Such a piece is in no queue and has no owner that can still
+    /// deliver it, so nothing downloads it until a steal happens by -- see `on_peer_died`,
+    /// which hands a dying task's pieces back before it looks the table up at all. Always
+    /// empty except in the instant between a peer being forgotten and its task noticing.
+    #[cfg(test)]
+    pub(crate) fn ownerless_inflight_pieces(&self) -> Vec<(u32, SocketAddr)> {
+        // Read the table first: the state lock may not be held while it is touched.
+        let known: HashSet<SocketAddr> = self.peers.states.iter().map(|pe| *pe.key()).collect();
+        let g = self.lock_read("ownerless_inflight_pieces");
+        let Ok(pieces) = g.get_pieces() else {
+            return Vec::new();
+        };
+        (0..self.lengths.total_pieces())
+            .filter_map(|index| self.lengths.validate_piece_index(index))
+            .filter_map(|piece| {
+                pieces
+                    .get_inflight(piece)
+                    .map(|inf| (piece.get(), inf.peer))
+            })
+            .filter(|(_, owner)| !known.contains(owner))
+            .collect()
+    }
+
     /// How many peers this torrent keeps connected (or connecting) at once.
     pub fn peer_limit(&self) -> usize {
         self.peer_limit.load(Ordering::Acquire)
@@ -1660,24 +1684,13 @@ impl PeerHandler {
     fn on_peer_died(self, error: Option<crate::Error>) -> crate::Result<()> {
         let peers = &self.state.peers;
         let handle = self.addr;
-        let mut pe = match peers.states.get_mut(&handle) {
-            Some(peer) => TimedExistence::new(peer, "on_peer_died"),
-            None => {
-                warn!(
-                    id = self.state.shared.id,
-                    info_hash = ?self.state.shared.info_hash,
-                    addr=?handle,
-                    "bug: peer not found in table. Forgetting it forever"
-                );
-                return Ok(());
-            }
-        };
-        // Whatever state the table has this peer in by now, the task that is dying may
-        // still own pieces it reserved while it was live, and a reserved piece is owned by
-        // an address, not by a state: the entry may since have been parked by a lowered
-        // peer limit, re-queued by a raised one, or already given to a fresh dial. Hand
-        // them back before looking at the state at all -- until they are back in the queue
-        // nobody else may download them and the torrent stalls until a steal comes by.
+
+        // The task that is dying may still own pieces it reserved while it was live, and a
+        // reserved piece is owned by an address, not by a table entry: the entry may since
+        // have been parked by a lowered peer limit, re-queued by a raised one, given to a
+        // fresh dial, or dropped outright by `forget_disconnected_peers`. Hand the pieces
+        // back before the table is even looked at -- until they are back in the queue
+        // nobody else may download them, and the torrent stalls until a steal comes by.
         // Not fatal if the chunk tracker is gone: the torrent is being paused.
         let released = self
             .state
@@ -1693,22 +1706,44 @@ impl PeerHandler {
             self.state.new_pieces_notify.notify_waiters();
         }
 
+        let mut pe = match peers.states.get_mut(&handle) {
+            Some(peer) => TimedExistence::new(peer, "on_peer_died"),
+            None => {
+                // Expected, not a bug: `forget_disconnected_peers` drops the entry of a
+                // peer we already hung up on while its task is still winding down.
+                debug!(addr = ?handle, "peer is no longer in the table, nothing to update");
+                return Ok(());
+            }
+        };
+
         let prev = pe.value_mut().take_state(peers);
 
-        // The entry may have been handed to a newer task while this one was hanging up: a
-        // peer parked by a lowered cap, re-queued by a raised one and dialled again, or one
-        // that dialled us in the meantime. Its state is not ours to end -- writing
-        // `NotNeeded` or `Dead` over it would kill a connection that is coming up, and the
-        // `Dead` backoff would then hold the address for a minute or more. Put it back and
-        // leave; that task will report its own death.
-        if prev.tx().is_some_and(|tx| !tx.same_channel(&self.tx)) {
-            trace!("peer entry belongs to a newer connection, leaving it alone");
+        // Only the task that owns the entry may end it. Two tasks name the same address in
+        // turn -- a peer is parked by a lowered cap, re-queued by a raised one and dialled
+        // again, or it dials us while we are hanging up on it -- and writing `NotNeeded` or
+        // `Dead` over the newcomer would kill a connection that is coming up, while the
+        // `Dead` backoff would hold the address for a minute or more.
+        let ours = match &prev {
+            PeerState::Connecting(tx) => tx.same_channel(&self.tx),
+            PeerState::Live(live) => live.tx.same_channel(&self.tx),
+            // A txless state names no task, so the channel cannot decide it. `NotNeeded` is
+            // the parking this task was asked to honour, and honouring it is what it is
+            // doing now. `Queued` and `Dead` mean the entry has already been handed on --
+            // a raised cap re-queued the address, or a backoff holds it -- and whoever
+            // takes it next reports its own death.
+            PeerState::NotNeeded => true,
+            PeerState::Queued | PeerState::Dead => false,
+        };
+        if !ours {
+            trace!(
+                state = %prev,
+                "peer entry belongs to a newer connection, leaving it alone"
+            );
             pe.value_mut().set_state(prev, peers);
             return Ok(());
         }
 
         match prev {
-            PeerState::Connecting(_) => {}
             PeerState::Live(live) => {
                 for req in live.inflight_requests() {
                     trace!(
@@ -1719,22 +1754,12 @@ impl PeerHandler {
                 }
             }
             PeerState::NotNeeded => {
-                // Restore it as std::mem::take() replaced it above.
+                // Restore it as take_state() replaced it above. A raise re-queues it.
                 pe.value_mut().set_state(PeerState::NotNeeded, peers);
                 return Ok(());
             }
-            s @ PeerState::Queued | s @ PeerState::Dead => {
-                warn!(
-                    id = self.state.shared.id,
-                    info_hash = ?self.state.shared.info_hash,
-                    addr = ?handle,
-                    "bug: peer was in a wrong state {s:?}, ignoring it forever"
-                );
-                // Prevent deadlocks.
-                drop(pe);
-                self.state.peers.drop_peer(handle);
-                return Ok(());
-            }
+            // Queued and Dead were sent back above; Connecting has nothing to hand back.
+            PeerState::Connecting(_) | PeerState::Queued | PeerState::Dead => {}
         };
 
         let _error = match error {

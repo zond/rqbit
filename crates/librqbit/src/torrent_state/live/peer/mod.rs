@@ -133,17 +133,6 @@ impl PeerState {
         }
     }
 
-    /// The channel to the peer task that owns this state, if a task owns it at all. Two
-    /// tasks can name the same address in turn -- a peer is parked, re-queued, dialled
-    /// again -- and only the channel says which of them a state belongs to.
-    pub fn tx(&self) -> Option<&PeerTx> {
-        match self {
-            PeerState::Connecting(tx) => Some(tx),
-            PeerState::Live(live) => Some(&live.tx),
-            PeerState::Queued | PeerState::Dead | PeerState::NotNeeded => None,
-        }
-    }
-
     pub fn take_live_no_counters(self) -> Option<LivePeerState> {
         match self {
             PeerState::Live(l) => Some(l),
