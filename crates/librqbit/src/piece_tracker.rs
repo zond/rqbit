@@ -536,6 +536,51 @@ mod tests {
         );
     }
 
+    // Between its last chunk arriving and its hash passing, a piece is neither queued,
+    // in-flight nor have. A reselect_pieces() landing in that window finds a dropped piece
+    // nobody owns and queues it; the hash then passes, and without the fix the piece is
+    // have AND queued, and the next peer to ask is handed a piece we have - a redundant
+    // download, and a completion counted twice.
+    #[test]
+    fn test_reselect_during_the_hash_check_does_not_leave_a_have_piece_queued() {
+        let file_infos = reclaim_file_infos(3);
+        let file_priorities = make_default_file_priorities(&file_infos);
+        let mut tracker = make_reclaim_tracker(3);
+        let p0 = piece(&tracker, 0);
+
+        let dropped = tracker.drop_pieces(&file_infos, [p0]).unwrap();
+        assert_eq!(tracker.finish_release(dropped), 0);
+
+        // A reader's priority window pulls the dropped piece back in, and the peer
+        // delivers all of it. It comes out of the in-flight map for the hash check.
+        let res = acquire(&mut tracker, &file_infos, &file_priorities, Some(p0));
+        assert!(
+            matches!(res, AcquireResult::Reserved(p) if p == p0),
+            "{res:?}"
+        );
+        let block = vec![0u8; CHUNK_SIZE as usize];
+        for chunk in 0..RECLAIM_CHUNKS_PER_PIECE {
+            tracker.mark_chunk_downloaded(&Piece::from_data(p0.get(), chunk * CHUNK_SIZE, &block));
+        }
+        assert!(tracker.take_inflight(p0).is_some());
+
+        // The caller reselects the same range while the hash is being checked.
+        tracker.reselect_pieces([p0]).unwrap();
+
+        // The hash passes.
+        tracker.mark_piece_hash_ok(p0);
+        assert!(tracker.chunks().is_piece_have(p0));
+        assert!(
+            !tracker.chunks().is_piece_queued(p0),
+            "a piece we have is still queued"
+        );
+        let res = acquire(&mut tracker, &file_infos, &file_priorities, None);
+        assert!(
+            matches!(res, AcquireResult::NoneAvailable),
+            "a second peer was handed a piece we have: {res:?}"
+        );
+    }
+
     // A piece handed to the caller so it can delete the storage behind it must not be
     // downloaded again until the caller says the deletion is done. Otherwise we set the
     // have-bit back and the deletion removes a piece we have and are advertising.
