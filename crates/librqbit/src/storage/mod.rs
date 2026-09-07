@@ -109,6 +109,31 @@ pub trait StorageFactory: Send + Sync + Any {
         )
     }
 
+    /// Whether the storages this factory creates can release a single piece - and if not,
+    /// why [`crate::AddTorrentOptions::piece_reclaim`] is refused with it.
+    ///
+    /// Piece reclaim is bookkeeping on the torrent's side: [`crate::ManagedTorrent::drop_pieces`]
+    /// forgets a piece and hands it to the caller, and the caller releases its storage.
+    /// That takes a storage laid out so that one piece can go - one entry or file per
+    /// piece, like `storage::examples::inmemory::InMemoryPieceStorage` - and one that
+    /// answers [`TorrentStorage::has_piece`] from what it holds, so that startup comes up
+    /// with the pieces that are actually there. The filesystem storage is neither: it
+    /// writes the torrent's own files, a piece of which can't be deleted on its own, so
+    /// with it drop_pieces frees nothing and only has the dropped pieces downloaded again
+    /// over bytes that never left the disk.
+    ///
+    /// The default is no, so that piece_reclaim over a storage that can't honour it is
+    /// refused when the torrent is added rather than discovered when the disk doesn't
+    /// empty. Like [`Self::ensure_persistable`], this has to survive wrapping and boxing,
+    /// and a middleware forwards it to what it wraps.
+    fn ensure_can_release_pieces(&self) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "{} can't release a single piece, so piece_reclaim would free nothing with it. \
+             Implement StorageFactory::ensure_can_release_pieces if it can.",
+            std::any::type_name::<Self>()
+        )
+    }
+
     fn clone_box(&self) -> BoxStorageFactory;
 }
 
@@ -144,6 +169,10 @@ impl<SF: StorageFactory> StorageFactoryExt for SF {
                 self.sf.ensure_persistable()
             }
 
+            fn ensure_can_release_pieces(&self) -> anyhow::Result<()> {
+                self.sf.ensure_can_release_pieces()
+            }
+
             fn clone_box(&self) -> BoxStorageFactory {
                 self.sf.clone_box()
             }
@@ -170,6 +199,10 @@ impl<U: StorageFactory + ?Sized> StorageFactory for Box<U> {
 
     fn ensure_persistable(&self) -> anyhow::Result<()> {
         (**self).ensure_persistable()
+    }
+
+    fn ensure_can_release_pieces(&self) -> anyhow::Result<()> {
+        (**self).ensure_can_release_pieces()
     }
 
     fn clone_box(&self) -> BoxStorageFactory {
@@ -364,6 +397,10 @@ mod tests {
             self.underlying_factory.ensure_persistable()
         }
 
+        fn ensure_can_release_pieces(&self) -> anyhow::Result<()> {
+            self.underlying_factory.ensure_can_release_pieces()
+        }
+
         fn clone_box(&self) -> BoxStorageFactory {
             self.clone().boxed()
         }
@@ -461,6 +498,78 @@ mod tests {
             .boxed()
             .ensure_persistable()
             .is_err()
+        );
+    }
+
+    // Same shape, other promise: whether a storage can let a single piece go. The
+    // filesystem storage can't, and that has to come through boxing and middlewares as a
+    // no - a yes invented on the way would have piece_reclaim accepted over a storage it
+    // frees nothing on.
+    #[test]
+    fn test_ensure_can_release_pieces_survives_boxing() {
+        let err = format!(
+            "{:#}",
+            FilesystemStorageFactory::default()
+                .ensure_can_release_pieces()
+                .unwrap_err()
+        );
+        assert!(err.contains("FilesystemStorageFactory"), "{err}");
+        assert!(err.contains("ensure_can_release_pieces"), "{err}");
+        assert_eq!(
+            format!(
+                "{:#}",
+                FilesystemStorageFactory::default()
+                    .boxed()
+                    .ensure_can_release_pieces()
+                    .unwrap_err()
+            ),
+            err
+        );
+        let wrapped = Middleware {
+            underlying_factory: FilesystemStorageFactory::default(),
+        };
+        assert!(wrapped.clone().boxed().ensure_can_release_pieces().is_err());
+        assert!(
+            wrapped
+                .boxed()
+                .clone_box()
+                .ensure_can_release_pieces()
+                .is_err()
+        );
+
+        // And a factory that does promise it keeps the promise through the same trip.
+        #[derive(Clone)]
+        struct PerPiece {}
+
+        impl StorageFactory for PerPiece {
+            type Storage = Box<dyn super::TorrentStorage>;
+
+            fn create(
+                &self,
+                _shared: &ManagedTorrentShared,
+                _metadata: &TorrentMetadata,
+            ) -> anyhow::Result<Self::Storage> {
+                anyhow::bail!("not used")
+            }
+
+            fn ensure_can_release_pieces(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            fn clone_box(&self) -> BoxStorageFactory {
+                self.clone().boxed()
+            }
+        }
+
+        assert!(PerPiece {}.boxed().ensure_can_release_pieces().is_ok());
+        assert!(
+            Middleware {
+                underlying_factory: PerPiece {},
+            }
+            .boxed()
+            .clone_box()
+            .ensure_can_release_pieces()
+            .is_ok()
         );
     }
 }

@@ -63,6 +63,10 @@ impl<U: StorageFactory + Clone> StorageFactory for WriteThroughCacheStorageFacto
         self.underlying.ensure_persistable()
     }
 
+    fn ensure_can_release_pieces(&self) -> anyhow::Result<()> {
+        self.underlying.ensure_can_release_pieces()
+    }
+
     fn clone_box(&self) -> crate::storage::BoxStorageFactory {
         self.clone().boxed()
     }

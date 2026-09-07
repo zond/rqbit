@@ -81,6 +81,10 @@ impl<U: StorageFactory + Clone> StorageFactory for SlowStorageFactory<U> {
         self.underlying_factory.ensure_persistable()
     }
 
+    fn ensure_can_release_pieces(&self) -> anyhow::Result<()> {
+        self.underlying_factory.ensure_can_release_pieces()
+    }
+
     fn clone_box(&self) -> crate::storage::BoxStorageFactory {
         self.clone().boxed()
     }

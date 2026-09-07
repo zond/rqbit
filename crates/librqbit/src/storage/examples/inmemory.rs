@@ -264,6 +264,12 @@ impl StorageFactory for InMemoryPieceStorageFactory {
         Ok(())
     }
 
+    // One entry per piece, released one at a time through release_piece(), and
+    // has_piece() answers from what is left: what piece_reclaim needs of a storage.
+    fn ensure_can_release_pieces(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn clone_box(&self) -> crate::storage::BoxStorageFactory {
         self.clone().boxed()
     }

@@ -165,8 +165,28 @@ async fn e2e_piece_reclaim() -> anyhow::Result<()> {
     assert!(plain.reselect_pieces(DROP).is_err());
     assert!(plain.stats().finished);
 
+    // Opting in takes a storage that can release a piece. The default filesystem storage
+    // can't - a piece of a whole file can't be deleted on its own - so with it dropping
+    // would free nothing, and the torrent is refused rather than let the caller find that
+    // out from a disk that doesn't empty.
+    let refused_dir = TempDir::with_prefix("test_piece_reclaim_refused")?;
+    let err = add_client(&refused_dir, &torrent_bytes, peer, true)
+        .await
+        .err()
+        .context("expected piece_reclaim on the filesystem storage to be refused")?;
+    let err = format!("{err:#}");
+    assert!(err.contains("FilesystemStorageFactory"), "{err}");
+    assert!(err.contains("ensure_can_release_pieces"), "{err}");
+
     let client_dir = TempDir::with_prefix("test_piece_reclaim_client")?;
-    let (client_session, handle) = add_client(&client_dir, &torrent_bytes, peer, true).await?;
+    let (client_session, handle) = add_client_with_storage(
+        &client_dir,
+        &torrent_bytes,
+        peer,
+        true,
+        Some(ReleasingStorageFactory::default().boxed()),
+    )
+    .await?;
     let downloaded = client_dir.path().join("0.data");
     assert_eq!(std::fs::read(&downloaded).unwrap(), orig_content);
 
@@ -256,7 +276,8 @@ async fn e2e_piece_reclaim() -> anyhow::Result<()> {
 
     // The torrent is still finished: a piece we threw away on purpose is not a piece we
     // are missing. Dropping is bookkeeping - the bytes are still on disk until the caller
-    // releases the storage, which with one file per piece is a file deletion.
+    // releases the storage, which this storage leaves to the caller and never gets round
+    // to.
     assert!(handle.stats().finished);
     assert_eq!(std::fs::read(&downloaded).unwrap(), orig_content);
 
@@ -496,7 +517,9 @@ async fn test_e2e_piece_reclaim_claim_survives_pause() -> anyhow::Result<()> {
 //
 // It is a middleware in the sense of storage::middleware: it forwards everything to a
 // FilesystemStorage, and forwards ensure_persistable() too, so it makes the same promise
-// to session persistence that the storage underneath does.
+// to session persistence that the storage underneath does. What it promises on its own is
+// ensure_can_release_pieces(), which the filesystem storage can't, and which is what lets
+// the bookkeeping tests above run piece_reclaim over real files.
 //
 // What it adds is a released-set, which is what has_piece() answers from. The bytes of a
 // released piece are still on disk here - deleting them is the caller's job and it hasn't
@@ -530,6 +553,13 @@ impl crate::storage::StorageFactory for ReleasingStorageFactory {
 
     fn ensure_persistable(&self) -> anyhow::Result<()> {
         self.underlying_factory.ensure_persistable()
+    }
+
+    // It can't actually free a piece's bytes - that is the point of it as a test double -
+    // but it does the storage's half of the reclaim contract: it takes a release one piece
+    // at a time and answers has_piece() from it.
+    fn ensure_can_release_pieces(&self) -> anyhow::Result<()> {
+        Ok(())
     }
 
     fn clone_box(&self) -> crate::storage::BoxStorageFactory {

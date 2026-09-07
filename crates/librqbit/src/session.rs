@@ -295,8 +295,12 @@ pub struct AddTorrentOptions {
     /// [`crate::storage::TorrentStorage::has_piece`]), so a piece whose storage was
     /// released comes back as missing and wanted - which is the right default.
     ///
-    /// A storage used with this must implement `has_piece`: it is the only thing that
-    /// keeps the have-set honest across a crash, since the bitfield is flushed lazily.
+    /// A storage used with this must be able to release a single piece and must
+    /// implement `has_piece` - the only thing that keeps the have-set honest across a
+    /// crash, since the bitfield is flushed lazily. Its factory promises both through
+    /// [`crate::storage::StorageFactory::ensure_can_release_pieces`], and `add_torrent`
+    /// refuses this option with a storage that doesn't; the default filesystem storage
+    /// doesn't, since it writes whole files.
     #[serde(default)]
     pub piece_reclaim: bool,
 
@@ -1331,6 +1335,16 @@ impl Session {
             .take()
             .or_else(|| self.default_storage_factory.as_ref().map(|f| f.clone_box()))
             .unwrap_or_else(|| FilesystemStorageFactory::default().boxed());
+
+        // Dropping a piece frees nothing by itself: the caller releases its storage, and
+        // that takes a storage that can let one piece go. Ask now, while there is someone
+        // to tell, rather than have the disk stay full. See
+        // StorageFactory::ensure_can_release_pieces.
+        if opts.piece_reclaim {
+            storage_factory
+                .ensure_can_release_pieces()
+                .context("piece_reclaim needs a storage that can release single pieces")?;
+        }
 
         let id = if let Some(id) = opts.preferred_id {
             id
