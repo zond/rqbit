@@ -446,15 +446,12 @@ impl TorrentStateLive {
     ) -> anyhow::Result<AddIncomingPeerResult> {
         use dashmap::mapref::entry::Entry;
         let (tx, rx) = unbounded_channel();
-        let permit = match self.peer_semaphore.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                debug!("limit of live peers reached, dropping incoming peer");
-                self.peers.with_peer(checked_peer.addr, |p| {
-                    atomic_inc(&p.stats.counters.incoming_connections);
-                });
-                return Ok(AddIncomingPeerResult::ConcurrencyLimitReached);
-            }
+        let Some(permit) = PeerPermit::try_acquire(self) else {
+            debug!("limit of live peers reached, dropping incoming peer");
+            self.peers.with_peer(checked_peer.addr, |p| {
+                atomic_inc(&p.stats.counters.incoming_connections);
+            });
+            return Ok(AddIncomingPeerResult::ConcurrencyLimitReached);
         };
 
         let counters = match self.peers.states.entry(checked_peer.addr) {
@@ -569,7 +566,7 @@ impl TorrentStateLive {
         counters: Arc<AtomicPeerCounters>,
         tx: PeerTx,
         rx: PeerRx,
-        permit: OwnedSemaphorePermit,
+        permit: PeerPermit,
     ) -> crate::Result<()> {
         let handler = PeerHandler {
             addr: checked_peer.addr,
@@ -619,22 +616,19 @@ impl TorrentStateLive {
                 handler.on_peer_died(Some(e))?;
             }
         };
-        self.release_peer_permit(permit);
+        drop(permit);
         Ok(())
     }
 
     async fn task_manage_outgoing_peer(
         self: Arc<Self>,
         addr: SocketAddr,
-        permit: OwnedSemaphorePermit,
+        permit: PeerPermit,
+        rx: PeerRx,
+        tx: PeerTx,
+        counters: Arc<AtomicPeerCounters>,
     ) -> crate::Result<()> {
         let state = self;
-        let (rx, tx) = state.peers.mark_peer_connecting(addr)?;
-        let counters = state
-            .peers
-            .with_peer(addr, |p| p.stats.counters.clone())
-            .ok_or(Error::BugPeerNotFound)?;
-
         let handler = PeerHandler {
             addr,
             incoming: false,
@@ -693,7 +687,7 @@ impl TorrentStateLive {
                 handler.on_peer_died(Some(e))?;
             }
         }
-        state.release_peer_permit(permit);
+        drop(permit);
         Ok(())
     }
 
@@ -750,11 +744,30 @@ impl TorrentStateLive {
                 continue;
             }
 
-            let permit = state.peer_semaphore.clone().acquire_owned().await?;
+            let permit = PeerPermit::acquire(&state).await?;
+            // Claim the table slot under the same permit, before the spawn. A cap lowered
+            // in between would find this peer neither `Live` nor `Connecting`, rank it as
+            // absent and leave it unparked, and the swarm would settle one peer above the
+            // cap for as long as it lives.
+            let (rx, tx) = match state.peers.mark_peer_connecting(addr) {
+                Ok(v) => v,
+                Err(e) => {
+                    debug!(?addr, "not dialling: {e:#}");
+                    continue;
+                }
+            };
+            let Some(counters) = state.peers.with_peer(addr, |p| p.stats.counters.clone()) else {
+                debug!(?addr, "not dialling: no longer in the peer table");
+                continue;
+            };
             state.spawn(
                 debug_span!(parent: state.shared.span.clone(), "manage_peer", peer = ?addr),
                 format!("[{}][addr={addr}]manage_peer", state.shared.id),
-                aframe!(state.clone().task_manage_outgoing_peer(addr, permit)),
+                aframe!(
+                    state
+                        .clone()
+                        .task_manage_outgoing_peer(addr, permit, rx, tx, counters)
+                ),
             );
         }
     }
@@ -1100,6 +1113,17 @@ impl TorrentStateLive {
             .collect()
     }
 
+    /// The peer-slot bookkeeping as `(free slots, slots a lowered cap is still owed)`.
+    /// Once every peer a lowering asked to leave has left, the debt is nil and the free
+    /// slots plus the connections in hand come to the cap. Tests only.
+    #[cfg(test)]
+    pub(crate) fn peer_permit_accounting(&self) -> (usize, usize) {
+        (
+            self.peer_semaphore.available_permits(),
+            self.peer_permits_to_forget.load(Ordering::Acquire),
+        )
+    }
+
     /// How many peers this torrent keeps connected (or connecting) at once.
     pub fn peer_limit(&self) -> usize {
         self.peer_limit.load(Ordering::Acquire)
@@ -1152,16 +1176,6 @@ impl TorrentStateLive {
                 self.peer_semaphore.add_permits(over);
             }
             self.disconnect_surplus_peers(limit);
-        }
-    }
-
-    /// A peer task is done with its permit: pay it into the debt a lowered cap left, or
-    /// give it back to the semaphore.
-    fn release_peer_permit(&self, permit: OwnedSemaphorePermit) {
-        if sub_saturating(&self.peer_permits_to_forget, 1) == 1 {
-            permit.forget();
-        } else {
-            drop(permit);
         }
     }
 
@@ -2584,6 +2598,52 @@ fn sub_saturating(counter: &AtomicUsize, by: usize) -> usize {
         })
         .map(|previous| previous.min(by))
         .unwrap_or(0)
+}
+
+/// A live-peer slot, held for as long as the peer connection is.
+///
+/// Owning the permit is not enough on its own: a cap lowered while peers hold every
+/// permit cannot take the ones it wants off the semaphore, so it books them as a debt
+/// (`peer_permits_to_forget`) for the returning permits to pay. Which means a permit must
+/// be settled exactly once, on every way out of a peer task -- and there are many, `?`
+/// operators, a panic and the task being cancelled among them. Settling it in `Drop` is
+/// the only shape that covers all of them; a permit returned to the pool without paying
+/// the debt lets the adder dial one more peer than the cap allows, until some unrelated
+/// death happens to pay it instead.
+pub(crate) struct PeerPermit {
+    state: Arc<TorrentStateLive>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl PeerPermit {
+    /// Wait for a slot.
+    async fn acquire(state: &Arc<TorrentStateLive>) -> crate::Result<Self> {
+        let permit = state.peer_semaphore.clone().acquire_owned().await?;
+        Ok(Self {
+            state: state.clone(),
+            permit: Some(permit),
+        })
+    }
+
+    /// Take a slot if one is free right now.
+    fn try_acquire(state: &Arc<TorrentStateLive>) -> Option<Self> {
+        let permit = state.peer_semaphore.clone().try_acquire_owned().ok()?;
+        Some(Self {
+            state: state.clone(),
+            permit: Some(permit),
+        })
+    }
+}
+
+impl Drop for PeerPermit {
+    fn drop(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            // Pay the debt a lowered cap left, or give the slot back to the semaphore.
+            if sub_saturating(&self.state.peer_permits_to_forget, 1) == 1 {
+                permit.forget();
+            }
+        }
+    }
 }
 
 fn format_peer_client_name(value: &ByteBuf<'_>) -> Option<String> {

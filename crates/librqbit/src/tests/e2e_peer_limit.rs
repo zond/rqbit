@@ -213,6 +213,14 @@ async fn peer_limit_moves_at_runtime_inner() {
     )
     .await
     .unwrap();
+    // Every permit the lowering could not take off the semaphore has been paid back by
+    // the peer that held it, and the peers that are left hold all the slots there are.
+    assert_eq!(
+        live.peer_permit_accounting(),
+        (0, 0),
+        "free slots and the debt a lowered cap left"
+    );
+
     // Setting the cap it already has changes nothing.
     handle.set_peer_limit(LOWERED);
     let stats = peer_stats();
