@@ -632,6 +632,157 @@ impl crate::storage::TorrentStorage for ReleasingStorage {
     }
 }
 
+// A storage that takes every chunk and refuses to commit any piece: what a full disk or
+// a directory that won't take a rename looks like to a storage that stages pieces.
+#[derive(Clone, Default)]
+struct RefusingCommitStorageFactory {
+    underlying: InMemoryPieceStorageFactory,
+    attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl crate::storage::StorageFactory for RefusingCommitStorageFactory {
+    type Storage = RefusingCommitStorage;
+
+    fn create(
+        &self,
+        shared: &crate::ManagedTorrentShared,
+        metadata: &crate::torrent_state::TorrentMetadata,
+    ) -> anyhow::Result<Self::Storage> {
+        Ok(RefusingCommitStorage {
+            underlying: Box::new(self.underlying.create(shared, metadata)?),
+            attempts: self.attempts.clone(),
+        })
+    }
+
+    fn clone_box(&self) -> crate::storage::BoxStorageFactory {
+        self.clone().boxed()
+    }
+}
+
+struct RefusingCommitStorage {
+    underlying: Box<dyn crate::storage::TorrentStorage>,
+    attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl crate::storage::TorrentStorage for RefusingCommitStorage {
+    fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        self.underlying.pread_exact(file_id, offset, buf)
+    }
+
+    fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+        self.underlying.pwrite_all(file_id, offset, buf)
+    }
+
+    fn remove_file(&self, file_id: usize, filename: &std::path::Path) -> anyhow::Result<()> {
+        self.underlying.remove_file(file_id, filename)
+    }
+
+    fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
+        self.underlying.ensure_file_length(file_id, length)
+    }
+
+    fn take(&self) -> anyhow::Result<Box<dyn crate::storage::TorrentStorage>> {
+        Ok(Box::new(RefusingCommitStorage {
+            underlying: self.underlying.take()?,
+            attempts: self.attempts.clone(),
+        }))
+    }
+
+    fn init(
+        &mut self,
+        shared: &crate::ManagedTorrentShared,
+        metadata: &crate::torrent_state::TorrentMetadata,
+    ) -> anyhow::Result<()> {
+        self.underlying.init(shared, metadata)
+    }
+
+    fn remove_directory_if_empty(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.underlying.remove_directory_if_empty(path)
+    }
+
+    fn on_piece_completed(
+        &self,
+        piece_index: librqbit_core::lengths::ValidPieceIndex,
+    ) -> anyhow::Result<()> {
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        anyhow::bail!("refusing to commit piece {piece_index}: no space left on device")
+    }
+
+    fn has_piece(
+        &self,
+        piece_index: librqbit_core::lengths::ValidPieceIndex,
+    ) -> anyhow::Result<bool> {
+        self.underlying.has_piece(piece_index)
+    }
+}
+
+// on_piece_completed() is the storage's word that the piece is there to stay, and a
+// storage that stages pieces gives it by moving the piece into place. It used to be asked
+// after the have-bit was set, and a refusal was logged at debug and ignored: the torrent
+// finished, advertised every piece and served them, over bytes has_piece() said it didn't
+// have. A refused commit is a disk failure like a failed write, and ends the torrent the
+// same way, before the piece is anyone's.
+async fn e2e_refused_commit_is_fatal() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (_files, torrent_bytes, _server_session, peer) =
+        seeding_server("test_refused_commit", FILE_SIZE).await?;
+
+    let storage = RefusingCommitStorageFactory::default();
+    let dir = TempDir::with_prefix("test_refused_commit_client")?;
+    let session = Session::new_with_opts(
+        dir.path().into(),
+        crate::SessionOptions {
+            dht: None,
+            persistence: None,
+            peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent_bytes.to_owned()),
+            Some(crate::AddTorrentOptions {
+                paused: false,
+                initial_peers: Some(vec![peer]),
+                storage_factory: Some(storage.clone().boxed()),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+
+    // The first piece to pass its hash check is refused, and that is the end of it.
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if handle.with_state(|s| matches!(s, crate::ManagedTorrentState::Error(_))) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .context("the torrent didn't stop: a refused commit was swallowed")?;
+
+    let stats = handle.stats();
+    assert!(!stats.finished);
+    assert_eq!(stats.progress_bytes, 0);
+    let error = stats.error.context("expected the torrent's error")?;
+    assert!(error.contains("no space left on device"), "{error}");
+
+    // Nothing was committed, so nothing is ours: has_piece() and the have-set agree.
+    assert!(storage.attempts.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+    assert_eq!(storage.underlying.piece_count(handle.info_hash()), 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_refused_commit_is_fatal() -> anyhow::Result<()> {
+    timeout(Duration::from_secs(120), e2e_refused_commit_is_fatal()).await?
+}
+
 // The have-bitfield is flushed lazily (16 MiB of piece completions), so a caller that
 // releases pieces and then dies leaves resume data claiming pieces it no longer has.
 // Startup intersects that resume data with TorrentStorage::has_piece(), and this is that
