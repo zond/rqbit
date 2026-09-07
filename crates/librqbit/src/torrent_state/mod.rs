@@ -350,14 +350,20 @@ impl ManagedTorrent {
     /// that were actually dropped, so the caller can release the storage behind them,
     /// together with a claim on them - see [`DroppedPieces`].
     ///
-    /// This is bookkeeping only: it does not touch storage. Storage is one file per
-    /// piece, so releasing a dropped piece is a file deletion and the caller owns it -
-    /// which also means it works on any filesystem.
+    /// This is bookkeeping only: it does not touch storage. Releasing a dropped piece is
+    /// the caller's job, and it takes a storage that can let one piece go - one entry or
+    /// file per piece, like `storage::examples::inmemory::InMemoryPieceStorage`,
+    /// where releasing a piece is deleting its file and works on any filesystem. The
+    /// default [`crate::storage::filesystem::FilesystemStorage`] writes the torrent's own
+    /// files and can't: with it dropping frees nothing, and the dropped pieces are only
+    /// downloaded again over bytes still on disk. That is why `add_torrent` refuses
+    /// `piece_reclaim` with a storage whose factory doesn't promise
+    /// [`crate::storage::StorageFactory::ensure_can_release_pieces`].
     ///
     /// The have-bitfield is flushed lazily, so what keeps it honest across a crash is
-    /// [`crate::storage::TorrentStorage::has_piece`]: startup intersects the resume data
-    /// with what the storage still holds. A storage whose pieces are released this way
-    /// must implement it.
+    /// [`crate::storage::TorrentStorage::has_piece`]: startup asks the storage what it
+    /// still holds, and believes it over the resume data. A storage whose pieces are
+    /// released this way must implement it.
     ///
     /// This is what makes it possible to keep streaming a torrent that doesn't fit on the
     /// disk while still seeding everything that does. Deciding *which* pieces to drop is

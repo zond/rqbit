@@ -292,8 +292,9 @@ impl ChunkTracker {
     /// wanting them back. Returns the pieces that were actually dropped, in the order
     /// given, so the caller can release the storage behind them.
     ///
-    /// This is bookkeeping only - it does not touch storage. Storage is one file per
-    /// piece, so releasing a dropped piece is a file deletion, and the caller owns it.
+    /// This is bookkeeping only - it does not touch storage. Releasing a dropped piece is
+    /// the caller's job, and takes a storage that can let one piece go; see
+    /// [`crate::ManagedTorrent::drop_pieces`].
     ///
     /// Pieces we don't have are skipped. It is the caller's job not to pass pieces that a
     /// live stream still needs.
