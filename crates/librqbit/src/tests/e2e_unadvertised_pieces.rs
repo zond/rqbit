@@ -17,6 +17,7 @@ use crate::{
     AddTorrent, CreateTorrentOptions, ManagedTorrent, Session, create_torrent,
     spawn_utils::BlockingSpawner,
     tests::test_util::{TestPeerMetadata, setup_test_logging},
+    torrent_state::live::peer::stats::snapshot::{PeerStatsFilter, PeerStatsFilterState},
 };
 
 use super::test_util::create_default_random_dir_with_torrents;
@@ -208,6 +209,75 @@ async fn e2e_unadvertised_pieces() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_e2e_unadvertised_pieces() -> anyhow::Result<()> {
     timeout(Duration::from_secs(120), e2e_unadvertised_pieces()).await?
+}
+
+// How many times we have dialled this peer, and how many times talking to it went wrong.
+// A peer we learn from over the connection we already had moves neither.
+fn peer_connection_counters(
+    handle: &ManagedTorrent,
+    peer: std::net::SocketAddr,
+) -> anyhow::Result<(u32, u32)> {
+    let live = handle.live().context("expected a live torrent")?;
+    // Every state, not just live: a torrent that has just finished parks the seeders it
+    // no longer needs, and this is read on both sides of that.
+    let stats = live.per_peer_stats_snapshot(PeerStatsFilter {
+        state: PeerStatsFilterState::All,
+    });
+    let peer = stats
+        .peers
+        .get(&peer.to_string())
+        .context("expected the peer to be in the peer table")?;
+    Ok((peer.counters.connection_attempts, peer.counters.errors))
+}
+
+// The other half: a piece put back has to reach the peers that are already connected.
+// Their handshake bitfield came without it, so the only thing that can tell them is a
+// Have - and this asserts they got it that way, over the connection they already had,
+// rather than by the connection dying and the fresh handshake covering for it.
+async fn e2e_unadvertised_pieces_come_back() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (files, torrent_bytes, (_seeder_session, seeder), addr) =
+        seeder("test_unadvertised_pieces_come_back").await?;
+    let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
+
+    seeder.set_pieces_advertised(HELD_BACK, false)?;
+
+    let leecher_dir = TempDir::with_prefix("test_unadvertised_pieces_come_back_leecher")?;
+    let (_leecher_session, leecher) = leecher(&leecher_dir, &torrent_bytes, addr).await?;
+    let advertised = (HELD_BACK.end..TOTAL_PIECES).collect::<Vec<_>>();
+    wait_for_pieces(&leecher, &advertised).await?;
+
+    let before = peer_connection_counters(&leecher, addr)?;
+
+    info!("advertising {HELD_BACK:?} again");
+
+    // The window has moved on and these pieces are staying, so announce them.
+    assert_eq!(
+        seeder.set_pieces_advertised(HELD_BACK, true)?,
+        HELD_BACK.len()
+    );
+    assert_eq!(seeder.set_pieces_advertised(HELD_BACK, true)?, 0);
+
+    timeout(Duration::from_secs(30), leecher.wait_until_completed()).await??;
+    assert_eq!(
+        std::fs::read(leecher_dir.path().join("0.data")).unwrap(),
+        orig_content
+    );
+    assert_eq!(
+        peer_connection_counters(&leecher, addr)?,
+        before,
+        "the peer only got the pieces after redialling us, so the Have did not reach it"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_unadvertised_pieces_come_back() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_unadvertised_pieces_come_back(),
+    )
+    .await?
 }
 
 // The default path, which is every torrent that never calls set_pieces_advertised: a peer

@@ -1810,8 +1810,15 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             .state
             .peers
             .with_live(self.addr, |l| {
-                l.bitfield.get(id.get_usize()).map(|p| *p).unwrap_or(true)
+                // An empty bitfield is a peer that has told us nothing yet, not a peer
+                // that has everything: a client with no pieces sends no bitfield at all,
+                // which is why on_have() allocates one on the first Have it gets. Reading
+                // that as "it already has the piece" silences every Have we would ever
+                // send it, and it is the peer that needs them most. A Have it turns out
+                // not to need costs 9 bytes.
+                l.bitfield.get(id.get_usize()).is_some_and(|p| *p)
             })
+            // Not live: nobody to tell.
             .unwrap_or(true);
         !have
     }
