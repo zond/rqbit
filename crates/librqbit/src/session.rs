@@ -290,9 +290,13 @@ pub struct AddTorrentOptions {
     /// NOTE: like every other field here except `only_files` and `paused`, this is not
     /// part of the persisted session state, so a torrent restored at startup comes back
     /// with it false unless the caller sets it again. That is deliberate: the set of
-    /// dropped pieces is per-session policy, and on restart the have-set is recomputed
-    /// from what is actually on disk, so a piece whose storage was released simply comes
-    /// back as missing and wanted - which is the right default.
+    /// dropped pieces is per-session policy, and the have-set a restart comes up with is
+    /// intersected with what the storage still holds (see
+    /// [`crate::storage::TorrentStorage::has_piece`]), so a piece whose storage was
+    /// released comes back as missing and wanted - which is the right default.
+    ///
+    /// A storage used with this must implement `has_piece`: it is the only thing that
+    /// keeps the have-set honest across a crash, since the bitfield is flushed lazily.
     #[serde(default)]
     pub piece_reclaim: bool,
 

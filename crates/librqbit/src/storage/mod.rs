@@ -177,6 +177,22 @@ pub trait TorrentStorage: Send + Sync {
     fn on_piece_completed(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Whether the data of this piece is still here.
+    ///
+    /// Called at startup for every piece the resume data claims we have, and the have-set
+    /// we start with is the intersection of the two - so this can only take a piece away,
+    /// never add one. It exists for storages that can lose a single piece behind our back:
+    /// with [`crate::AddTorrentOptions::piece_reclaim`] the caller deletes the storage of
+    /// a dropped piece itself, and if the process dies before the bitfield reaches the
+    /// disk, the resume data outlives the data it describes.
+    ///
+    /// The default answers "yes, and I would know otherwise", which is right for a
+    /// storage that cannot lose one piece on its own - the filesystem one grows files, it
+    /// never punches holes in them. Implement it if a piece of yours can go away.
+    fn has_piece(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<bool> {
+        Ok(true)
+    }
 }
 
 impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
@@ -214,6 +230,10 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
 
     fn on_piece_completed(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
         (**self).on_piece_completed(piece_id)
+    }
+
+    fn has_piece(&self, piece_id: ValidPieceIndex) -> anyhow::Result<bool> {
+        (**self).has_piece(piece_id)
     }
 }
 

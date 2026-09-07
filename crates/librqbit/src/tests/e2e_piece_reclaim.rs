@@ -82,13 +82,14 @@ async fn add_client_with_storage(
 // address to connect to.
 async fn seeding_server(
     prefix: &str,
+    file_size: usize,
 ) -> anyhow::Result<(
     TempDir,
     Vec<u8>,
     std::sync::Arc<Session>,
     std::net::SocketAddr,
 )> {
-    let files = create_default_random_dir_with_torrents(1, FILE_SIZE, Some(prefix));
+    let files = create_default_random_dir_with_torrents(1, file_size, Some(prefix));
     let torrent = create_torrent(
         files.path(),
         CreateTorrentOptions {
@@ -146,7 +147,7 @@ async fn seeding_server(
 async fn e2e_piece_reclaim() -> anyhow::Result<()> {
     setup_test_logging();
     let (files, torrent_bytes, _server_session, peer) =
-        seeding_server("test_piece_reclaim").await?;
+        seeding_server("test_piece_reclaim", FILE_SIZE).await?;
     let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
 
     // Without opting in, the API is refused and the torrent is upstream's torrent.
@@ -315,7 +316,7 @@ async fn test_e2e_piece_reclaim() -> anyhow::Result<()> {
 async fn e2e_piece_reclaim_storage_loop() -> anyhow::Result<()> {
     setup_test_logging();
     let (files, torrent_bytes, _server_session, peer) =
-        seeding_server("test_piece_reclaim_storage").await?;
+        seeding_server("test_piece_reclaim_storage", FILE_SIZE).await?;
     let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
 
     let storage = InMemoryPieceStorageFactory::default();

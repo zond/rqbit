@@ -346,6 +346,11 @@ impl ManagedTorrent {
     /// piece, so releasing a dropped piece is a file deletion and the caller owns it -
     /// which also means it works on any filesystem.
     ///
+    /// The have-bitfield is flushed lazily, so what keeps it honest across a crash is
+    /// [`crate::storage::TorrentStorage::has_piece`]: startup intersects the resume data
+    /// with what the storage still holds. A storage whose pieces are released this way
+    /// must implement it.
+    ///
     /// This is what makes it possible to keep streaming a torrent that doesn't fit on the
     /// disk while still seeding everything that does. Deciding *which* pieces to drop is
     /// the caller's job.
