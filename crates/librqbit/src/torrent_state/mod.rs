@@ -510,9 +510,19 @@ impl ManagedTorrent {
     /// policy set the caller owns, and nothing but this call changes it.
     ///
     /// The set is per-session and is not persisted, like the want-set of
-    /// [`Self::drop_pieces`]. It survives a pause, and is lost if the torrent is
-    /// re-checked or re-added - in which case the pieces are announced again, so re-apply
-    /// it before unpausing a torrent that must not announce them.
+    /// [`Self::drop_pieces`]. It lives in the chunk tracker: a pause keeps that, so a
+    /// pause keeps the set, and it is still in force when the torrent goes live again. A
+    /// re-check builds a new tracker, so the set is gone with the old one and everything
+    /// we have is announced again.
+    ///
+    /// Whether that is recoverable depends on how the re-check came about. A torrent
+    /// added again is: add it paused, hold back what must be held back, then unpause it.
+    /// A torrent restarted after an error (`error` -> `initializing`) is not - the check
+    /// runs in the background and the torrent goes initializing -> paused -> live in one
+    /// locked step when it finishes, so there is no state a caller can catch it in and
+    /// re-apply the set at. Watching for it to come back and re-applying then is after
+    /// the fact: it is live, and announcing, first. If those pieces must not be
+    /// announced, remove the torrent and add it again paused instead of restarting it.
     ///
     /// Works on a live or paused torrent, needs no options to have been set, and with
     /// nothing held back costs nothing: what we announce is then the have-set itself.
