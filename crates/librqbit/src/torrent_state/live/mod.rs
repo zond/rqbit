@@ -123,6 +123,14 @@ fn make_piece_bitfield(lengths: &Lengths) -> BF {
     BF::from_boxed_slice(vec![0; lengths.piece_bitfield_bytes()].into_boxed_slice())
 }
 
+// The piece range is the caller's, and "everything from here on" is a natural way to
+// ask for it. Walking it to the end of u32 to find out that none of it is a piece of
+// this torrent stalls the executor for seconds, so bound it first.
+fn clamp_piece_range(pieces: Range<u32>, lengths: &Lengths) -> Range<u32> {
+    let end = pieces.end.min(lengths.total_pieces());
+    pieces.start.min(end)..end
+}
+
 pub(crate) struct TorrentStateLocked {
     // Coordinates piece state: what chunks we have, need, and what pieces are in-flight.
     // If this is None, the torrent was paused, and this live state is useless, and needs to be dropped.
@@ -827,7 +835,7 @@ impl TorrentStateLive {
     ///
     /// Pieces we don't have, and pieces a live stream is about to read, are skipped.
     pub(crate) fn drop_pieces(&self, pieces: Range<u32>) -> anyhow::Result<Vec<u32>> {
-        let candidates = pieces
+        let candidates = clamp_piece_range(pieces, &self.lengths)
             .filter_map(|id| self.lengths.validate_piece_index(id))
             .filter(|id| !self.streams.is_piece_wanted(*id, &self.lengths))
             .collect::<Vec<_>>();
@@ -859,7 +867,8 @@ impl TorrentStateLive {
     /// Make previously dropped pieces wanted again. Returns how many pieces stopped being
     /// dropped.
     pub(crate) fn reselect_pieces(&self, pieces: Range<u32>) -> anyhow::Result<usize> {
-        let pieces = pieces.filter_map(|id| self.lengths.validate_piece_index(id));
+        let pieces = clamp_piece_range(pieces, &self.lengths)
+            .filter_map(|id| self.lengths.validate_piece_index(id));
         let count = self
             .lock_write("reselect_pieces")
             .get_pieces_mut()?
@@ -2162,4 +2171,28 @@ fn format_peer_client_name(value: &ByteBuf<'_>) -> Option<String> {
     }
 
     Some(client_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_piece_range;
+    use librqbit_core::lengths::Lengths;
+
+    #[test]
+    fn test_clamp_piece_range() {
+        // 10 pieces of 1024 bytes each.
+        let lengths = Lengths::new(10 * 1024, 1024).unwrap();
+
+        // A range inside the torrent is untouched.
+        assert_eq!(clamp_piece_range(2..5, &lengths), 2..5);
+
+        // "Everything from here on", which is how a caller asks to reclaim a tail.
+        assert_eq!(clamp_piece_range(5..u32::MAX, &lengths), 5..10);
+        assert_eq!(clamp_piece_range(0..u32::MAX, &lengths), 0..10);
+
+        // Entirely out of range: empty, and not a range that panics when iterated.
+        let r = clamp_piece_range(100..u32::MAX, &lengths);
+        assert!(r.is_empty(), "{r:?}");
+        assert_eq!(r.count(), 0);
+    }
 }
