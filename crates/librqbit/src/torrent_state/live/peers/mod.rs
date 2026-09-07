@@ -3,6 +3,7 @@ use std::{collections::HashSet, net::SocketAddr, ops::Deref, sync::Arc};
 use dashmap::DashMap;
 use librqbit_core::lengths::ValidPieceIndex;
 use parking_lot::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     Error,
@@ -176,10 +177,14 @@ impl PeerStates {
         self.session_stats.seeder_flag_changed(seeder);
     }
 
-    pub fn mark_peer_connecting(&self, h: PeerHandle) -> crate::Result<(PeerRx, PeerTx)> {
+    pub fn mark_peer_connecting(
+        &self,
+        h: PeerHandle,
+        dial_cancel: CancellationToken,
+    ) -> crate::Result<(PeerRx, PeerTx)> {
         let rx = self
             .with_peer_mut(h, "mark_peer_connecting", |peer| {
-                peer.idle_to_connecting(self)
+                peer.idle_to_connecting(self, dial_cancel)
                     .ok_or(Error::BugInvalidPeerState)
             })
             .ok_or(Error::BugPeerNotFound)??;

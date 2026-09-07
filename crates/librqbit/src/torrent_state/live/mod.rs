@@ -627,6 +627,7 @@ impl TorrentStateLive {
         rx: PeerRx,
         tx: PeerTx,
         counters: Arc<AtomicPeerCounters>,
+        dial_cancel: CancellationToken,
     ) -> crate::Result<()> {
         let state = self;
         let handler = PeerHandler {
@@ -638,7 +639,7 @@ impl TorrentStateLive {
             tx,
             counters,
             first_message_received: AtomicBool::new(false),
-            cancel_token: state.cancellation_token.child_token(),
+            cancel_token: dial_cancel,
             client_name_and_version: state.shared.client_name_and_version().to_owned(),
         };
         let _token_guard = handler.cancel_token.clone().drop_guard();
@@ -675,6 +676,9 @@ impl TorrentStateLive {
         let res = tokio::select! {
             r = requester => {r}
             r = conn_manager => {r}
+            // A lowered cap wants this slot back and cannot ask through the writer
+            // channel, because a dial that has not finished handshaking is not reading it.
+            _ = handler.cancel_token.cancelled() => Err(Error::Disconnect)
         };
 
         match res {
@@ -749,7 +753,8 @@ impl TorrentStateLive {
             // in between would find this peer neither `Live` nor `Connecting`, rank it as
             // absent and leave it unparked, and the swarm would settle one peer above the
             // cap for as long as it lives.
-            let (rx, tx) = match state.peers.mark_peer_connecting(addr) {
+            let dial_cancel = state.cancellation_token.child_token();
+            let (rx, tx) = match state.peers.mark_peer_connecting(addr, dial_cancel.clone()) {
                 Ok(v) => v,
                 Err(e) => {
                     debug!(?addr, "not dialling: {e:#}");
@@ -763,11 +768,14 @@ impl TorrentStateLive {
             state.spawn(
                 debug_span!(parent: state.shared.span.clone(), "manage_peer", peer = ?addr),
                 format!("[{}][addr={addr}]manage_peer", state.shared.id),
-                aframe!(
-                    state
-                        .clone()
-                        .task_manage_outgoing_peer(addr, permit, rx, tx, counters)
-                ),
+                aframe!(state.clone().task_manage_outgoing_peer(
+                    addr,
+                    permit,
+                    rx,
+                    tx,
+                    counters,
+                    dial_cancel
+                )),
             );
         }
     }
@@ -1180,11 +1188,17 @@ impl TorrentStateLive {
     }
 
     /// Hang up on the peers a cap of `limit` has no room for, least useful first (see
-    /// [`Self::surplus_rank`]), the way a peer we no longer need after finishing is dropped:
+    /// [`surplus_rank`]), the way a peer we no longer need after finishing is dropped:
     /// parked as `NotNeeded` first, then asked to disconnect. Its task ends on the request,
     /// and `on_peer_died` finds it parked, hands back the pieces it had in flight and
-    /// returns its permit. A peer still connecting is parked the same way: the handshake
-    /// then finds no `Connecting` state to promote and the queued request closes the writer.
+    /// returns its permit.
+    ///
+    /// A peer still connecting is parked the same way, but asking is not enough for it: it
+    /// reads its writer channel only once the handshake is done, which may be a connect
+    /// timeout and two read timeouts away, and against a host that accepts and then says
+    /// nothing it is the full wait. Since these are the peers a lowering sheds first --
+    /// they have proven nothing -- waiting would mean the cap holding its own slots hostage
+    /// for half a minute. So the dial is cancelled outright.
     fn disconnect_surplus_peers(&self, limit: usize) {
         // Read the queue of pieces still needed first, and let go of the state lock before
         // the table is touched (see `PeerTable` for the lock order).
@@ -1222,9 +1236,19 @@ impl TorrentStateLive {
                     ) {
                         return;
                     }
+                    let dial_cancel = peer.dial_cancel.take();
                     let tx = match peer.set_not_needed(&self.peers) {
                         PeerState::Live(live) => live.tx,
-                        PeerState::Connecting(tx) => tx,
+                        PeerState::Connecting(tx) => {
+                            // It is not reading the channel yet, and will not be for up to
+                            // a connect timeout plus two read timeouts. Ask anyway, in case
+                            // the handshake lands first, but end the task so the slot and
+                            // the socket come back now rather than in half a minute.
+                            if let Some(cancel) = dial_cancel {
+                                cancel.cancel();
+                            }
+                            tx
+                        }
                         _ => return,
                     };
                     let _ = tx.send(WriterRequest::Disconnect(Ok(())));

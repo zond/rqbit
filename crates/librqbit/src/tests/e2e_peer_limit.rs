@@ -213,13 +213,18 @@ async fn peer_limit_moves_at_runtime_inner() {
     )
     .await
     .unwrap();
-    // Every permit the lowering could not take off the semaphore has been paid back by
-    // the peer that held it, and the peers that are left hold all the slots there are.
-    assert_eq!(
-        live.peer_permit_accounting(),
-        (0, 0),
-        "free slots and the debt a lowered cap left"
-    );
+    // A slot the lowering could not take off the semaphore is paid back by the peer that
+    // held it, as it hangs up. Once they all have, the debt is nil and the peers that are
+    // left hold every slot there is.
+    wait_until(
+        || match live.peer_permit_accounting() {
+            (0, 0) => Ok(()),
+            (free, debt) => bail!("waiting for the slots to settle: {free} free, {debt} owed"),
+        },
+        WAIT,
+    )
+    .await
+    .unwrap();
 
     // Setting the cap it already has changes nothing.
     handle.set_peer_limit(LOWERED);
@@ -411,4 +416,130 @@ async fn forgetting_a_parked_peer_strands_none_of_its_pieces_inner() {
 
     swarm.unthrottle();
     swarm.handle.wait_until_completed().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parked_dial_gives_its_slot_back_at_once() {
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        a_parked_dial_gives_its_slot_back_at_once_inner(),
+    )
+    .await
+    .expect("test timed out");
+}
+
+/// Lowering the cap has to shed peers that are still connecting, and they are the ones it
+/// sheds first: they have proven nothing. But a dial hears nothing we send it until its
+/// handshake is done, so a host that accepts the connection and then says nothing holds
+/// its slot for a connect timeout and two read timeouts -- here 30 seconds, and in that
+/// time a backgrounded app has neither its memory back nor, on the way out of the
+/// background, a slot to dial anyone else with.
+async fn a_parked_dial_gives_its_slot_back_at_once_inner() {
+    setup_test_logging();
+
+    const TARPITS: usize = 4;
+    const KEPT: usize = 1;
+
+    // Listeners that accept and never speak a word of the protocol.
+    let mut addrs = Vec::new();
+    let closed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for _ in 0..TARPITS {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        addrs.push(listener.local_addr().unwrap());
+        let closed = closed.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let closed = closed.clone();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = [0u8; 1024];
+                    // Read until the other end goes away. We never write, so the peer
+                    // stays stuck waiting for our handshake.
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    closed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
+        });
+    }
+
+    let tempdir = create_default_random_dir_with_torrents(1, 100_000, Some("rqbit_tarpit"));
+    let torrent_file = create_torrent(
+        tempdir.path(),
+        CreateTorrentOptions {
+            piece_length: Some(32768),
+            ..Default::default()
+        },
+        &BlockingSpawner::new(1),
+    )
+    .await
+    .unwrap();
+    let root = tempfile::TempDir::with_prefix("rqbit_tarpit_client").unwrap();
+    let client = Session::new_with_opts(
+        root.path().join("out"),
+        SessionOptions {
+            dht: None,
+            listen: None,
+            disable_local_service_discovery: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let handle = client
+        .add_torrent(
+            AddTorrent::TorrentFileBytes(torrent_file.as_bytes().unwrap()),
+            Some(AddTorrentOptions {
+                initial_peers: Some(addrs.clone()),
+                peer_limit: Some(TARPITS),
+                overwrite: true,
+                peer_opts: Some(crate::PeerConnectionOptions {
+                    // Long enough that nothing here can be explained by a timeout.
+                    connect_timeout: Some(Duration::from_secs(30)),
+                    read_write_timeout: Some(Duration::from_secs(30)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_handle()
+        .unwrap();
+    let live = handle
+        .live_wait_initializing(Duration::from_secs(10))
+        .await
+        .expect("the client torrent goes live");
+
+    wait_until(
+        || match live.stats_snapshot().peer_stats {
+            s if s.connecting as usize == TARPITS => Ok(()),
+            s => bail!("waiting for every dial to wedge in the handshake: {s:?}"),
+        },
+        WAIT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(closed.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+    handle.set_peer_limit(KEPT);
+    wait_until(
+        || match closed.load(std::sync::atomic::Ordering::Relaxed) {
+            n if n == TARPITS - KEPT => Ok(()),
+            n => bail!("waiting for the parked dials to drop their sockets, {n} so far"),
+        },
+        // A fifth of the timeout that would end them on its own.
+        Duration::from_secs(6),
+    )
+    .await
+    .unwrap();
+    let stats = live.stats_snapshot().peer_stats;
+    assert_eq!(stats.connecting as usize, KEPT, "{stats:?}");
+    assert_eq!(stats.not_needed as usize, TARPITS - KEPT, "{stats:?}");
+    info!(stats = ?stats, "the parked dials let go of their slots");
 }

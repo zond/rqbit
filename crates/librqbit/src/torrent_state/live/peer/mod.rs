@@ -12,6 +12,7 @@ use tokio::sync::{
     Notify,
     mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::peer_connection::WriterRequest;
@@ -30,6 +31,15 @@ pub(crate) struct Peer {
     state: PeerState,
     pub stats: stats::atomic::PeerStats,
     pub outgoing_address: Option<SocketAddr>,
+    /// Ends the task dialling this peer, if one is dialling it.
+    ///
+    /// A peer we ask to disconnect hears the ask through its writer channel, and a peer
+    /// that has not finished its handshake is not reading that channel yet: it is inside
+    /// connect(), or waiting for the other end's handshake, for up to two more timeouts.
+    /// That is far too long for a lowered cap to wait for the slot back, so the cap ends
+    /// the task instead. Replaced by the next dial; a stale one left by a dial that has
+    /// already finished is harmless, since only a `Connecting` entry is ever cancelled.
+    pub(crate) dial_cancel: Option<CancellationToken>,
 }
 
 impl Peer {
@@ -49,6 +59,7 @@ impl Peer {
             state,
             stats: Default::default(),
             outgoing_address: None,
+            dial_cancel: None,
         }
     }
 
@@ -63,6 +74,7 @@ impl Peer {
             state,
             stats: Default::default(),
             outgoing_address: Some(addr),
+            dial_cancel: None,
         }
     }
 
@@ -72,6 +84,7 @@ impl Peer {
             outgoing_address: Some(addr),
             stats: Default::default(),
             state: Default::default(),
+            dial_cancel: None,
         }
     }
 
@@ -202,11 +215,16 @@ impl Peer {
         }
     }
 
-    pub fn idle_to_connecting(&mut self, counters: &PeerStates) -> Option<(PeerRx, PeerTx)> {
+    pub fn idle_to_connecting(
+        &mut self,
+        counters: &PeerStates,
+        dial_cancel: CancellationToken,
+    ) -> Option<(PeerRx, PeerTx)> {
         match &self.state {
             PeerState::Queued | PeerState::NotNeeded => {
                 let (tx, rx) = unbounded_channel();
                 let tx_2 = tx.clone();
+                self.dial_cancel = Some(dial_cancel);
                 self.set_state(PeerState::Connecting(tx), counters);
                 Some((rx, tx_2))
             }
