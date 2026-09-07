@@ -1697,6 +1697,18 @@ impl PeerHandler {
 
         let prev = pe.value_mut().take_state(peers);
 
+        // The entry may have been handed to a newer task while this one was hanging up: a
+        // peer parked by a lowered cap, re-queued by a raised one and dialled again, or one
+        // that dialled us in the meantime. Its state is not ours to end -- writing
+        // `NotNeeded` or `Dead` over it would kill a connection that is coming up, and the
+        // `Dead` backoff would then hold the address for a minute or more. Put it back and
+        // leave; that task will report its own death.
+        if prev.tx().is_some_and(|tx| !tx.same_channel(&self.tx)) {
+            trace!("peer entry belongs to a newer connection, leaving it alone");
+            pe.value_mut().set_state(prev, peers);
+            return Ok(());
+        }
+
         match prev {
             PeerState::Connecting(_) => {}
             PeerState::Live(live) => {
