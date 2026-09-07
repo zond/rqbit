@@ -256,4 +256,10 @@ impl TorrentStorage for InMemoryPieceStorage {
     fn remove_directory_if_empty(&self, _path: &Path) -> anyhow::Result<()> {
         Ok(())
     }
+
+    // The whole point: a piece that was released is gone, and startup has to believe the
+    // storage over the resume data.
+    fn has_piece(&self, piece_index: ValidPieceIndex) -> anyhow::Result<bool> {
+        Ok(self.pieces.read().contains_key(&piece_index))
+    }
 }

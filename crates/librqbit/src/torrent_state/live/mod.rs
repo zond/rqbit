@@ -857,9 +857,10 @@ impl TorrentStateLive {
             locked.unflushed_bitv_bytes += self.lengths.piece_length(*id) as u64;
         }
         // Same deal as on piece completion: let the bitfield drift until it's worth a
-        // write. Nothing is lost if a crash beats the flush - the storage the caller is
-        // about to release is what decides the have-set at startup, and a stale have-bit
-        // over storage that is gone is caught by the usual hash check.
+        // write. A crash that beats the flush leaves resume data claiming a piece whose
+        // storage the caller has since released, which is why startup intersects the
+        // resume data with TorrentStorage::has_piece() - the storage decides the have-set,
+        // so the claim cannot outlive the bytes.
         if locked.unflushed_bitv_bytes >= FLUSH_BITV_EVERY_BYTES {
             locked.try_flush_bitv(&self.shared, true);
         }
