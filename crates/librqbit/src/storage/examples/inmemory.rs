@@ -138,12 +138,16 @@ impl TorrentStorage for InMemoryExampleStorage {
 #[derive(Default)]
 struct Pieces {
     // Pieces that are all here: fully written, and hash-checked by the time they landed.
-    // This is what has_piece() answers from, and what a reader may be served.
+    // This is what has_piece() answers from.
     complete: HashMap<ValidPieceIndex, InMemoryPiece>,
 
     // Pieces being written. A piece appears here on its first 16 KiB chunk and moves to
     // `complete` in on_piece_completed(). Keeping it out of `complete` until then is what
     // makes "the storage has this piece" mean "complete" rather than "started".
+    //
+    // A piece can be in both maps at once - downloaded again while an older complete copy
+    // has not been released yet - and then this one, the newer, is what a read gets. See
+    // pread_exact().
     partial: HashMap<ValidPieceIndex, InMemoryPiece>,
 }
 
@@ -159,6 +163,12 @@ struct Pieces {
 /// so that its presence means "complete" and not "started" - see
 /// [`crate::storage::TorrentStorage::has_piece`], where a wrong yes is silent corruption.
 /// On a filesystem that move is writing to a temporary name and renaming it.
+///
+/// That leaves a piece with two copies for as long as it is being downloaded again while
+/// the old one is still held, and the rule is that a read gets the newer one: the staged
+/// copy if there is one, the complete copy otherwise. The hash check that decides whether
+/// to promote the staged copy is itself a read, so serving it the old bytes would have it
+/// check the wrong ones. The same applies to the temporary file on a filesystem.
 ///
 /// The factory is the caller's handle to those pieces: it shares the map with the storage
 /// it creates, so the policy that decides what to reclaim can call
@@ -233,12 +243,26 @@ impl TorrentStorage for InMemoryPieceStorage {
         let (piece_id, piece_offset) =
             piece_and_offset(&self.lengths, &self.file_infos, file_id, offset)?;
         let g = self.pieces.read();
-        // A piece being written is readable: hash checking it is a read of what was just
-        // written, and it happens before the piece is complete.
+        // A read is served the newest copy of the piece: the one being written if there
+        // is one, otherwise the complete one. Hash checking a piece is a read of what was
+        // just written, and it happens before the piece is complete - so a piece being
+        // downloaded has to be readable, and it has to win over a complete copy that is
+        // still around. It can be: drop_pieces() clears the have-bit, but the bytes stay
+        // until the caller releases them, and the piece may be downloaded again in
+        // between. Reading the stale complete copy there would hash-check the old bytes,
+        // pass, and on_piece_completed() would promote the new ones on the strength of a
+        // check that never looked at them.
+        //
+        // Nothing wants the older copy while a newer one exists, because the two maps
+        // only overlap while a piece is being downloaded, and a piece being downloaded is
+        // not one rqbit counts as ours: a peer's request for it is refused before it
+        // reaches storage, and a stream waits for it. The overlap ends at
+        // on_piece_completed(), which takes the partial copy out of the map as it
+        // promotes it, or at release_piece(), which drops both.
         let piece = g
-            .complete
+            .partial
             .get(&piece_id)
-            .or_else(|| g.partial.get(&piece_id))
+            .or_else(|| g.complete.get(&piece_id))
             .context("piece was released")?;
         buf.copy_from_slice(&piece.bytes[piece_offset..(piece_offset + buf.len())]);
         Ok(())
@@ -376,5 +400,46 @@ mod tests {
         assert!(!storage.has_piece(piece).unwrap());
         assert_eq!(factory.piece_count(), 0);
         assert!(storage.pread_exact(0, 0, &mut buf).is_err());
+    }
+
+    // A read must see the bytes most recently written. A piece can be downloaded again
+    // while the complete copy is still here - drop_pieces() clears the have-bit and the
+    // caller releases the bytes afterwards - and the check that decides whether to keep
+    // the new copy is a read. Serve it the stale complete one and it hash-checks the old
+    // bytes, passes, and on_piece_completed() promotes the new ones on the strength of a
+    // check that never looked at them.
+    #[test]
+    fn test_a_read_sees_the_newest_copy_of_a_piece() {
+        let (factory, storage) = storage();
+        let piece = storage.lengths.validate_piece_index(0).unwrap();
+        let old = vec![1u8; PIECE_LEN as usize];
+        let new = vec![2u8; PIECE_LEN as usize];
+
+        storage.pwrite_all(0, 0, &old).unwrap();
+        storage.on_piece_completed(piece).unwrap();
+        assert!(factory.has_piece(piece));
+
+        // Downloaded again: the first chunk of the new copy lands in the staging area
+        // next to the complete one, and a read has to get the new bytes.
+        let chunk = CHUNK_SIZE as usize;
+        storage.pwrite_all(0, 0, &new[..chunk]).unwrap();
+        let mut buf = vec![0u8; chunk];
+        storage.pread_exact(0, 0, &mut buf).unwrap();
+        assert_eq!(
+            buf,
+            new[..chunk],
+            "the hash check must see the re-downloaded bytes, not the stale complete copy"
+        );
+
+        // The rest of it, then the promotion: the newer copy replaces the older one, and
+        // the piece is back to having exactly one.
+        storage
+            .pwrite_all(0, CHUNK_SIZE as u64, &new[chunk..])
+            .unwrap();
+        storage.on_piece_completed(piece).unwrap();
+        assert_eq!(factory.piece_count(), 1);
+        let mut buf = vec![0u8; PIECE_LEN as usize];
+        storage.pread_exact(0, 0, &mut buf).unwrap();
+        assert_eq!(buf, new);
     }
 }
