@@ -719,3 +719,193 @@ async fn test_e2e_piece_reclaim_resume_data_is_intersected_with_storage() -> any
     )
     .await?
 }
+
+// Which pieces of the torrent the storage holds, complete.
+fn storage_has(
+    storage: &InMemoryPieceStorageFactory,
+    handle: &crate::ManagedTorrent,
+) -> anyhow::Result<Vec<bool>> {
+    let lengths = *handle
+        .metadata
+        .load_full()
+        .context("no metadata")?
+        .lengths();
+    Ok((0..TOTAL_PIECES)
+        .map(|id| {
+            storage.has_piece(
+                handle.info_hash(),
+                lengths.validate_piece_index(id).unwrap(),
+            )
+        })
+        .collect())
+}
+
+// The have-set the torrent came up with.
+fn torrent_has(handle: &crate::ManagedTorrent) -> anyhow::Result<Vec<bool>> {
+    handle.with_chunk_tracker(|ct| {
+        let have = ct.get_have_pieces().as_slice();
+        (0..TOTAL_PIECES).map(|id| have[id as usize]).collect()
+    })
+}
+
+// Release the pieces of a range and let the claim go: the storage has holes where they
+// were, and the torrent knows it.
+fn release(
+    storage: &InMemoryPieceStorageFactory,
+    handle: &std::sync::Arc<crate::ManagedTorrent>,
+    pieces: std::ops::Range<u32>,
+) -> anyhow::Result<()> {
+    let lengths = *handle
+        .metadata
+        .load_full()
+        .context("no metadata")?
+        .lengths();
+    let dropped = handle.drop_pieces(pieces.clone())?;
+    assert_eq!(dropped.pieces(), pieces.collect::<Vec<_>>());
+    for id in dropped.pieces() {
+        assert!(
+            storage.release_piece(
+                handle.info_hash(),
+                lengths.validate_piece_index(*id).unwrap()
+            ),
+            "piece {id} wasn't there"
+        );
+    }
+    Ok(())
+}
+
+// The intersection above only runs when there is resume data to intersect, and fastresume
+// is off by default - rqbit, the desktop app and a Session::new_with_opts that leaves it
+// alone all do a full check at startup. So this is the path every shipped default takes,
+// and it has to reach the same have-set: the full check asks the storage about each piece
+// before reading it. It didn't, and a read of a released piece failed the way a missing
+// file does, which wrote off every later piece of the file: one hole, and the rest of the
+// film is downloaded again on every relaunch.
+async fn e2e_piece_reclaim_full_check_asks_the_storage() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (files, torrent_bytes, _server_session, peer) =
+        seeding_server("test_piece_reclaim_full_check", FILE_SIZE).await?;
+    let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
+
+    let dir = TempDir::with_prefix("test_piece_reclaim_full_check_client")?;
+    let output_folder = dir.path().join("out");
+    let persistence_folder = dir.path().join("session");
+    let storage = InMemoryPieceStorageFactory::default();
+
+    // Persistence on, fastresume left at its default: what a restart gets is the record
+    // and the storage, with no bitfield to intersect.
+    let session_opts = || crate::SessionOptions {
+        dht: None,
+        persistence: Some(crate::SessionPersistenceConfig::Json {
+            folder: Some(persistence_folder.clone()),
+        }),
+        disable_local_service_discovery: true,
+        peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+        default_storage_factory: Some(storage.clone().boxed()),
+        ..Default::default()
+    };
+
+    let session = Session::new_with_opts(output_folder.clone(), session_opts()).await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent_bytes.clone()),
+            Some(crate::AddTorrentOptions {
+                paused: false,
+                initial_peers: Some(vec![peer]),
+                piece_reclaim: true,
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
+    assert_eq!(read_back(handle.clone()).await?, orig_content);
+
+    // One hole, early in the file: the only piece the storage doesn't have.
+    release(&storage, &handle, 1..2)?;
+    let held = storage_has(&storage, &handle)?;
+    assert_eq!(held.iter().filter(|h| !**h).count(), 1);
+
+    drop(handle);
+    drop(session);
+
+    let session = Session::new_with_opts(output_folder.clone(), session_opts()).await?;
+    let handle = session
+        .get(crate::api::TorrentIdOrHash::Id(0))
+        .context("expected the torrent to be restored from persistence")?;
+    timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+
+    assert_eq!(
+        torrent_has(&handle)?,
+        held,
+        "the full check didn't come up with what the storage holds"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_piece_reclaim_full_check_asks_the_storage() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_piece_reclaim_full_check_asks_the_storage(),
+    )
+    .await?
+}
+
+// Restarting a torrent that hit a fatal error throws the bitfield away and does a full
+// check - and a fatal error is what ENOSPC on a full disk is, which is the situation
+// piece reclaim exists for. The have-set that check comes up with has to be what the
+// storage holds, holes included, as the DroppedPieces doc promises.
+async fn e2e_piece_reclaim_errored_torrent_asks_the_storage() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (files, torrent_bytes, _server_session, peer) =
+        seeding_server("test_piece_reclaim_errored", FILE_SIZE).await?;
+    let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
+
+    let storage = InMemoryPieceStorageFactory::default();
+    let dir = TempDir::with_prefix("test_piece_reclaim_errored_client")?;
+    let (session, handle) = add_client_with_storage(
+        &dir,
+        &torrent_bytes,
+        peer,
+        true,
+        Some(storage.clone().boxed()),
+    )
+    .await?;
+
+    // A hole in the middle of the file, then the error.
+    release(&storage, &handle, 4..8)?;
+    let held = storage_has(&storage, &handle)?;
+    handle.stop_with_error(anyhow!("simulated fatal error"));
+    assert!(handle.with_state(|s| matches!(s, crate::ManagedTorrentState::Error(_))));
+
+    // Restart it into a paused state, so that what the check came up with is what we
+    // look at, and not what a peer had time to fill in since.
+    handle.start(None, true)?;
+    timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+    assert_eq!(
+        torrent_has(&handle)?,
+        held,
+        "the check after the error didn't come up with what the storage holds"
+    );
+
+    // And from there it downloads exactly the hole.
+    session.unpause(&handle).await?;
+    timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
+    assert_eq!(
+        storage.piece_count(handle.info_hash()),
+        TOTAL_PIECES as usize
+    );
+    assert_eq!(read_back(handle.clone()).await?, orig_content);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_piece_reclaim_errored_torrent_asks_the_storage() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_piece_reclaim_errored_torrent_asks_the_storage(),
+    )
+    .await?
+}

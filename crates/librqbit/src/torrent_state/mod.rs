@@ -439,7 +439,7 @@ impl ManagedTorrent {
         self.live()
     }
 
-    fn stop_with_error(&self, error: anyhow::Error) {
+    pub(crate) fn stop_with_error(&self, error: anyhow::Error) {
         let mut g = self.locked.write();
 
         match g.state.take() {
