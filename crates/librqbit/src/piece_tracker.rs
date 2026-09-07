@@ -336,12 +336,15 @@ impl PieceTracker {
         self.releasing.contains(&piece)
     }
 
-    /// Make previously dropped pieces wanted again.
+    /// Make previously dropped pieces wanted again. A piece a peer already owns is left
+    /// alone: it is being downloaded already.
     pub fn reselect_pieces(
         &mut self,
         pieces: impl IntoIterator<Item = ValidPieceIndex>,
     ) -> crate::Result<Reselected> {
-        self.chunks.reselect_pieces(pieces)
+        let inflight = &self.inflight;
+        self.chunks
+            .reselect_pieces(pieces, |piece| inflight.contains_key(&piece))
     }
 
     /// Update which files are selected for download.
@@ -374,7 +377,7 @@ impl PieceTracker {
 mod tests {
     use super::*;
     use crate::{bitv::BitV as BitVTrait, type_aliases::BF};
-    use librqbit_core::lengths::Lengths;
+    use librqbit_core::{constants::CHUNK_SIZE, lengths::Lengths};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn peer(id: u8) -> PeerHandle {
@@ -428,8 +431,34 @@ mod tests {
         (0..file_infos.len()).collect()
     }
 
+    // The reclaim tests need more than one chunk per piece: a piece that a peer is
+    // halfway through is the whole point of them.
+    const RECLAIM_CHUNKS_PER_PIECE: u32 = 4;
+    const RECLAIM_PIECE_LEN: u32 = CHUNK_SIZE * RECLAIM_CHUNKS_PER_PIECE;
+
+    fn reclaim_file_infos(num_pieces: u32) -> FileInfos {
+        vec![crate::file_info::FileInfo {
+            relative_filename: "test.dat".into(),
+            offset_in_torrent: 0,
+            len: RECLAIM_PIECE_LEN as u64 * num_pieces as u64,
+            piece_range: 0..num_pieces,
+            attrs: Default::default(),
+        }]
+    }
+
     fn make_reclaim_tracker(num_pieces: u32) -> PieceTracker {
-        let mut chunks = make_test_chunk_tracker(num_pieces);
+        let file_infos = reclaim_file_infos(num_pieces);
+        let lengths = Lengths::new(
+            RECLAIM_PIECE_LEN as u64 * num_pieces as u64,
+            RECLAIM_PIECE_LEN,
+        )
+        .unwrap();
+        let bf_len = lengths.piece_bitfield_bytes();
+        let have = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        let mut selected = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        selected.get_mut(0..num_pieces as usize).unwrap().fill(true);
+        let mut chunks =
+            ChunkTracker::new(have.into_dyn(), selected, lengths, &file_infos).unwrap();
         chunks.enable_piece_reclaim();
         let mut tracker = PieceTracker::new(chunks);
         // Have everything, so nothing is queued and acquisition has to come from the
@@ -468,12 +497,64 @@ mod tests {
         })
     }
 
+    // reselect_pieces() is the only caller of mark_piece_broken_if_not_have() that cannot
+    // take the piece out of the in-flight map first: the piece is legitimately being
+    // downloaded, by the very peer whose work requeuing would throw away.
+    #[test]
+    fn test_reselect_does_not_wipe_an_inflight_piece() {
+        let file_infos = reclaim_file_infos(3);
+        let file_priorities = make_default_file_priorities(&file_infos);
+        let mut tracker = make_reclaim_tracker(3);
+        let p0 = piece(&tracker, 0);
+
+        let dropped = tracker.drop_pieces(&file_infos, [p0]).unwrap();
+        assert_eq!(tracker.finish_release(dropped), 0);
+
+        // A reader seeks back into the reclaimed range: the priority path picks the piece
+        // up on its own, without it ever going through the queue.
+        let res = acquire(&mut tracker, &file_infos, &file_priorities, Some(p0));
+        assert!(
+            matches!(res, AcquireResult::Reserved(p) if p == p0),
+            "{res:?}"
+        );
+
+        // The peer delivers all but the last chunk of it.
+        let block = vec![0u8; CHUNK_SIZE as usize];
+        let deliver = |t: &mut PieceTracker, chunk: u32| {
+            t.mark_chunk_downloaded(&Piece::from_data(p0.get(), chunk * CHUNK_SIZE, &block))
+        };
+        for chunk in 0..RECLAIM_CHUNKS_PER_PIECE - 1 {
+            assert!(matches!(
+                deliver(&mut tracker, chunk),
+                Some(ChunkMarkingResult::NotCompleted)
+            ));
+        }
+
+        // Now the caller reselects the range the piece is in. It is already being
+        // downloaded, which is exactly what reselecting wants.
+        tracker.reselect_pieces([p0]).unwrap();
+
+        // The last chunk completes the piece - unless the ones before it were thrown away.
+        assert!(
+            matches!(
+                deliver(&mut tracker, RECLAIM_CHUNKS_PER_PIECE - 1),
+                Some(ChunkMarkingResult::Completed)
+            ),
+            "the chunks the peer already delivered were thrown away"
+        );
+        assert!(tracker.is_inflight(p0));
+        assert!(
+            !tracker.chunks().is_piece_queued(p0),
+            "the piece a peer owns was put back in the queue, so a second peer can take it too"
+        );
+    }
+
     // A piece handed to the caller so it can delete the storage behind it must not be
     // downloaded again until the caller says the deletion is done. Otherwise we set the
     // have-bit back and the deletion removes a piece we have and are advertising.
     #[test]
     fn test_a_dropped_piece_is_not_reacquired_until_released() {
-        let file_infos = make_test_file_infos(3);
+        let file_infos = reclaim_file_infos(3);
         let file_priorities = make_default_file_priorities(&file_infos);
         let mut tracker = make_reclaim_tracker(3);
         let p0 = piece(&tracker, 0);

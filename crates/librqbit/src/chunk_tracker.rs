@@ -295,9 +295,13 @@ impl ChunkTracker {
     /// Make previously dropped pieces wanted again, e.g. after seeking backwards into a
     /// range we reclaimed. Pieces that weren't dropped are left alone. Returns what
     /// changed: see [`Reselected`].
+    ///
+    /// `is_inflight` says whether a peer already owns the piece; the tracker has no view
+    /// of that. Such a piece is already being downloaded and is left as it is.
     pub fn reselect_pieces(
         &mut self,
         pieces: impl IntoIterator<Item = ValidPieceIndex>,
+        is_inflight: impl Fn(ValidPieceIndex) -> bool,
     ) -> crate::Result<Reselected> {
         if self.dropped.is_none() {
             return Err(Error::PieceReclaimDisabled);
@@ -312,7 +316,12 @@ impl ChunkTracker {
             // unconditionally would break "queued is a subset of selected or have" and
             // download a file the user deselected - the same invariant update_only_files
             // goes out of its way to maintain.
-            if self.selected[id.get() as usize] {
+            // A piece a peer already owns is being downloaded, which is what reselecting
+            // wants. mark_piece_broken_if_not_have() would throw away the chunks that
+            // peer has already delivered and queue the piece for a second peer as well:
+            // every other caller of it takes the piece out of the in-flight map first,
+            // and this is the one that must not.
+            if self.selected[id.get() as usize] && !is_inflight(id) {
                 // Puts it back in the queue and resets its chunks.
                 self.mark_piece_broken_if_not_have(id);
                 res.queued += 1;
@@ -1162,7 +1171,7 @@ mod piece_reclaim_tests {
             Err(Error::PieceReclaimDisabled)
         ));
         assert!(matches!(
-            ct.reselect_pieces([piece(&l, 0)]),
+            ct.reselect_pieces([piece(&l, 0)], |_| false),
             Err(Error::PieceReclaimDisabled)
         ));
         assert_eq!(snapshot(&ct), before);
@@ -1308,7 +1317,7 @@ mod piece_reclaim_tests {
         assert_eq!(queued(&ct), Vec::<usize>::new());
 
         assert_eq!(
-            ct.reselect_pieces([piece(&l, 0)]).unwrap(),
+            ct.reselect_pieces([piece(&l, 0)], |_| false).unwrap(),
             Reselected {
                 reselected: 1,
                 queued: 1
@@ -1328,7 +1337,8 @@ mod piece_reclaim_tests {
 
         // Reselecting something that wasn't dropped does nothing.
         assert_eq!(
-            ct.reselect_pieces([piece(&l, 0), piece(&l, 2)]).unwrap(),
+            ct.reselect_pieces([piece(&l, 0), piece(&l, 2)], |_| false)
+                .unwrap(),
             Reselected::default()
         );
         assert_eq!(queued(&ct), vec![0]);
@@ -1374,7 +1384,7 @@ mod piece_reclaim_tests {
         // also not queued, and the caller has to be able to tell: waking every peer for a
         // piece that nobody can download is a wake-up with no work behind it.
         assert_eq!(
-            ct.reselect_pieces([piece(&l, 2)]).unwrap(),
+            ct.reselect_pieces([piece(&l, 2)], |_| false).unwrap(),
             Reselected {
                 reselected: 1,
                 queued: 0
