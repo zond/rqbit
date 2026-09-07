@@ -835,13 +835,17 @@ impl TorrentStateLive {
     ///
     /// Pieces we don't have, and pieces a live stream is about to read, are skipped.
     pub(crate) fn drop_pieces(&self, pieces: Range<u32>) -> anyhow::Result<Vec<u32>> {
-        let candidates = clamp_piece_range(pieces, &self.lengths)
-            .filter_map(|id| self.lengths.validate_piece_index(id))
-            .filter(|id| !self.streams.is_piece_wanted(*id, &self.lengths))
-            .collect::<Vec<_>>();
-
         let mut g = self.lock_write("drop_pieces");
         let locked = &mut **g;
+        // The guard is evaluated here, under the write lock, and not before taking it.
+        // Waiting for a contended write lock is exactly when a reader is likely to seek,
+        // and a lookahead computed before the wait would be stale by the time we drop.
+        // What is left racing is a seek concurrent with this very iteration, and that one
+        // is harmless: the picker's priority path ignores "dropped", so the reader pulls
+        // the piece back in by itself.
+        let candidates = clamp_piece_range(pieces, &self.lengths)
+            .filter_map(|id| self.lengths.validate_piece_index(id))
+            .filter(|id| !self.streams.is_piece_wanted(*id, &self.lengths));
         let dropped = locked
             .get_pieces_mut()?
             .drop_pieces(&self.metadata.file_infos, candidates)?;
