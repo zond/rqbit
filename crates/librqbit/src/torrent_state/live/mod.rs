@@ -1619,57 +1619,43 @@ impl PeerHandler {
                 return Ok(());
             }
         };
+        // Whatever state the table has this peer in by now, the task that is dying may
+        // still own pieces it reserved while it was live, and a reserved piece is owned by
+        // an address, not by a state: the entry may since have been parked by a lowered
+        // peer limit, re-queued by a raised one, or already given to a fresh dial. Hand
+        // them back before looking at the state at all -- until they are back in the queue
+        // nobody else may download them and the torrent stalls until a steal comes by.
+        // Not fatal if the chunk tracker is gone: the torrent is being paused.
+        let released = self
+            .state
+            .lock_write("release_dead_peer_pieces")
+            .get_pieces_mut()
+            .map(|pieces| pieces.release_pieces_owned_by(self.addr))
+            .unwrap_or(0);
+        if released > 0 {
+            trace!(
+                released,
+                "peer dead, released its in-flight pieces to queue"
+            );
+            self.state.new_pieces_notify.notify_waiters();
+        }
+
         let prev = pe.value_mut().take_state(peers);
 
         match prev {
             PeerState::Connecting(_) => {}
             PeerState::Live(live) => {
-                let mut g = self.state.lock_write("mark_chunk_requests_canceled");
-
-                // Release all pieces owned by this peer (fixes the bug where pieces
-                // could be in both queue_pieces AND inflight_pieces after peer death)
-                let released = g.get_pieces_mut()?.release_pieces_owned_by(self.addr);
-                if released > 0 {
-                    trace!(
-                        "peer dead, released {} in-flight pieces back to queue",
-                        released
-                    );
-                }
-
-                // Also handle any active chunk-level inflight requests.
-                let mut had_inflight = false;
                 for req in live.inflight_requests() {
-                    had_inflight = true;
                     trace!(
                         "peer dead, marking chunk request cancelled, index={}, chunk={}",
                         req.piece_index.get(),
                         req.chunk_index
                     );
                 }
-
-                if released > 0 || had_inflight {
-                    self.state.new_pieces_notify.notify_waiters();
-                }
             }
             PeerState::NotNeeded => {
                 // Restore it as std::mem::take() replaced it above.
                 pe.value_mut().set_state(PeerState::NotNeeded, peers);
-                // Parked while it was live -- a lowered peer limit does that -- it may still
-                // own pieces in flight; hand them back or nobody else gets to download them.
-                // Not fatal if the chunk tracker is gone: the torrent is being paused.
-                let released = self
-                    .state
-                    .lock_write("release_parked_peer_pieces")
-                    .get_pieces_mut()
-                    .map(|pieces| pieces.release_pieces_owned_by(self.addr))
-                    .unwrap_or(0);
-                if released > 0 {
-                    trace!(
-                        released,
-                        "parked peer died, released its in-flight pieces back to queue"
-                    );
-                    self.state.new_pieces_notify.notify_waiters();
-                }
                 return Ok(());
             }
             s @ PeerState::Queued | s @ PeerState::Dead => {
