@@ -8,12 +8,16 @@ use std::{
 use anyhow::{Context, anyhow};
 use librqbit_core::constants::CHUNK_SIZE;
 use tempfile::TempDir;
-use tokio::{io::AsyncSeek, time::timeout};
+use tokio::{
+    io::{AsyncReadExt, AsyncSeek},
+    time::timeout,
+};
 use tracing::info;
 
 use crate::{
     AddTorrent, CreateTorrentOptions, DroppedPieces, Session, create_torrent,
     spawn_utils::BlockingSpawner,
+    storage::{StorageFactoryExt, examples::inmemory::InMemoryPieceStorageFactory},
     tests::test_util::{TestPeerMetadata, setup_test_logging},
 };
 
@@ -36,6 +40,16 @@ async fn add_client(
     peer: std::net::SocketAddr,
     piece_reclaim: bool,
 ) -> anyhow::Result<Client> {
+    add_client_with_storage(dir, torrent, peer, piece_reclaim, None).await
+}
+
+async fn add_client_with_storage(
+    dir: &TempDir,
+    torrent: &[u8],
+    peer: std::net::SocketAddr,
+    piece_reclaim: bool,
+    storage_factory: Option<crate::storage::BoxStorageFactory>,
+) -> anyhow::Result<Client> {
     let session = Session::new_with_opts(
         dir.path().into(),
         crate::SessionOptions {
@@ -53,6 +67,7 @@ async fn add_client(
                 paused: false,
                 initial_peers: Some(vec![peer]),
                 piece_reclaim,
+                storage_factory,
                 ..Default::default()
             }),
         )
@@ -63,9 +78,17 @@ async fn add_client(
     Ok((session, handle))
 }
 
-async fn e2e_piece_reclaim() -> anyhow::Result<()> {
-    setup_test_logging();
-    let files = create_default_random_dir_with_torrents(1, FILE_SIZE, Some("test_piece_reclaim"));
+// A session that has the whole torrent and will serve it, plus the torrent file and the
+// address to connect to.
+async fn seeding_server(
+    prefix: &str,
+) -> anyhow::Result<(
+    TempDir,
+    Vec<u8>,
+    std::sync::Arc<Session>,
+    std::net::SocketAddr,
+)> {
+    let files = create_default_random_dir_with_torrents(1, FILE_SIZE, Some(prefix));
     let torrent = create_torrent(
         files.path(),
         CreateTorrentOptions {
@@ -77,8 +100,6 @@ async fn e2e_piece_reclaim() -> anyhow::Result<()> {
     )
     .await?;
     let torrent_bytes = torrent.as_bytes()?;
-
-    let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
 
     let server_session = Session::new_with_opts(
         files.path().into(),
@@ -119,6 +140,14 @@ async fn e2e_piece_reclaim() -> anyhow::Result<()> {
     let peer = server_session
         .listen_addr()
         .context("expected listen_addr to be set")?;
+    Ok((files, torrent_bytes.to_vec(), server_session, peer))
+}
+
+async fn e2e_piece_reclaim() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (files, torrent_bytes, _server_session, peer) =
+        seeding_server("test_piece_reclaim").await?;
+    let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
 
     // Without opting in, the API is refused and the torrent is upstream's torrent.
     let plain_dir = TempDir::with_prefix("test_piece_reclaim_plain")?;
@@ -279,4 +308,73 @@ async fn e2e_piece_reclaim() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_e2e_piece_reclaim() -> anyhow::Result<()> {
     timeout(Duration::from_secs(120), e2e_piece_reclaim()).await?
+}
+
+// The whole loop, with a storage that actually releases what it is told to: download,
+// drop, delete the pieces, seek back into the range, get them again.
+async fn e2e_piece_reclaim_storage_loop() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (files, torrent_bytes, _server_session, peer) =
+        seeding_server("test_piece_reclaim_storage").await?;
+    let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
+
+    let storage = InMemoryPieceStorageFactory::default();
+    let dir = TempDir::with_prefix("test_piece_reclaim_storage_client")?;
+    let (_session, handle) = add_client_with_storage(
+        &dir,
+        &torrent_bytes,
+        peer,
+        true,
+        Some(storage.clone().boxed()),
+    )
+    .await?;
+
+    let lengths = *handle
+        .metadata
+        .load_full()
+        .context("no metadata")?
+        .lengths();
+    let piece = |id: u32| lengths.validate_piece_index(id).unwrap();
+
+    // One entry per piece, which is what makes releasing one meaningful.
+    assert_eq!(storage.piece_count(), TOTAL_PIECES as usize);
+    let read_back = |handle: std::sync::Arc<crate::ManagedTorrent>| async move {
+        let mut stream = handle.stream(0).await?;
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await?;
+        Ok::<_, anyhow::Error>(buf)
+    };
+    assert_eq!(read_back(handle.clone()).await?, orig_content);
+
+    // The loop: ask what may go, delete exactly that, then let the claim go.
+    let dropped = handle.drop_pieces(DROP)?;
+    assert_eq!(dropped.pieces(), DROP.collect::<Vec<_>>());
+    for id in dropped.pieces() {
+        assert!(storage.release_piece(piece(*id)), "piece {id} wasn't there");
+    }
+    drop(dropped);
+
+    assert_eq!(storage.piece_count(), TOTAL_PIECES as usize - DROP.len());
+    for id in 0..TOTAL_PIECES {
+        assert_eq!(storage.has_piece(piece(id)), !DROP.contains(&id), "{id}");
+    }
+
+    // The memory is gone and the torrent is still finished: a piece we threw away on
+    // purpose is not a piece we are missing.
+    assert!(handle.stats().finished);
+
+    // Asking for the range back re-downloads it from the peer, hash-checked on the way
+    // in, and the file reads back byte-identical.
+    assert_eq!(handle.reselect_pieces(DROP)?, DROP.len());
+    assert!(!handle.stats().finished);
+    timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
+    assert_eq!(storage.piece_count(), TOTAL_PIECES as usize);
+    assert_eq!(read_back(handle.clone()).await?, orig_content);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_piece_reclaim_storage_loop() -> anyhow::Result<()> {
+    timeout(Duration::from_secs(120), e2e_piece_reclaim_storage_loop()).await?
 }

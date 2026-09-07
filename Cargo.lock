@@ -3079,6 +3079,7 @@ dependencies = [
  "http",
  "intervaltree",
  "itertools 0.15.0",
+ "librqbit",
  "librqbit-bencode",
  "librqbit-buffers",
  "librqbit-clone-to-owned",
