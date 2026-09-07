@@ -1,4 +1,7 @@
-use std::{net::Ipv4Addr, time::Duration};
+use std::{
+    net::Ipv4Addr,
+    time::{Duration, Instant},
+};
 
 use anyhow::Context;
 use librqbit_core::constants::CHUNK_SIZE;
@@ -195,6 +198,26 @@ async fn e2e_piece_reclaim() -> anyhow::Result<()> {
     handle.with_chunk_tracker(|ct| {
         assert!(ct.get_have_pieces().as_slice()[..TOTAL_PIECES as usize].all());
     })?;
+
+    // "Everything from here on" is a natural way to ask for a tail, and the range is the
+    // caller's, not ours. It has to be clamped to the torrent: walking it to the end of
+    // u32 takes ~26 seconds in a debug build, all of it blocking the executor.
+    let started = Instant::now();
+    let dropped = handle.drop_pieces(TOTAL_PIECES - 2..u32::MAX)?;
+    let elapsed = started.elapsed();
+    assert_eq!(dropped, vec![TOTAL_PIECES - 2, TOTAL_PIECES - 1]);
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "drop_pieces to u32::MAX took {elapsed:?}"
+    );
+
+    let started = Instant::now();
+    assert_eq!(handle.reselect_pieces(0..u32::MAX)?, 2);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "reselect_pieces to u32::MAX took {elapsed:?}"
+    );
 
     Ok(())
 }
