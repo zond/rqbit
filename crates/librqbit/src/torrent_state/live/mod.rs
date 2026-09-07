@@ -846,9 +846,10 @@ impl TorrentStateLive {
         // What is left racing is a seek concurrent with this very iteration, and that one
         // is harmless: the picker's priority path ignores "dropped", so the reader pulls
         // the piece back in by itself.
+        let wanted = self.streams.wanted_ranges(&self.lengths);
         let candidates = clamp_piece_range(pieces, &self.lengths)
-            .filter_map(|id| self.lengths.validate_piece_index(id))
-            .filter(|id| !self.streams.is_piece_wanted(*id, &self.lengths));
+            .filter(|id| !wanted.iter().any(|r| r.contains(id)))
+            .filter_map(|id| self.lengths.validate_piece_index(id));
         let dropped = locked
             .get_pieces_mut()?
             .drop_pieces(&self.metadata.file_infos, candidates)?;

@@ -154,12 +154,16 @@ impl TorrentStreams {
         self.streams.iter().map(|s| s.value().file_id)
     }
 
-    // True if any live reader is about to want this piece. Dropping such a piece would
-    // just make it be re-requested at once, and stall the reader in the meantime.
-    pub(crate) fn is_piece_wanted(&self, piece_id: ValidPieceIndex, lengths: &Lengths) -> bool {
+    // The pieces every live reader is about to want, one range per stream. Dropping one of
+    // those would just make it be re-requested at once, and stall the reader in the
+    // meantime. Collected once rather than asked per piece: iterating a DashMap takes a
+    // lock and an Arc per shard, empty shards included, and a caller that checks a whole
+    // torrent's worth of pieces under the state write lock must not pay that per piece.
+    pub(crate) fn wanted_ranges(&self, lengths: &Lengths) -> Vec<std::ops::Range<u32>> {
         self.streams
             .iter()
-            .any(|s| s.value().queue_range(lengths).contains(&piece_id.get()))
+            .map(|s| s.value().queue_range(lengths))
+            .collect()
     }
 }
 
@@ -470,6 +474,42 @@ mod tests {
             waker: None,
         };
         state.queue(lengths).map(|p| p.get()).collect()
+    }
+
+    #[test]
+    fn wanted_ranges_is_one_range_per_stream() {
+        // 10 pieces of 1024 bytes each.
+        let lengths = Lengths::new(10 * 1024, 1024).unwrap();
+        let streams = TorrentStreams::default();
+        assert!(streams.wanted_ranges(&lengths).is_empty());
+
+        let state = |position: u64, lookahead_bytes: u64| StreamState {
+            file_id: 0,
+            file_len: lengths.total_length(),
+            file_abs_offset: 0,
+            position,
+            lookahead_bytes,
+            waker: None,
+        };
+        // A reader at the start with two pieces of lookahead, and one in the middle of
+        // piece 6 whose lookahead reaches into piece 8.
+        streams
+            .streams
+            .insert(streams.next_id(), state(0, 2 * 1024));
+        streams
+            .streams
+            .insert(streams.next_id(), state(6 * 1024 + 512, 2 * 1024));
+
+        let mut ranges = streams.wanted_ranges(&lengths);
+        ranges.sort_by_key(|r| r.start);
+        assert_eq!(ranges, vec![0..2, 6..9]);
+
+        // Which is what the per-piece question used to answer.
+        let wanted = |id: u32| ranges.iter().any(|r| r.contains(&id));
+        assert_eq!(
+            (0..10).filter(|id| wanted(*id)).collect::<Vec<_>>(),
+            vec![0, 1, 6, 7, 8]
+        );
     }
 
     #[test]
