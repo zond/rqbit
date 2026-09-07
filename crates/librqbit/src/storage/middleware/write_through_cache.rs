@@ -55,6 +55,14 @@ impl<U: StorageFactory + Clone> StorageFactory for WriteThroughCacheStorageFacto
         })
     }
 
+    fn is_type_id(&self, type_id: std::any::TypeId) -> bool {
+        self.underlying.is_type_id(type_id)
+    }
+
+    fn ensure_persistable(&self) -> anyhow::Result<()> {
+        self.underlying.ensure_persistable()
+    }
+
     fn clone_box(&self) -> crate::storage::BoxStorageFactory {
         self.clone().boxed()
     }
