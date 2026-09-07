@@ -30,6 +30,29 @@ pub struct StreamQueryParams {
     lookahead_bytes: Option<u64>,
 }
 
+/// The most lookahead a request may ask for.
+///
+/// The lookahead is a buffering window, and it does two things to every piece it covers:
+/// puts it in the picker's priority set, and keeps it from being reclaimed (see
+/// [`crate::ManagedTorrent::drop_pieces`]) for as long as the stream is open. Left to the
+/// file length, one request could pin a whole file with `lookahead_bytes=<huge>`. A GiB is
+/// well past anything a player buffers, and a library caller with a real reason to want
+/// more still has [`crate::Api::api_stream_with_options`], which this doesn't bound.
+const MAX_LOOKAHEAD_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn stream_options(query: &StreamQueryParams) -> Result<FileStreamOptions> {
+    match query.lookahead_bytes {
+        Some(0) => Err(anyhow::anyhow!("lookahead_bytes must be positive"))
+            .with_status(StatusCode::BAD_REQUEST),
+        Some(lookahead_bytes) if lookahead_bytes > MAX_LOOKAHEAD_BYTES => Err(anyhow::anyhow!(
+            "lookahead_bytes must be at most {MAX_LOOKAHEAD_BYTES}"
+        ))
+        .with_status(StatusCode::BAD_REQUEST),
+        Some(lookahead_bytes) => Ok(FileStreamOptions { lookahead_bytes }),
+        None => Ok(FileStreamOptions::default()),
+    }
+}
+
 pub async fn h_torrent_stream_file(
     State(state): State<ApiState>,
     Path(StreamPathParams { id, file_id, .. }): Path<StreamPathParams>,
@@ -37,14 +60,7 @@ pub async fn h_torrent_stream_file(
     headers: http::HeaderMap,
 ) -> Result<impl IntoResponse> {
     trace!(?id, ?file_id, "acquiring stream");
-    let options = match query.lookahead_bytes {
-        Some(0) => {
-            return Err(anyhow::anyhow!("lookahead_bytes must be positive"))
-                .with_status(StatusCode::BAD_REQUEST);
-        }
-        Some(lookahead_bytes) => FileStreamOptions { lookahead_bytes },
-        None => FileStreamOptions::default(),
-    };
+    let options = stream_options(&query)?;
     let mut stream = state
         .api
         .api_stream_with_options(id, file_id, options)
@@ -139,4 +155,39 @@ pub async fn h_torrent_stream_file(
 
     let s = tokio_util::io::ReaderStream::with_capacity(stream, 65536);
     Ok((status, (output_headers, axum::body::Body::from_stream(s))))
+}
+
+#[cfg(test)]
+mod tests {
+    use http::StatusCode;
+
+    use super::{MAX_LOOKAHEAD_BYTES, StreamQueryParams, stream_options};
+    use crate::DEFAULT_STREAM_LOOKAHEAD_BYTES;
+
+    fn lookahead(lookahead_bytes: Option<u64>) -> Result<u64, StatusCode> {
+        stream_options(&StreamQueryParams { lookahead_bytes })
+            .map(|o| o.lookahead_bytes)
+            .map_err(|e| e.status())
+    }
+
+    // The query string is untrusted input, and the lookahead it asks for is what the
+    // reclaim guard and the piece picker see. Bound it here; the library API stays as
+    // it is for callers that mean it.
+    #[test]
+    fn test_lookahead_bytes_is_bounded() {
+        assert_eq!(lookahead(None), Ok(DEFAULT_STREAM_LOOKAHEAD_BYTES));
+        assert_eq!(lookahead(Some(1)), Ok(1));
+        assert_eq!(
+            lookahead(Some(MAX_LOOKAHEAD_BYTES)),
+            Ok(MAX_LOOKAHEAD_BYTES)
+        );
+
+        // Zero and too much are both refused, and refused as the client's mistake.
+        assert_eq!(lookahead(Some(0)), Err(StatusCode::BAD_REQUEST));
+        assert_eq!(
+            lookahead(Some(MAX_LOOKAHEAD_BYTES + 1)),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(lookahead(Some(u64::MAX)), Err(StatusCode::BAD_REQUEST));
+    }
 }
