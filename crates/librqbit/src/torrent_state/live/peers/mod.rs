@@ -111,7 +111,20 @@ impl PeerStates {
     }
 
     pub fn drop_peer(&self, handle: PeerHandle) -> Option<Peer> {
-        let p = self.states.remove(&handle).map(|r| r.1)?;
+        self.drop_peer_if(handle, |_| true)
+    }
+
+    /// [`Self::drop_peer`], but only if `pred` holds for the peer -- checked under the
+    /// entry's lock, so a peer that changed state since the caller looked stays.
+    pub fn drop_peer_if(
+        &self,
+        handle: PeerHandle,
+        pred: impl FnOnce(&Peer) -> bool,
+    ) -> Option<Peer> {
+        let p = self
+            .states
+            .remove_if(&handle, |_, p| pred(p))
+            .map(|r| r.1)?;
         let s = p.get_state();
         self.stats.dec(s);
         self.session_stats.dec(s);

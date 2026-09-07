@@ -522,6 +522,11 @@ impl ChunkTracker {
         self.have.as_slice()[id.get() as usize]
     }
 
+    /// The pieces still to be downloaded: selected, not yet have, not in flight.
+    pub(crate) fn get_queue_pieces(&self) -> &BF {
+        &self.queue_pieces
+    }
+
     pub(crate) fn is_piece_queued(&self, id: ValidPieceIndex) -> bool {
         self.queue_pieces[id.get() as usize]
     }

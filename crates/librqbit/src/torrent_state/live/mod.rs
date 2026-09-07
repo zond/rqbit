@@ -51,7 +51,7 @@ use std::{
     ops::{Deref, DerefMut, Range},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -267,6 +267,12 @@ pub struct TorrentStateLive {
 
     // Limits how many active (occupying network resources) peers there are at a moment in time.
     peer_semaphore: Arc<Semaphore>,
+    // The cap `peer_semaphore` enforces (see `set_peer_limit`). Invariant: the semaphore's
+    // permits (available plus held) minus `peer_permits_to_forget` equal this.
+    peer_limit: AtomicUsize,
+    // Permits a lowered cap could not take from the semaphore because peers held them: each
+    // is forgotten instead of released when its peer dies (`release_peer_permit`).
+    peer_permits_to_forget: AtomicUsize,
 
     // The queue for peer manager to connect to them.
     peer_queue_tx: UnboundedSender<SocketAddr>,
@@ -324,6 +330,7 @@ impl TorrentStateLive {
         };
 
         let (have_broadcast_tx, _) = tokio::sync::broadcast::channel(128);
+        let peer_limit = paused.shared.peer_limit();
 
         let (ratelimit_upload_tx, ratelimit_upload_rx) = tokio::sync::mpsc::unbounded_channel::<(
             tokio::sync::mpsc::UnboundedSender<WriterRequest>,
@@ -352,9 +359,9 @@ impl TorrentStateLive {
                 ..Default::default()
             },
             lengths,
-            peer_semaphore: Arc::new(Semaphore::new(
-                paused.shared.options.peer_limit.unwrap_or(128),
-            )),
+            peer_semaphore: Arc::new(Semaphore::new(peer_limit)),
+            peer_limit: AtomicUsize::new(peer_limit),
+            peer_permits_to_forget: AtomicUsize::new(0),
             new_pieces_notify: Notify::new(),
             peer_queue_tx,
             finished_notify: Notify::new(),
@@ -612,7 +619,7 @@ impl TorrentStateLive {
                 handler.on_peer_died(Some(e))?;
             }
         };
-        drop(permit);
+        self.release_peer_permit(permit);
         Ok(())
     }
 
@@ -686,7 +693,7 @@ impl TorrentStateLive {
                 handler.on_peer_died(Some(e))?;
             }
         }
-        drop(permit);
+        state.release_peer_permit(permit);
         Ok(())
     }
 
@@ -1067,6 +1074,162 @@ impl TorrentStateLive {
             }
         }
         Ok(())
+    }
+
+    /// How many peers this torrent keeps connected (or connecting) at once.
+    pub fn peer_limit(&self) -> usize {
+        self.peer_limit.load(Ordering::Acquire)
+    }
+
+    /// Change the live-peer cap of a running torrent.
+    ///
+    /// Raising it hands the peer adder that many more permits and re-queues the peers a
+    /// lower cap parked (`NotNeeded`), so they are the first to come back. Lowering it takes
+    /// the spare permits away at once and, if more peers are connected than the new cap has
+    /// room for, disconnects the surplus -- least useful first: peers still connecting, then
+    /// peers that have nothing we need and want nothing from us, the fewest bytes exchanged
+    /// first among equals -- and forgets their permits as they come back instead of
+    /// releasing them. A peer asked to go ends like one we drop after finishing: its
+    /// in-flight pieces return to the queue and it stays in the table as `NotNeeded`, so
+    /// nothing re-dials it until the cap is raised; incoming connections beyond the cap are
+    /// refused as before. Until the surplus has actually hung up, live peers exceed the cap
+    /// by that many, and no more.
+    ///
+    /// Idempotent and cheap: no I/O, the state lock is taken only to read the queue of
+    /// pieces still needed, and never while the peer table is touched.
+    pub fn set_peer_limit(&self, limit: usize) {
+        let prev = self.peer_limit.swap(limit, Ordering::AcqRel);
+        if limit > prev {
+            // A lower cap may still be waiting to collect permits from dying peers; those
+            // debts are simply written off before any new permit is issued.
+            let add = limit - prev;
+            let written_off = sub_saturating(&self.peer_permits_to_forget, add);
+            if add > written_off {
+                self.peer_semaphore.add_permits(add - written_off);
+            }
+            self.reconnect_all_not_needed_peers();
+        } else if limit < prev {
+            let remove = prev - limit;
+            // Book the debt first, then take what is not out on loan right away. A peer
+            // dying in between forgets its permit against the debt, in which case the
+            // semaphore was drained by more than it owed: hand the difference back.
+            self.peer_permits_to_forget
+                .fetch_add(remove, Ordering::AcqRel);
+            let forgotten = self.peer_semaphore.forget_permits(remove);
+            let over = forgotten - sub_saturating(&self.peer_permits_to_forget, forgotten);
+            if over > 0 {
+                self.peer_semaphore.add_permits(over);
+            }
+            self.disconnect_surplus_peers(limit);
+        }
+    }
+
+    /// A peer task is done with its permit: pay it into the debt a lowered cap left, or
+    /// give it back to the semaphore.
+    fn release_peer_permit(&self, permit: OwnedSemaphorePermit) {
+        if sub_saturating(&self.peer_permits_to_forget, 1) == 1 {
+            permit.forget();
+        } else {
+            drop(permit);
+        }
+    }
+
+    /// Hang up on the peers a cap of `limit` has no room for, least useful first (see
+    /// `set_peer_limit`), the way a peer we no longer need after finishing is dropped: parked
+    /// as `NotNeeded` first, then asked to disconnect. Its task ends on the request, and
+    /// `on_peer_died` finds it parked, hands back the pieces it had in flight and returns its
+    /// permit. A peer still connecting is parked the same way: the handshake then finds no
+    /// `Connecting` state to promote and the queued request closes the writer.
+    fn disconnect_surplus_peers(&self, limit: usize) {
+        // Read the queue of pieces still needed first, and let go of the state lock before
+        // the table is touched (see `PeerTable` for the lock order).
+        let needed: Option<BF> = self
+            .lock_read("disconnect_surplus_peers")
+            .get_chunks()
+            .ok()
+            .map(|chunks| chunks.get_queue_pieces().clone());
+        let has_needed_piece = |bitfield: &BF| {
+            needed.as_ref().is_some_and(|needed| {
+                needed
+                    .iter_ones()
+                    .any(|index| bitfield.get(index).is_some_and(|bit| *bit))
+            })
+        };
+
+        // (is live, is useful, bytes exchanged, addr): sorted ascending, the front is the
+        // least worth keeping. A peer we are still connecting to has proven nothing; a
+        // live one is useful if it wants what we have or has what we want.
+        let mut ranked: Vec<(bool, bool, u64, SocketAddr)> = Vec::new();
+        for pe in self.peers.states.iter() {
+            let peer = pe.value();
+            match peer.get_state() {
+                PeerState::Connecting(_) => ranked.push((false, false, 0, peer.addr)),
+                PeerState::Live(live) => {
+                    let counters = &peer.stats.counters;
+                    let bytes = counters.fetched_bytes.load(Ordering::Relaxed)
+                        + counters.uploaded_bytes.load(Ordering::Relaxed);
+                    let useful = live.peer_interested || has_needed_piece(&live.bitfield);
+                    ranked.push((true, useful, bytes, peer.addr));
+                }
+                _ => {}
+            }
+        }
+        let surplus = ranked.len().saturating_sub(limit);
+        if surplus == 0 {
+            return;
+        }
+        ranked.sort_unstable();
+        let mut parked = 0usize;
+        for (_, _, _, addr) in ranked.into_iter().take(surplus) {
+            self.peers
+                .with_peer_mut(addr, "disconnect_surplus_peers", |peer| {
+                    // Gone or changed since the ranking: nothing to hang up on.
+                    if !matches!(
+                        peer.get_state(),
+                        PeerState::Live(_) | PeerState::Connecting(_)
+                    ) {
+                        return;
+                    }
+                    let tx = match peer.set_not_needed(&self.peers) {
+                        PeerState::Live(live) => live.tx,
+                        PeerState::Connecting(tx) => tx,
+                        _ => return,
+                    };
+                    let _ = tx.send(WriterRequest::Disconnect(Ok(())));
+                    parked += 1;
+                });
+        }
+        debug!(
+            limit,
+            parked, "peer limit lowered, disconnecting the surplus"
+        );
+    }
+
+    /// Drop from the peer table every peer we are neither talking to nor about to: the ones
+    /// that died and are waiting out a backoff (`Dead`) and the ones we hung up on because
+    /// there was nothing to exchange (`NotNeeded`). Returns how many.
+    ///
+    /// The table otherwise keeps every address a tracker, the DHT or PEX ever named for as
+    /// long as the torrent is live -- thousands after a download from a busy swarm, each
+    /// with its counters and backoff state. A forgotten peer comes back, with a fresh
+    /// backoff, the next time a source names it or it dials us; a dead peer's pending
+    /// reconnect finds no entry and does nothing. Call it before lowering the peer limit
+    /// rather than after, or the peers the lower cap parks are forgotten too and a later
+    /// raise has nothing to re-queue.
+    pub fn forget_disconnected_peers(&self) -> usize {
+        let is_disconnected =
+            |peer: &Peer| matches!(peer.get_state(), PeerState::Dead | PeerState::NotNeeded);
+        let candidates: Vec<SocketAddr> = self
+            .peers
+            .states
+            .iter()
+            .filter(|pe| is_disconnected(pe.value()))
+            .map(|pe| pe.value().addr)
+            .collect();
+        candidates
+            .into_iter()
+            .filter(|addr| self.peers.drop_peer_if(*addr, is_disconnected).is_some())
+            .count()
     }
 
     fn disconnect_all_peers_that_have_full_torrent(&self) {
@@ -1491,6 +1654,22 @@ impl PeerHandler {
             PeerState::NotNeeded => {
                 // Restore it as std::mem::take() replaced it above.
                 pe.value_mut().set_state(PeerState::NotNeeded, peers);
+                // Parked while it was live -- a lowered peer limit does that -- it may still
+                // own pieces in flight; hand them back or nobody else gets to download them.
+                // Not fatal if the chunk tracker is gone: the torrent is being paused.
+                let released = self
+                    .state
+                    .lock_write("release_parked_peer_pieces")
+                    .get_pieces_mut()
+                    .map(|pieces| pieces.release_pieces_owned_by(self.addr))
+                    .unwrap_or(0);
+                if released > 0 {
+                    trace!(
+                        released,
+                        "parked peer died, released its in-flight pieces back to queue"
+                    );
+                    self.state.new_pieces_notify.notify_waiters();
+                }
                 return Ok(());
             }
             s @ PeerState::Queued | s @ PeerState::Dead => {
@@ -2292,6 +2471,16 @@ impl PeerHandler {
             notify.notify_waiters();
         }
     }
+}
+
+/// Subtract up to `by` from `counter`, stopping at zero; returns how much was subtracted.
+fn sub_saturating(counter: &AtomicUsize, by: usize) -> usize {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            Some(current.saturating_sub(by))
+        })
+        .map(|previous| previous.min(by))
+        .unwrap_or(0)
 }
 
 fn format_peer_client_name(value: &ByteBuf<'_>) -> Option<String> {

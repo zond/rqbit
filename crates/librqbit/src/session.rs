@@ -1399,11 +1399,15 @@ impl Session {
                     output_folder,
                     ratelimits: opts.ratelimits,
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
-                    peer_limit: opts.peer_limit.or(self.peer_limit),
                     piece_reclaim: opts.piece_reclaim,
                     #[cfg(feature = "disable-upload")]
                     _disable_upload: self._disable_upload,
                 },
+                peer_limit: AtomicUsize::new(
+                    opts.peer_limit
+                        .or(self.peer_limit)
+                        .unwrap_or(crate::torrent_state::DEFAULT_PEER_LIMIT),
+                ),
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),
                 magnet_name: name,

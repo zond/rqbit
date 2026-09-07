@@ -11,7 +11,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Weak;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -98,6 +98,10 @@ impl ManagedTorrentState {
     }
 }
 
+/// How many peers a torrent keeps connected (or connecting) at once when nothing
+/// says otherwise: neither `SessionOptions::peer_limit` nor `AddTorrentOptions::peer_limit`.
+pub const DEFAULT_PEER_LIMIT: usize = 128;
+
 pub(crate) struct ManagedTorrentLocked {
     // The torrent might not be in "paused" state technically,
     // but the intention might be for it to stay paused.
@@ -117,7 +121,6 @@ pub(crate) struct ManagedTorrentOptions {
     pub output_folder: PathBuf,
     pub ratelimits: LimitsConfig,
     pub initial_peers: Vec<SocketAddr>,
-    pub peer_limit: Option<usize>,
     pub piece_reclaim: bool,
     #[cfg(feature = "disable-upload")]
     pub _disable_upload: bool,
@@ -188,6 +191,9 @@ pub struct ManagedTorrentShared {
     pub peer_id: Id20,
     pub span: tracing::Span,
     pub(crate) options: ManagedTorrentOptions,
+    /// The live-peer cap in force: `options.peer_limit` (or [`DEFAULT_PEER_LIMIT`]) until
+    /// [`ManagedTorrent::set_peer_limit`] changes it. Read when the torrent goes live.
+    pub(crate) peer_limit: AtomicUsize,
     pub(crate) connector: Arc<StreamConnector>,
     pub(crate) storage_factory: BoxStorageFactory,
     pub(crate) session: Weak<Session>,
@@ -201,6 +207,11 @@ pub struct ManagedTorrentShared {
 impl ManagedTorrentShared {
     pub(crate) fn client_name_and_version(&self) -> &str {
         &self.client_name_and_version
+    }
+
+    /// The live-peer cap in force for this torrent (see [`ManagedTorrent::set_peer_limit`]).
+    pub fn peer_limit(&self) -> usize {
+        self.peer_limit.load(Ordering::Relaxed)
     }
 }
 
@@ -442,6 +453,18 @@ impl ManagedTorrent {
             ManagedTorrentState::Live(live) => live.reselect_pieces(pieces),
             ManagedTorrentState::Paused(paused) => paused.reselect_pieces(pieces),
             state => bail!("torrent is neither live nor paused: {}", state.name()),
+        }
+    }
+
+    /// Change how many peers this torrent keeps connected at once, now and whenever it
+    /// (re)starts. On a live torrent this takes effect immediately, disconnecting the surplus
+    /// if there is one -- see [`TorrentStateLive::set_peer_limit`] for the details; on a
+    /// torrent in any other state it is the cap the next live state opens with. Idempotent
+    /// and cheap.
+    pub fn set_peer_limit(&self, limit: usize) {
+        self.shared.peer_limit.store(limit, Ordering::Relaxed);
+        if let Some(live) = self.live() {
+            live.set_peer_limit(limit);
         }
     }
 
