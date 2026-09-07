@@ -212,6 +212,48 @@ async fn test_e2e_unadvertised_pieces() -> anyhow::Result<()> {
     timeout(Duration::from_secs(120), e2e_unadvertised_pieces()).await?
 }
 
+// The hook a caller has when the set has to be in force before the torrent says anything:
+// pause it, hold the pieces back, unpause. The set lives in the chunk tracker, which is
+// what a pause keeps, so the first bitfield after unpausing is already short.
+async fn e2e_unadvertised_pieces_applied_while_paused() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (_files, torrent_bytes, (seeder_session, seeder), addr) =
+        seeder("test_unadvertised_pieces_paused").await?;
+
+    seeder_session.pause(&seeder).await?;
+    assert!(seeder.is_paused());
+    // Nobody to tell and nothing to tell them on: a paused torrent has no peers.
+    assert_eq!(
+        seeder.set_pieces_advertised(HELD_BACK, false)?,
+        HELD_BACK.len()
+    );
+    seeder_session.unpause(&seeder).await?;
+    timeout(Duration::from_secs(30), seeder.wait_until_completed()).await??;
+
+    let leecher_dir = TempDir::with_prefix("test_unadvertised_pieces_paused_leecher")?;
+    let (_leecher_session, leecher) = leecher(&leecher_dir, &torrent_bytes, addr).await?;
+
+    let advertised = (HELD_BACK.end..TOTAL_PIECES).collect::<Vec<_>>();
+    wait_for_pieces(&leecher, &advertised).await?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        have_pieces(&leecher)?,
+        advertised,
+        "the peer got a piece held back before the torrent was ever live"
+    );
+    assert!(!leecher.stats().finished);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_unadvertised_pieces_applied_while_paused() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_unadvertised_pieces_applied_while_paused(),
+    )
+    .await?
+}
+
 // How many times we have dialled this peer, and how many times talking to it went wrong.
 // A peer we learn from over the connection we already had moves neither.
 fn peer_connection_counters(
