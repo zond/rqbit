@@ -104,6 +104,18 @@ pub struct PieceChunkProgress {
     pub verified: bool,
 }
 
+/// What [`ChunkTracker::reselect_pieces`] changed.
+#[derive(Default, Debug, PartialEq, Eq, Clone, Copy)]
+pub struct Reselected {
+    /// How many pieces stopped being dropped, i.e. are wanted again.
+    pub reselected: usize,
+    /// How many of those actually went back into the download queue. Fewer than
+    /// `reselected` when the user has deselected the file a piece lives in: it is wanted
+    /// again, but there is nothing a peer can do about it, so waking peers for it would
+    /// be a wake-up with no work behind it.
+    pub queued: usize,
+}
+
 // Compute the have-status of chunks.
 //
 // Save as "have_pieces", but there's one bit per chunk (not per piece).
@@ -281,21 +293,21 @@ impl ChunkTracker {
     }
 
     /// Make previously dropped pieces wanted again, e.g. after seeking backwards into a
-    /// range we reclaimed. Pieces that weren't dropped are left alone. Returns how many
-    /// pieces stopped being dropped.
+    /// range we reclaimed. Pieces that weren't dropped are left alone. Returns what
+    /// changed: see [`Reselected`].
     pub fn reselect_pieces(
         &mut self,
         pieces: impl IntoIterator<Item = ValidPieceIndex>,
-    ) -> crate::Result<usize> {
+    ) -> crate::Result<Reselected> {
         if self.dropped.is_none() {
             return Err(Error::PieceReclaimDisabled);
         }
-        let mut count = 0;
+        let mut res = Reselected::default();
         for id in pieces {
             if !self.undrop_piece(id) {
                 continue;
             }
-            count += 1;
+            res.reselected += 1;
             // Only queue it if the user still wants the file it lives in. Queuing
             // unconditionally would break "queued is a subset of selected or have" and
             // download a file the user deselected - the same invariant update_only_files
@@ -303,9 +315,10 @@ impl ChunkTracker {
             if self.selected[id.get() as usize] {
                 // Puts it back in the queue and resets its chunks.
                 self.mark_piece_broken_if_not_have(id);
+                res.queued += 1;
             }
         }
-        Ok(count)
+        Ok(res)
     }
 
     // Returns true if the piece was dropped, i.e. if we had it.
@@ -1042,7 +1055,11 @@ mod piece_reclaim_tests {
     use std::collections::HashSet;
 
     use crate::{
-        Error, bitv::BitV, chunk_tracker::HaveNeededSelected, file_info::FileInfo, type_aliases::BF,
+        Error,
+        bitv::BitV,
+        chunk_tracker::{HaveNeededSelected, Reselected},
+        file_info::FileInfo,
+        type_aliases::BF,
     };
 
     use super::ChunkTracker;
@@ -1286,7 +1303,13 @@ mod piece_reclaim_tests {
         ct.drop_pieces(&fi, [piece(&l, 0), piece(&l, 1)]).unwrap();
         assert_eq!(queued(&ct), Vec::<usize>::new());
 
-        assert_eq!(ct.reselect_pieces([piece(&l, 0)]).unwrap(), 1);
+        assert_eq!(
+            ct.reselect_pieces([piece(&l, 0)]).unwrap(),
+            Reselected {
+                reselected: 1,
+                queued: 1
+            }
+        );
         assert!(!ct.is_piece_dropped(piece(&l, 0)));
         assert_eq!(queued(&ct), vec![0]);
         assert!(!ct.is_finished());
@@ -1300,7 +1323,10 @@ mod piece_reclaim_tests {
         );
 
         // Reselecting something that wasn't dropped does nothing.
-        assert_eq!(ct.reselect_pieces([piece(&l, 0), piece(&l, 2)]).unwrap(), 0);
+        assert_eq!(
+            ct.reselect_pieces([piece(&l, 0), piece(&l, 2)]).unwrap(),
+            Reselected::default()
+        );
         assert_eq!(queued(&ct), vec![0]);
 
         // Downloading it again restores everything.
@@ -1340,8 +1366,16 @@ mod piece_reclaim_tests {
         assert_eq!(selected(&ct), vec![0, 1]);
         assert!(ct.is_piece_dropped(piece(&l, 2)));
 
-        // Undropping it must not make it wanted: the user doesn't want that file.
-        assert_eq!(ct.reselect_pieces([piece(&l, 2)]).unwrap(), 1);
+        // Undropping it must not make it wanted: the user doesn't want that file. It is
+        // also not queued, and the caller has to be able to tell: waking every peer for a
+        // piece that nobody can download is a wake-up with no work behind it.
+        assert_eq!(
+            ct.reselect_pieces([piece(&l, 2)]).unwrap(),
+            Reselected {
+                reselected: 1,
+                queued: 0
+            }
+        );
         assert!(!ct.is_piece_dropped(piece(&l, 2)));
         assert_eq!(selected(&ct), vec![0, 1]);
         assert_eq!(queued(&ct), Vec::<usize>::new());
