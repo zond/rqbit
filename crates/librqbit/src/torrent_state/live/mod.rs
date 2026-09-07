@@ -1376,6 +1376,12 @@ impl TorrentStateLive {
     /// rather than after, or the peers the lower cap parks are forgotten too and a later
     /// raise has none of them to re-queue -- on a torrent with no tracker and no DHT, that
     /// loses them for good.
+    ///
+    /// It does not collect addresses still waiting to be dialled, which nothing else
+    /// collects either: the address may be in the peer adder's queue, and dropping the
+    /// entry from under it would leave the adder with a slot and nothing to spend it on.
+    /// So a torrent left at a low cap in a busy swarm does still accumulate `Queued`
+    /// entries -- a few hundred bytes each -- for as long as it stays live.
     pub fn forget_disconnected_peers(&self) -> usize {
         let is_disconnected =
             |peer: &Peer| matches!(peer.get_state(), PeerState::Dead | PeerState::NotNeeded);
