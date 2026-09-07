@@ -1145,8 +1145,9 @@ impl TorrentStateLive {
     /// instead of releasing them. A peer asked to go ends like one we drop after finishing:
     /// its in-flight pieces return to the queue and it stays in the table as `NotNeeded`, so
     /// nothing re-dials it until the cap is raised; incoming connections beyond the cap are
-    /// refused as before. Until the surplus has actually hung up, live peers exceed the cap
-    /// by that many, and no more.
+    /// refused as before. Live peers exceed the cap by the number still hanging up, and by
+    /// no more than that: a dial in flight holds its slot from the moment it takes it, so
+    /// the ranking sees every peer that holds one.
     ///
     /// Raising it hands the peer adder that many more permits and puts the parked peers back
     /// in the queue to be dialled -- but not at the front of it. See
@@ -1154,6 +1155,13 @@ impl TorrentStateLive {
     /// running they queue behind whatever addresses piled up while the cap was low, so they
     /// come back over the following seconds rather than at once. Handing them back their old
     /// slots would need a queue with a front, which that is not.
+    ///
+    /// Only peers we have an address to dial come back that way -- one we dialled ourselves,
+    /// or one that named its listening port in the extended handshake. A peer that dialled
+    /// us from an ephemeral port has no dialable address at all, so the raise cannot ask for
+    /// it; it returns when it dials us again, which the restored permits let it do at once.
+    /// rqbit does not send its own listening port in that handshake, so between two rqbit
+    /// nodes this is the case on the seeding side of every connection.
     ///
     /// Idempotent, and no I/O: the state lock is taken only to read the queue of pieces
     /// still needed, and never while the peer table is touched. Lowering walks the peer
@@ -1338,7 +1346,8 @@ impl TorrentStateLive {
     /// backoff, the next time a source names it or it dials us; a dead peer's pending
     /// reconnect finds no entry and does nothing. Call it before lowering the peer limit
     /// rather than after, or the peers the lower cap parks are forgotten too and a later
-    /// raise has nothing to re-queue.
+    /// raise has none of them to re-queue -- on a torrent with no tracker and no DHT, that
+    /// loses them for good.
     pub fn forget_disconnected_peers(&self) -> usize {
         let is_disconnected =
             |peer: &Peer| matches!(peer.get_state(), PeerState::Dead | PeerState::NotNeeded);

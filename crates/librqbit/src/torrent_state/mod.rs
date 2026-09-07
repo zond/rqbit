@@ -98,8 +98,9 @@ impl ManagedTorrentState {
     }
 }
 
-/// How many peers a torrent keeps connected (or connecting) at once when nothing
-/// says otherwise: neither `SessionOptions::peer_limit` nor `AddTorrentOptions::peer_limit`.
+/// How many peers a torrent keeps connected (or connecting) at once when nothing says
+/// otherwise: neither [`crate::AddTorrentOptions::peer_limit`] nor
+/// [`crate::SessionOptions::peer_limit`].
 pub const DEFAULT_PEER_LIMIT: usize = 128;
 
 pub(crate) struct ManagedTorrentLocked {
@@ -191,7 +192,8 @@ pub struct ManagedTorrentShared {
     pub peer_id: Id20,
     pub span: tracing::Span,
     pub(crate) options: ManagedTorrentOptions,
-    /// The live-peer cap in force: `options.peer_limit` (or [`DEFAULT_PEER_LIMIT`]) until
+    /// The live-peer cap in force: [`crate::AddTorrentOptions::peer_limit`], else
+    /// [`crate::SessionOptions::peer_limit`], else [`DEFAULT_PEER_LIMIT`] -- until
     /// [`ManagedTorrent::set_peer_limit`] changes it. Read when the torrent goes live.
     pub(crate) peer_limit: AtomicUsize,
     pub(crate) connector: Arc<StreamConnector>,
@@ -457,10 +459,30 @@ impl ManagedTorrent {
     }
 
     /// Change how many peers this torrent keeps connected at once, now and whenever it
-    /// (re)starts. On a live torrent this takes effect immediately, disconnecting the surplus
-    /// if there is one -- see [`TorrentStateLive::set_peer_limit`] for the details; on a
-    /// torrent in any other state it is the cap the next live state opens with. Idempotent
-    /// and cheap.
+    /// (re)starts.
+    ///
+    /// On a live torrent it takes effect immediately. Lowering it hangs up on the surplus,
+    /// least useful first -- a peer still connecting before one that is talking to us, and
+    /// among those the one that has moved fewest bytes lately, in either direction. Parked
+    /// peers stay in the table and nothing re-dials them until the cap goes back up.
+    /// Raising it hands the slots back, so incoming connections are accepted again at once,
+    /// and re-queues every parked peer we have an address to dial -- one we dialled
+    /// ourselves, or one that told us where it listens. A peer that dialled us and did not
+    /// say has no such address, and comes back only when it dials us again. Read the cap
+    /// back with [`ManagedTorrentShared::peer_limit`].
+    ///
+    /// On a torrent in any other state it is the cap the next live state opens with.
+    ///
+    /// # Memory
+    ///
+    /// A peer costs about 48 KB of read and write buffers while it is connected, and
+    /// hanging up on it frees them -- to the allocator. Whether the process gives the
+    /// pages back to the OS is the allocator's decision and not this call's: measured on
+    /// x86-64 Linux, dropping from 40 peers to 4 moved resident memory by nothing at all
+    /// under either glibc or mimalloc, and glibc gave 4 MB back only when asked directly
+    /// with `malloc_trim(0)`. What lowering the cap does buy, on every allocator, is
+    /// sockets, file descriptors, tasks, CPU and bandwidth. An embedder that needs the
+    /// resident memory back has to ask its allocator for it.
     pub fn set_peer_limit(&self, limit: usize) {
         self.shared.peer_limit.store(limit, Ordering::Relaxed);
         if let Some(live) = self.live() {
