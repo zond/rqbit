@@ -1123,8 +1123,11 @@ impl TorrentStateLive {
     /// come back over the following seconds rather than at once. Handing them back their old
     /// slots would need a queue with a front, which that is not.
     ///
-    /// Idempotent and cheap: no I/O, the state lock is taken only to read the queue of
-    /// pieces still needed, and never while the peer table is touched.
+    /// Idempotent, and no I/O: the state lock is taken only to read the queue of pieces
+    /// still needed, and never while the peer table is touched. Lowering walks the peer
+    /// table once, asking of each live peer whether it holds anything we still want -- a
+    /// byte-wise AND of two bitfields, so one operation per eight pieces. Raising walks it
+    /// once and pushes each parked peer onto the queue.
     pub fn set_peer_limit(&self, limit: usize) {
         let prev = self.peer_limit.swap(limit, Ordering::AcqRel);
         if limit > prev {
@@ -1177,11 +1180,9 @@ impl TorrentStateLive {
             .ok()
             .map(|chunks| chunks.get_queue_pieces().clone());
         let has_needed_piece = |bitfield: &BF| {
-            needed.as_ref().is_some_and(|needed| {
-                needed
-                    .iter_ones()
-                    .any(|index| bitfield.get(index).is_some_and(|bit| *bit))
-            })
+            needed
+                .as_ref()
+                .is_some_and(|n| has_any_needed_piece(n, bitfield))
         };
 
         let mut ranked: Vec<(SurplusRank, SocketAddr)> = Vec::new();
@@ -1221,6 +1222,20 @@ impl TorrentStateLive {
             parked, "peer limit lowered, disconnecting the surplus"
         );
     }
+}
+
+/// Does `bitfield` hold any of the pieces `needed` still wants?
+///
+/// Byte-wise, because this runs once per live peer and a season pack has a hundred
+/// thousand pieces: `domain()` hands back the underlying bytes with the partial head and
+/// tail already masked, so the answer is one AND per eight pieces instead of a random
+/// lookup per piece we still want. `zip` stops at the shorter of the two, which is what a
+/// peer whose bitfield has not arrived yet needs: length zero, holds nothing.
+fn has_any_needed_piece(needed: &BF, bitfield: &BF) -> bool {
+    needed
+        .domain()
+        .zip(bitfield.domain())
+        .any(|(needed, has)| needed & has != 0)
 }
 
 /// (talking to us, useful either way, bytes moved recently, bytes moved ever). See
@@ -2587,7 +2602,7 @@ mod tests {
     use librqbit_core::{hash_id::Id20, lengths::Lengths};
 
     use super::{
-        BF, Ordering, Peer, PeerState, WriterRequest, clamp_piece_range,
+        BF, Ordering, Peer, PeerState, WriterRequest, clamp_piece_range, has_any_needed_piece,
         peer::{LivePeerState, PeerTx},
         surplus_rank,
     };
@@ -2609,6 +2624,51 @@ mod tests {
         let r = clamp_piece_range(100..u32::MAX, &lengths);
         assert!(r.is_empty(), "{r:?}");
         assert_eq!(r.count(), 0);
+    }
+
+    /// The byte-wise overlap test answers exactly what a per-piece walk would, including
+    /// at the ragged end of the last byte and for a peer whose bitfield has not arrived.
+    #[test]
+    fn has_any_needed_piece_matches_a_piece_by_piece_walk() {
+        let naive = |needed: &BF, has: &BF| {
+            needed
+                .iter_ones()
+                .any(|index| has.get(index).is_some_and(|bit| *bit))
+        };
+        let sized = |pieces: usize, ones: &[usize]| -> BF {
+            let mut bv: bitvec::vec::BitVec<u8, bitvec::order::Msb0> =
+                bitvec::vec::BitVec::repeat(false, pieces);
+            for one in ones {
+                bv.set(*one, true);
+            }
+            bv.into_boxed_bitslice()
+        };
+
+        // 20 pieces: two full bytes and a half-used third, so the masked tail is covered.
+        for (needed, has) in [
+            (vec![0usize], vec![0usize]),
+            (vec![0], vec![1]),
+            (vec![19], vec![19]),
+            (vec![19], vec![18]),
+            (vec![3, 11, 19], vec![11]),
+            (vec![3, 11, 19], vec![2, 10, 18]),
+            (vec![], vec![7]),
+            (vec![7], vec![]),
+        ] {
+            let n = sized(20, &needed);
+            let h = sized(20, &has);
+            assert_eq!(
+                has_any_needed_piece(&n, &h),
+                naive(&n, &h),
+                "needed={needed:?} has={has:?}"
+            );
+        }
+
+        // A peer that has not sent its bitfield yet holds nothing, not everything.
+        let n = sized(20, &[0, 19]);
+        let empty = BF::default();
+        assert!(!has_any_needed_piece(&n, &empty));
+        assert_eq!(has_any_needed_piece(&n, &empty), naive(&n, &empty));
     }
 
     /// A bitfield of eight pieces holding exactly the ones listed.
