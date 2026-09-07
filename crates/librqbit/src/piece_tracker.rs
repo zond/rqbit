@@ -386,6 +386,17 @@ impl PieceTracker {
         self.chunks.update_only_files(file_infos, new_only_files)
     }
 
+    /// Hold pieces back from what we announce, or stop holding them back: see
+    /// [`ChunkTracker::set_pieces_advertised`]. Nothing to do with in-flight pieces -
+    /// what we announce and what we are downloading are separate questions.
+    pub fn set_pieces_advertised(
+        &mut self,
+        pieces: impl IntoIterator<Item = ValidPieceIndex>,
+        advertised: bool,
+    ) -> usize {
+        self.chunks.set_pieces_advertised(pieces, advertised)
+    }
+
     /// Flush the have pieces bitfield to disk.
     pub fn flush_have_pieces(&mut self, flush_async: bool) -> anyhow::Result<()> {
         self.chunks.get_have_pieces_mut().flush(flush_async)

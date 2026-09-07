@@ -4,6 +4,7 @@ mod e2e_pause;
 mod e2e_peer_limit;
 mod e2e_piece_reclaim;
 mod e2e_stream;
+mod e2e_unadvertised_pieces;
 mod lock_order;
 mod session_persistence;
 pub mod test_util;

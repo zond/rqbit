@@ -58,6 +58,26 @@ impl TorrentStatePaused {
             .reselected)
     }
 
+    /// Hold pieces back from what we announce, or put them back: see
+    /// [`crate::ManagedTorrent::set_pieces_advertised`]. Returns how many pieces changed,
+    /// and whether anything at all is still held back.
+    ///
+    /// Nobody to tell: a paused torrent has no peers. The set survives the pause - it
+    /// lives in the chunk tracker, which is what a pause keeps - so it is still in force
+    /// when the torrent goes live, and the first handshake bitfield already leaves the
+    /// held-back pieces out.
+    pub(crate) fn set_pieces_advertised(
+        &mut self,
+        pieces: Range<u32>,
+        advertised: bool,
+    ) -> (usize, bool) {
+        let lengths = *self.chunk_tracker.get_lengths();
+        let pieces =
+            clamp_piece_range(pieces, &lengths).filter_map(|id| lengths.validate_piece_index(id));
+        let changed = self.chunk_tracker.set_pieces_advertised(pieces, advertised);
+        (changed, self.chunk_tracker.has_unadvertised_pieces())
+    }
+
     /// The caller is done releasing the storage of these pieces. Nothing to wake up: a
     /// paused torrent has no peers, and unpausing picks the queue up as it finds it.
     pub(crate) fn finish_release(&mut self, pieces: &[u32]) {

@@ -1408,6 +1408,7 @@ impl Session {
                         .or(self.peer_limit)
                         .unwrap_or(crate::torrent_state::DEFAULT_PEER_LIMIT),
                 ),
+                unadvertised_pieces: Default::default(),
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),
                 magnet_name: name,

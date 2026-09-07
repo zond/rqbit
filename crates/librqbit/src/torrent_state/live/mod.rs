@@ -986,17 +986,66 @@ impl TorrentStateLive {
 
     /// Whether to tell peers we have this piece.
     ///
-    /// A Have is queued when the piece completes and can go out much later - after rate
-    /// limiting, behind whatever else that peer's writer has to send. If we dropped the
-    /// piece in between, advertising it earns us a request we cannot serve and, with no
-    /// reject-request in vanilla BitTorrent, a disconnect. Only a torrent that opted into
-    /// reclaim can lose a piece it had, so only it pays for the lock.
+    /// Two reasons to stay quiet. A Have is queued when the piece completes and can go out
+    /// much later - after rate limiting, behind whatever else that peer's writer has to
+    /// send. If we dropped the piece in between, advertising it earns us a request we
+    /// cannot serve and, with no reject-request in vanilla BitTorrent, a disconnect. And
+    /// the caller may have held the piece back on purpose - see
+    /// [`crate::ManagedTorrent::set_pieces_advertised`].
+    ///
+    /// Only a torrent that opted into reclaim can lose a piece it had, and only a torrent
+    /// that has held something back has anything to hide, so only those pay for the lock.
+    /// The `unadvertised_pieces` gate is a fast path and not the truth: it is set before
+    /// the set it summarises, so it can be true with nothing held back - which costs a
+    /// lock and answers correctly - but never false while something is.
     pub(crate) fn should_advertise_have(&self, id: ValidPieceIndex) -> bool {
-        !self.shared.options.piece_reclaim
-            || self
-                .lock_read("should_advertise_have")
-                .get_chunks()
-                .is_ok_and(|ct| ct.is_piece_have(id))
+        if !self.shared.options.piece_reclaim
+            && !self.shared.unadvertised_pieces.load(Ordering::Relaxed)
+        {
+            return true;
+        }
+        self.lock_read("should_advertise_have")
+            .get_chunks()
+            .is_ok_and(|ct| ct.is_piece_advertised(id))
+    }
+
+    /// Hold pieces back from what we announce, or put them back: see
+    /// [`crate::ManagedTorrent::set_pieces_advertised`]. Returns how many pieces changed,
+    /// and whether anything at all is still held back.
+    ///
+    /// Pieces that just became advertised and that we have get a Have, because the peers
+    /// already connected got a handshake bitfield without them and there is no other way
+    /// to tell them. Peers that connect afterwards see them in that bitfield instead.
+    pub(crate) fn set_pieces_advertised(
+        &self,
+        pieces: Range<u32>,
+        advertised: bool,
+    ) -> anyhow::Result<(usize, bool)> {
+        let ids = || {
+            clamp_piece_range(pieces.clone(), &self.lengths)
+                .filter_map(|id| self.lengths.validate_piece_index(id))
+        };
+        let mut g = self.lock_write("set_pieces_advertised");
+        let pt = g.get_pieces_mut()?;
+        // Collected before the change, while "held back" is still readable. Only the
+        // pieces that were hidden AND that we have need a Have; re-announcing the rest
+        // would be telling peers something they were already told.
+        let announce: Vec<ValidPieceIndex> = if advertised {
+            let ct = pt.chunks();
+            ids()
+                .filter(|id| ct.is_piece_have(*id) && ct.is_piece_held_back(*id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let changed = pt.set_pieces_advertised(ids(), advertised);
+        let still_held_back = pt.chunks().has_unadvertised_pieces();
+        drop(g);
+
+        for id in announce {
+            self.transmit_haves(id);
+        }
+        Ok((changed, still_held_back))
     }
 
     /// The caller is done releasing the storage of these pieces: they may be downloaded
@@ -1651,7 +1700,10 @@ impl PeerConnectionHandler for &'_ PeerHandler {
 
     fn serialize_bitfield_message_to_buf(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
         let g = self.state.lock_read("serialize_bitfield_message_to_buf");
-        let msg = Message::Bitfield(ByteBuf(g.get_chunks()?.get_have_pieces().as_bytes()));
+        // Not the have-bitfield: the pieces the caller has held back are cleared from it.
+        // A borrow of the have-bytes unless something actually is held back.
+        let advertised = g.get_chunks()?.advertised_pieces_bytes();
+        let msg = Message::Bitfield(ByteBuf(&advertised));
         let len = msg.serialize(buf, &Default::default)?;
         trace!("sending: {:?}, length={}", &msg, len);
         Ok(len)

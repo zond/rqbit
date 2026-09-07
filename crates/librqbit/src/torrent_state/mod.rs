@@ -11,7 +11,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Weak;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -196,6 +196,11 @@ pub struct ManagedTorrentShared {
     /// [`crate::SessionOptions::peer_limit`], else [`DEFAULT_PEER_LIMIT`] -- until
     /// [`ManagedTorrent::set_peer_limit`] changes it. Read when the torrent goes live.
     pub(crate) peer_limit: AtomicUsize,
+    /// Whether [`ManagedTorrent::set_pieces_advertised`] has anything held back, so the
+    /// Have path can answer "announce it" without taking the state lock when it doesn't.
+    /// A fast-path gate and not the truth - it is set before the set it summarises, so it
+    /// can be true with nothing held back, but never false while something is.
+    pub(crate) unadvertised_pieces: AtomicBool,
     pub(crate) connector: Arc<StreamConnector>,
     pub(crate) storage_factory: BoxStorageFactory,
     pub(crate) session: Weak<Session>,
@@ -443,6 +448,91 @@ impl ManagedTorrent {
                  what it has by asking the storage, so make sure it is done being deleted"
             ),
         }
+    }
+
+    /// Hold `pieces` back from what we announce to peers, or put them back.
+    ///
+    /// A held-back piece is one we may have, read and serve, but do not tell anyone
+    /// about: it is cleared from the bitfield we send on handshake, and completing it
+    /// sends no Have. Nothing else changes - we still download it, a stream still reads
+    /// it, and a peer that asks for it anyway is served, because we do have it. There is
+    /// no refusal path here and no need for one.
+    ///
+    /// A client is free to announce less than it holds; BEP-3 says what a Have and a
+    /// bitfield mean, not that every piece must produce one. This is that freedom, made
+    /// explicit and per piece.
+    ///
+    /// # What it is for
+    ///
+    /// An application that streams video and bounds its cache reclaims pieces behind the
+    /// playhead within seconds of reading them (see [`Self::drop_pieces`]). Such a piece
+    /// must be `have` while the reader is on it, or the stream cannot read it - but
+    /// announcing it invites a request for a piece we are about to throw away, so the
+    /// peer spends a round trip to be disappointed. BEP-6's Reject Request only makes
+    /// that exchange formally legal - the peer still wasted the round trip, and clients
+    /// hold a rejection against the peer that sent it. Not advertising in the first place
+    /// costs the peer nothing.
+    ///
+    /// So: hold the reclaim window back, advertise a piece once it leaves the window and
+    /// is there to stay. It is equally the answer for anything else we hold but do not
+    /// want traffic for.
+    ///
+    /// # Using it
+    ///
+    /// The set is a range at a time and idempotent, so a moving window is two calls -
+    /// advertise what the playhead has left, hold back what it has reached - each one a
+    /// bit-range fill. Returns how many pieces actually changed.
+    ///
+    /// Hold a piece back BEFORE it completes if the goal is that no Have ever goes out
+    /// for it. There is no un-Have in BitTorrent: a peer we have already told cannot be
+    /// untold, and holding the piece back afterwards only stops us repeating it to peers
+    /// that connect later.
+    ///
+    /// Putting pieces back sends a Have for each one we have and had held back, since the
+    /// peers already connected got a bitfield without them. Those go through the same
+    /// broadcast as a completed piece, which a peer far enough behind can miss - so
+    /// prefer to advertise as the window moves rather than a whole torrent at once.
+    ///
+    /// Holding back is orthogonal to having: a piece can be held back before it is
+    /// downloaded, and stays held back if it is dropped and downloaded again. It is a
+    /// policy set the caller owns, and nothing but this call changes it.
+    ///
+    /// The set is per-session and is not persisted, like the want-set of
+    /// [`Self::drop_pieces`]. It survives a pause, and is lost if the torrent is
+    /// re-checked or re-added - in which case the pieces are announced again, so re-apply
+    /// it before unpausing a torrent that must not announce them.
+    ///
+    /// Works on a live or paused torrent, needs no options to have been set, and with
+    /// nothing held back costs nothing: what we announce is then the have-set itself.
+    pub fn set_pieces_advertised(
+        &self,
+        pieces: Range<u32>,
+        advertised: bool,
+    ) -> anyhow::Result<usize> {
+        if !advertised {
+            // Before the set itself changes, never after. The gate is what lets the Have
+            // path skip the lock, and the window between the two may only cost a lock,
+            // not let out a piece the caller has just asked us to hold back.
+            self.shared
+                .unadvertised_pieces
+                .store(true, Ordering::Relaxed);
+        }
+        let mut g = self.locked.write();
+        let (changed, still_held_back) = match &mut g.state {
+            ManagedTorrentState::Live(live) => live.set_pieces_advertised(pieces, advertised)?,
+            ManagedTorrentState::Paused(paused) => paused.set_pieces_advertised(pieces, advertised),
+            state => bail!("torrent is neither live nor paused: {}", state.name()),
+        };
+        drop(g);
+        if advertised {
+            // Recomputed, not cleared: this call may have put back only part of what is
+            // held back. The Have path goes back to skipping the lock only once the set
+            // is empty again.
+            self.shared
+                .unadvertised_pieces
+                .store(still_held_back, Ordering::Relaxed);
+        }
+        Ok(changed)
     }
 
     /// Make pieces dropped by [`Self::drop_pieces`] wanted again, e.g. after seeking

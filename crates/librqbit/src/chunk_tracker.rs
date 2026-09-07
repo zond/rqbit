@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{borrow::Cow, collections::HashSet};
 
 use anyhow::Context;
 use buffers::ByteBuf;
@@ -58,6 +58,16 @@ pub struct ChunkTracker {
     // The piece-level want-set. None unless the torrent opted into piece reclaim, and
     // while it is None every path in here does exactly what it did before.
     reclaim: Option<Box<PieceReclaim>>,
+
+    // Pieces we hold back from what we announce: we may well have them, and we serve them
+    // on request, but they are cleared from the handshake bitfield and no Have goes out
+    // for them. See ManagedTorrent::set_pieces_advertised.
+    //
+    // Independent of `have`, and of `reclaim`, on purpose: this is a policy set the
+    // caller owns, so it stays put while pieces come and go underneath it. None until
+    // someone asks for it, and while it is None the advertised set IS the have-set, byte
+    // for byte, with not even an allocation between them.
+    unadvertised: Option<BF>,
 
     // How many bytes do we have per each file.
     per_file_bytes: Vec<u64>,
@@ -242,6 +252,7 @@ impl ChunkTracker {
             hns: HaveNeededSelected::default(),
             per_file_bytes: vec![0; file_infos.len()],
             reclaim: None,
+            unadvertised: None,
         };
         ct.recalculate_per_file_bytes(file_infos);
         ct.hns = ct.calc_hns();
@@ -478,6 +489,80 @@ impl ChunkTracker {
 
     pub fn get_have_pieces_mut(&mut self) -> &mut dyn BitV {
         &mut *self.have
+    }
+
+    /// Hold `pieces` back from what we announce, or stop holding them back. Returns how
+    /// many pieces changed. See [`crate::ManagedTorrent::set_pieces_advertised`] for what
+    /// this is for; this is the bookkeeping half of it, and tells nobody.
+    ///
+    /// Holding a piece back is orthogonal to having it: a piece can be held back before
+    /// it is downloaded, which is the only ordering that keeps a Have from ever going
+    /// out, and it stays held back if it is later dropped and downloaded again.
+    pub fn set_pieces_advertised(
+        &mut self,
+        pieces: impl IntoIterator<Item = ValidPieceIndex>,
+        advertised: bool,
+    ) -> usize {
+        let unadvertised = match (self.unadvertised.as_mut(), advertised) {
+            (Some(u), _) => u,
+            // Nothing has ever been held back, so there is nothing to un-hold and no
+            // reason to allocate the set.
+            (None, true) => return 0,
+            (None, false) => self.unadvertised.insert(BF::from_boxed_slice(
+                vec![0u8; self.lengths.piece_bitfield_bytes()].into_boxed_slice(),
+            )),
+        };
+        let mut changed = 0;
+        for id in pieces {
+            if unadvertised.replace(id.get() as usize, !advertised) == advertised {
+                changed += 1;
+            }
+        }
+        changed
+    }
+
+    /// True if we would announce this piece: we have it, and nobody has held it back with
+    /// [`Self::set_pieces_advertised`].
+    pub(crate) fn is_piece_advertised(&self, id: ValidPieceIndex) -> bool {
+        self.is_piece_have(id) && !self.is_piece_held_back(id)
+    }
+
+    /// True if [`Self::set_pieces_advertised`] is keeping this piece out of what we
+    /// announce, whether or not we have it.
+    pub(crate) fn is_piece_held_back(&self, id: ValidPieceIndex) -> bool {
+        self.unadvertised
+            .as_ref()
+            .is_some_and(|u| u[id.get() as usize])
+    }
+
+    /// True if any piece at all is being held back. The cheap "is this torrent using the
+    /// feature" question, so callers on a hot path can skip the rest of it.
+    pub(crate) fn has_unadvertised_pieces(&self) -> bool {
+        self.unadvertised.as_ref().is_some_and(|u| u.any())
+    }
+
+    /// The bitfield we announce: [`Self::get_have_pieces`] minus whatever is held back.
+    /// Borrowed - the have-bitfield's own bytes - unless something is actually held back,
+    /// so a torrent that never touched [`Self::set_pieces_advertised`] sends exactly the
+    /// bytes it sends today and allocates nothing on the handshake path.
+    ///
+    /// It can come out all zeroes, if everything we have is held back. That is a legal
+    /// bitfield - it is what a peer with nothing sends - and it is the truthful answer:
+    /// we are announcing nothing.
+    ///
+    /// The spare bits past the last piece stay zero, as BEP-3 requires: masking off bits
+    /// can only clear more of them.
+    pub(crate) fn advertised_pieces_bytes(&self) -> Cow<'_, [u8]> {
+        match self.unadvertised.as_ref() {
+            Some(u) if u.any() => {
+                let mut bytes = self.have.as_bytes().to_vec();
+                for (byte, mask) in bytes.iter_mut().zip(u.as_raw_slice()) {
+                    *byte &= !mask;
+                }
+                Cow::Owned(bytes)
+            }
+            _ => Cow::Borrowed(self.have.as_bytes()),
+        }
     }
 
     pub fn reserve_needed_piece(&mut self, index: ValidPieceIndex) {
@@ -1758,5 +1843,207 @@ mod piece_reclaim_tests {
         assert_eq!(ct.drop_pieces(&fi, [p2], |_| false).unwrap(), [p2]);
         assert_eq!(queued(&ct), Vec::<usize>::new());
         assert!(ct.is_finished());
+    }
+}
+
+#[cfg(test)]
+mod unadvertised_tests {
+    use librqbit_core::{
+        constants::CHUNK_SIZE,
+        lengths::{Lengths, ValidPieceIndex},
+    };
+
+    use crate::{bitv::BitV, file_info::FileInfo, type_aliases::BF};
+
+    use super::ChunkTracker;
+
+    // 12 pieces, so the advertised bitfield spans more than one byte and the trailing
+    // spare bits of the second one are exercised too.
+    const PIECE_LEN: u32 = CHUNK_SIZE;
+    const TOTAL_PIECES: u32 = 12;
+
+    fn lengths() -> Lengths {
+        let l = Lengths::new(PIECE_LEN as u64 * TOTAL_PIECES as u64, PIECE_LEN).unwrap();
+        assert_eq!(l.total_pieces(), TOTAL_PIECES);
+        assert_eq!(l.piece_bitfield_bytes(), 2);
+        l
+    }
+
+    fn file_infos(l: &Lengths) -> Vec<FileInfo> {
+        vec![FileInfo {
+            relative_filename: "0".into(),
+            offset_in_torrent: 0,
+            piece_range: 0..TOTAL_PIECES,
+            len: l.total_length(),
+            attrs: Default::default(),
+        }]
+    }
+
+    // A tracker that has every piece, as a torrent that finished downloading does.
+    fn seeding_tracker() -> (Lengths, ChunkTracker) {
+        let l = lengths();
+        let mut have = BF::from_boxed_slice(vec![0u8; l.piece_bitfield_bytes()].into_boxed_slice());
+        have.get_mut(0..TOTAL_PIECES as usize).unwrap().fill(true);
+        let mut selected =
+            BF::from_boxed_slice(vec![0u8; l.piece_bitfield_bytes()].into_boxed_slice());
+        selected
+            .get_mut(0..TOTAL_PIECES as usize)
+            .unwrap()
+            .fill(true);
+        let ct = ChunkTracker::new(have.into_dyn(), selected, l, &file_infos(&l)).unwrap();
+        (l, ct)
+    }
+
+    fn pieces(l: &Lengths, range: std::ops::Range<u32>) -> Vec<ValidPieceIndex> {
+        range
+            .filter_map(|id| l.validate_piece_index(id))
+            .collect::<Vec<_>>()
+    }
+
+    fn advertised(ct: &ChunkTracker) -> Vec<usize> {
+        let bytes = ct.advertised_pieces_bytes().into_owned();
+        BF::from_boxed_slice(bytes.into_boxed_slice())
+            .iter_ones()
+            .collect()
+    }
+
+    // The default path: a tracker nobody has held anything back on announces exactly the
+    // have-set, and does it by handing out the have-bitfield's own bytes.
+    #[test]
+    fn test_untouched_tracker_advertises_the_have_set_itself() {
+        let (l, ct) = seeding_tracker();
+        assert!(!ct.has_unadvertised_pieces());
+        assert_eq!(
+            advertised(&ct),
+            (0..TOTAL_PIECES as usize).collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            ct.advertised_pieces_bytes(),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            ct.advertised_pieces_bytes().as_ref(),
+            ct.get_have_pieces().as_bytes()
+        );
+        for id in pieces(&l, 0..TOTAL_PIECES) {
+            assert!(ct.is_piece_advertised(id), "piece {id}");
+            assert!(!ct.is_piece_held_back(id), "piece {id}");
+        }
+    }
+
+    // The whole point: have and readable, but not announced. Nothing about the have-set
+    // moves, so everything that reads or serves the piece still finds it.
+    #[test]
+    fn test_held_back_pieces_leave_the_advertised_bitfield_but_not_the_have_set() {
+        let (l, mut ct) = seeding_tracker();
+        assert_eq!(ct.set_pieces_advertised(pieces(&l, 3..6), false), 3);
+
+        assert_eq!(advertised(&ct), vec![0, 1, 2, 6, 7, 8, 9, 10, 11]);
+        assert!(ct.has_unadvertised_pieces());
+        for id in pieces(&l, 0..TOTAL_PIECES) {
+            let held_back = (3..6).contains(&id.get());
+            assert!(ct.is_piece_have(id), "piece {id} stopped being have");
+            assert_eq!(ct.is_piece_held_back(id), held_back, "piece {id}");
+            assert_eq!(ct.is_piece_advertised(id), !held_back, "piece {id}");
+        }
+        // Have is untouched: the reader, the uploader and the stats all go through this.
+        assert_eq!(
+            ct.get_have_pieces()
+                .as_slice()
+                .iter_ones()
+                .collect::<Vec<_>>(),
+            (0..TOTAL_PIECES as usize).collect::<Vec<_>>()
+        );
+        assert_eq!(ct.get_hns().have_bytes, l.total_length());
+        assert!(ct.is_finished());
+    }
+
+    // The spare bits past the last piece must stay zero (BEP-3): peers drop a connection
+    // over a bitfield with them set. Masking can only clear bits, but assert it.
+    #[test]
+    fn test_advertised_bitfield_keeps_its_spare_bits_zero() {
+        let (l, mut ct) = seeding_tracker();
+        ct.set_pieces_advertised(pieces(&l, 0..1), false);
+        let bytes = ct.advertised_pieces_bytes().into_owned();
+        assert_eq!(bytes.len(), 2);
+        // 12 pieces: the low 4 bits of the second byte are spare.
+        assert_eq!(bytes[1] & 0x0f, 0);
+    }
+
+    // A moving playback window: advertise what the playhead left, hold back what it
+    // reached. Both directions are idempotent, so the caller can be sloppy about what it
+    // has already said.
+    #[test]
+    fn test_the_set_is_a_range_at_a_time_and_idempotent() {
+        let (l, mut ct) = seeding_tracker();
+        assert_eq!(ct.set_pieces_advertised(pieces(&l, 0..4), false), 4);
+        // Saying it again changes nothing.
+        assert_eq!(ct.set_pieces_advertised(pieces(&l, 0..4), false), 0);
+        assert_eq!(advertised(&ct), vec![4, 5, 6, 7, 8, 9, 10, 11]);
+
+        // The window slides from 0..4 to 2..6.
+        assert_eq!(ct.set_pieces_advertised(pieces(&l, 0..2), true), 2);
+        assert_eq!(ct.set_pieces_advertised(pieces(&l, 4..6), false), 2);
+        assert_eq!(advertised(&ct), vec![0, 1, 6, 7, 8, 9, 10, 11]);
+
+        // And off the end of it: everything is announced again, and the tracker says so
+        // so the Have path can go back to skipping the lock.
+        assert_eq!(
+            ct.set_pieces_advertised(pieces(&l, 0..TOTAL_PIECES), true),
+            4
+        );
+        assert!(!ct.has_unadvertised_pieces());
+        assert_eq!(
+            advertised(&ct),
+            (0..TOTAL_PIECES as usize).collect::<Vec<_>>()
+        );
+    }
+
+    // Holding back is a policy set about pieces, not a fact about the have-set: it can be
+    // set before the piece exists, which is the only ordering that keeps a Have from ever
+    // going out for it.
+    #[test]
+    fn test_a_piece_can_be_held_back_before_we_have_it() {
+        let l = lengths();
+        let have = BF::from_boxed_slice(vec![0u8; l.piece_bitfield_bytes()].into_boxed_slice());
+        let mut selected =
+            BF::from_boxed_slice(vec![0u8; l.piece_bitfield_bytes()].into_boxed_slice());
+        selected
+            .get_mut(0..TOTAL_PIECES as usize)
+            .unwrap()
+            .fill(true);
+        let mut ct = ChunkTracker::new(have.into_dyn(), selected, l, &file_infos(&l)).unwrap();
+
+        let p = l.validate_piece_index(2).unwrap();
+        assert_eq!(ct.set_pieces_advertised(pieces(&l, 2..3), false), 1);
+        assert!(ct.is_piece_held_back(p));
+        assert!(!ct.is_piece_advertised(p), "we don't have it yet");
+
+        ct.mark_piece_downloaded(p, &file_infos(&l));
+        assert!(ct.is_piece_have(p));
+        assert!(
+            !ct.is_piece_advertised(p),
+            "completing it must not announce it"
+        );
+        assert_eq!(advertised(&ct), Vec::<usize>::new());
+
+        assert_eq!(ct.set_pieces_advertised(pieces(&l, 2..3), true), 1);
+        assert_eq!(advertised(&ct), vec![2]);
+    }
+
+    // Nothing has ever been held back, so there is no set to allocate and nothing to
+    // un-hold: the advertise direction stays free for callers that only ever advertise.
+    #[test]
+    fn test_advertising_an_untouched_tracker_allocates_nothing() {
+        let (l, mut ct) = seeding_tracker();
+        assert_eq!(
+            ct.set_pieces_advertised(pieces(&l, 0..TOTAL_PIECES), true),
+            0
+        );
+        assert!(ct.unadvertised.is_none());
+        assert!(matches!(
+            ct.advertised_pieces_bytes(),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 }
