@@ -216,7 +216,8 @@ pub struct ManagedTorrent {
 /// The pieces [`ManagedTorrent::drop_pieces`] dropped, and a claim on them.
 ///
 /// While this is alive nothing will download those pieces again, so their storage can be
-/// released without racing a piece coming back. Without the claim there is a window: the
+/// released without racing a piece coming back - and so can whatever a half-finished
+/// download left behind a piece we didn't have, which is in here too. Without the claim there is a window: the
 /// have-bit is cleared, but a live stream's lookahead can reach the same piece, download
 /// it and set the bit again before the caller's deletion lands - and the deletion then
 /// removes a piece we have and are advertising.
@@ -345,10 +346,10 @@ impl ManagedTorrent {
             .with_context(|| format!("piece index {piece_index} is out of range"))
     }
 
-    /// Drop the pieces in `pieces` that we currently have: forget that we have them,
-    /// stop advertising them to peers, and stop wanting them back. Returns the pieces
-    /// that were actually dropped, so the caller can release the storage behind them,
-    /// together with a claim on them - see [`DroppedPieces`].
+    /// Drop the pieces in `pieces`: forget that we have the ones we do, stop advertising
+    /// them to peers, and stop wanting them either way. Returns the pieces that were
+    /// actually dropped, so the caller can release the storage behind them, together with
+    /// a claim on them - see [`DroppedPieces`].
     ///
     /// This is bookkeeping only: it does not touch storage. Releasing a dropped piece is
     /// the caller's job, and it takes a storage that can let one piece go - one entry or
@@ -369,21 +370,38 @@ impl ManagedTorrent {
     /// disk while still seeding everything that does. Deciding *which* pieces to drop is
     /// the caller's job.
     ///
-    /// Requires `piece_reclaim` in [`crate::AddTorrentOptions`], and a live torrent.
+    /// Requires `piece_reclaim` in [`crate::AddTorrentOptions`], and a live or paused
+    /// torrent.
     ///
-    /// Pieces we don't have are skipped, and so are pieces that a live stream is about to
-    /// read - dropping those would only make them be re-requested at once.
+    /// Pieces we don't have are dropped too: a dropped piece is one we don't want, and
+    /// whether we ever had it doesn't come into that. This is what re-applies a want-set
+    /// after a restart. The want-set is per-session - see
+    /// [`crate::AddTorrentOptions::piece_reclaim`] - and the have-set a restart comes up
+    /// with is what the storage holds, holes and all, every one of them wanted; a caller
+    /// whose want-set is narrower restores the torrent paused, drops what it doesn't
+    /// want, and unpauses, so no peer gets a chance to fill a hole in between. There is
+    /// nothing of ours to release behind such a piece, but a half-finished download may
+    /// have left something, and the piece is in the returned list so that can go too.
+    ///
+    /// Skipped: pieces already dropped; pieces that a live stream is about to read -
+    /// dropping those would only make them be re-requested at once; and pieces a peer is
+    /// working on, in-flight or fully downloaded and being hash-checked, which complete
+    /// and can be dropped then.
     ///
     /// A dropped piece stays dropped until [`Self::reselect_pieces`] is called for it,
     /// the file it belongs to is re-selected through `update_only_files`, or a live
     /// stream's lookahead reaches it: a reader that seeks backwards into a reclaimed
     /// range gets it back on its own.
-    ///
-    /// NOTE: the want-set is per-session and is not persisted - see
-    /// [`crate::AddTorrentOptions::piece_reclaim`].
     pub fn drop_pieces(self: &Arc<Self>, pieces: Range<u32>) -> anyhow::Result<DroppedPieces> {
-        let live = self.live().context("torrent is not live")?;
-        let pieces = live.drop_pieces(pieces)?;
+        let mut g = self.locked.write();
+        let pieces = match &mut g.state {
+            // Under this lock a live torrent still has its piece tracker, same as in
+            // finish_release() below.
+            ManagedTorrentState::Live(live) => live.drop_pieces(pieces)?,
+            ManagedTorrentState::Paused(paused) => paused.drop_pieces(pieces)?,
+            state => bail!("torrent is neither live nor paused: {}", state.name()),
+        };
+        drop(g);
         Ok(DroppedPieces {
             torrent: Arc::downgrade(self),
             pieces,
@@ -417,11 +435,14 @@ impl ManagedTorrent {
     /// Make pieces dropped by [`Self::drop_pieces`] wanted again, e.g. after seeking
     /// backwards into a range that was reclaimed. Pieces that weren't dropped are left
     /// alone, and so are pieces belonging to a file the user has deselected. Returns how
-    /// many pieces stopped being dropped.
+    /// many pieces stopped being dropped. Works on a live or paused torrent.
     pub fn reselect_pieces(&self, pieces: Range<u32>) -> anyhow::Result<usize> {
-        self.live()
-            .context("torrent is not live")?
-            .reselect_pieces(pieces)
+        let mut g = self.locked.write();
+        match &mut g.state {
+            ManagedTorrentState::Live(live) => live.reselect_pieces(pieces),
+            ManagedTorrentState::Paused(paused) => paused.reselect_pieces(pieces),
+            state => bail!("torrent is neither live nor paused: {}", state.name()),
+        }
     }
 
     /// Get the live state if the torrent is live.

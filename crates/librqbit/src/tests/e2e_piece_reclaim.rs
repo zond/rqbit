@@ -632,13 +632,18 @@ impl crate::storage::TorrentStorage for ReleasingStorage {
     }
 }
 
-// piece_reclaim is persisted with the torrent: a torrent restored at startup keeps the
-// API. It didn't, so every restart turned a reclaim torrent into a plain one - the disk it
-// was keeping small refilled, and drop_pieces() was refused.
-async fn e2e_piece_reclaim_survives_a_restart() -> anyhow::Result<()> {
+// What survives a restart is the have-set, and the storage decides that. The want-set
+// doesn't, and can't be read off the storage: a piece the caller released and a piece it
+// never downloaded are the same hole. So a restored torrent wants every hole - and used to
+// come back without piece_reclaim at all, and with drop_pieces() refusing pieces we don't
+// have, so nothing could be done about it: every relaunch refilled the disk that reclaim
+// was keeping small. Now the flag is persisted, and the caller re-applies its want-set on
+// the restored torrent while it is still paused, so no peer gets a chance to fill a hole.
+async fn e2e_piece_reclaim_want_set_is_reapplied_after_a_restart() -> anyhow::Result<()> {
     setup_test_logging();
-    let (_files, torrent_bytes, _server_session, peer) =
+    let (files, torrent_bytes, _server_session, peer) =
         seeding_server("test_piece_reclaim_restart", FILE_SIZE).await?;
+    let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
 
     let dir = TempDir::with_prefix("test_piece_reclaim_restart_client")?;
     let output_folder = dir.path().join("out");
@@ -670,6 +675,12 @@ async fn e2e_piece_reclaim_survives_a_restart() -> anyhow::Result<()> {
         .into_handle()
         .context("expected a handle")?;
     timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
+
+    // Half the pieces go, then the torrent is paused: the record says so, and the restart
+    // comes up paused.
+    release(&storage, &handle, DROP)?;
+    let held = storage_has(&storage, &handle)?;
+    session.pause(&handle).await?;
     drop(handle);
     drop(session);
 
@@ -677,20 +688,58 @@ async fn e2e_piece_reclaim_survives_a_restart() -> anyhow::Result<()> {
     let handle = session
         .get(crate::api::TorrentIdOrHash::Id(0))
         .context("expected the torrent to be restored from persistence")?;
-    timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
+    timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+    assert!(handle.with_state(|s| matches!(s, crate::ManagedTorrentState::Paused(_))));
 
+    // The have-set is the storage's, holes included, and every hole is wanted.
+    assert_eq!(torrent_has(&handle)?, held);
+    assert!(!handle.stats().finished);
+
+    // The caller re-applies its want-set: the same range, none of which we have now.
     let dropped = handle
-        .drop_pieces(TOTAL_PIECES - 1..TOTAL_PIECES)
-        .context("the restored torrent lost piece_reclaim")?;
-    assert_eq!(dropped.pieces(), [TOTAL_PIECES - 1]);
+        .drop_pieces(DROP)
+        .context("drop_pieces on the restored, paused torrent")?;
+    assert_eq!(
+        dropped.pieces(),
+        DROP.collect::<Vec<_>>(),
+        "pieces we don't have were not dropped"
+    );
+    drop(dropped);
+    assert!(handle.stats().finished);
+    assert_eq!(torrent_has(&handle)?, held);
+
+    // Live, with a seeder that has everything, nothing is downloaded: the holes are not
+    // wanted.
+    session.unpause(&handle).await?;
+    timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+    handle
+        .live()
+        .context("expected a live torrent")?
+        .add_peer_if_not_seen(peer)?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        storage.piece_count(handle.info_hash()),
+        TOTAL_PIECES as usize - DROP.len(),
+        "a dropped piece was downloaded again after the restart"
+    );
+    assert!(handle.stats().finished);
+
+    // Wanted again on request, and only then.
+    assert_eq!(handle.reselect_pieces(DROP)?, DROP.len());
+    timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
+    assert_eq!(
+        storage.piece_count(handle.info_hash()),
+        TOTAL_PIECES as usize
+    );
+    assert_eq!(read_back(handle.clone()).await?, orig_content);
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_e2e_piece_reclaim_survives_a_restart() -> anyhow::Result<()> {
+async fn test_e2e_piece_reclaim_want_set_is_reapplied_after_a_restart() -> anyhow::Result<()> {
     timeout(
         Duration::from_secs(120),
-        e2e_piece_reclaim_survives_a_restart(),
+        e2e_piece_reclaim_want_set_is_reapplied_after_a_restart(),
     )
     .await?
 }
