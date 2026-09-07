@@ -260,7 +260,14 @@ pub trait TorrentStorage: Send + Sync {
     /// Default implementation does nothing, but can be override in trait implementations.
     ///
     /// This is where a storage that implements [`Self::has_piece`] makes the piece
-    /// visible: until it returns, the piece is still being written.
+    /// visible: until it returns, the piece is still being written. It runs after the
+    /// hash check and before the piece is marked have, so the piece is not counted,
+    /// advertised, served or readable through a stream until this has returned `Ok`.
+    ///
+    /// An `Err` means the piece is not ours. It is treated like a failed write: the torrent
+    /// stops with a fatal error rather than advertise a piece it cannot read back. On
+    /// restart the storage is asked what it holds, so a piece left half-committed is
+    /// simply not have, and downloaded again.
     fn on_piece_completed(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<()> {
         Ok(())
     }
