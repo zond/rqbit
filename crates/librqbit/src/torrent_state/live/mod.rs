@@ -868,6 +868,21 @@ impl TorrentStateLive {
         Ok(dropped.into_iter().map(|id| id.get()).collect())
     }
 
+    /// Whether to tell peers we have this piece.
+    ///
+    /// A Have is queued when the piece completes and can go out much later - after rate
+    /// limiting, behind whatever else that peer's writer has to send. If we dropped the
+    /// piece in between, advertising it earns us a request we cannot serve and, with no
+    /// reject-request in vanilla BitTorrent, a disconnect. Only a torrent that opted into
+    /// reclaim can lose a piece it had, so only it pays for the lock.
+    pub(crate) fn should_advertise_have(&self, id: ValidPieceIndex) -> bool {
+        !self.shared.options.piece_reclaim
+            || self
+                .lock_read("should_advertise_have")
+                .get_chunks()
+                .is_ok_and(|ct| ct.is_piece_have(id))
+    }
+
     /// The caller is done releasing the storage of these pieces: they may be downloaded
     /// again. See [`crate::DroppedPieces`].
     pub(crate) fn finish_release(&self, pieces: &[u32]) {
@@ -1323,6 +1338,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
 
     fn should_transmit_have(&self, id: ValidPieceIndex) -> bool {
         if self.state.shared.options.disable_upload() {
+            return false;
+        }
+        if !self.state.should_advertise_have(id) {
             return false;
         }
         let have = self
