@@ -287,13 +287,15 @@ pub struct AddTorrentOptions {
     /// Off by default, and while it's off nothing decides on its own to drop anything -
     /// this only makes the API available.
     ///
-    /// NOTE: like every other field here except `only_files` and `paused`, this is not
-    /// part of the persisted session state, so a torrent restored at startup comes back
-    /// with it false unless the caller sets it again. That is deliberate: the set of
-    /// dropped pieces is per-session policy, and the have-set a restart comes up with is
-    /// intersected with what the storage still holds (see
-    /// [`crate::storage::TorrentStorage::has_piece`]), so a piece whose storage was
-    /// released comes back as missing and wanted - which is the right default.
+    /// Persisted with the torrent, like `only_files` and `paused`, so a torrent restored
+    /// at startup keeps the API. What is not persisted is the want-set - which pieces were
+    /// dropped. The have-set a restart comes up with is what the storage still holds (see
+    /// [`crate::storage::TorrentStorage::has_piece`]), and the storage cannot tell a piece
+    /// the caller released from one that was never downloaded: both are holes. So a
+    /// restored torrent wants every hole, and a caller whose want-set is narrower re-applies
+    /// it with [`crate::ManagedTorrent::drop_pieces`], which takes pieces we don't have
+    /// and works on a paused torrent - restore paused, drop, unpause, and no peer gets a
+    /// chance to fill the holes in between.
     ///
     /// A storage used with this must be able to release a single piece and must
     /// implement `has_piece` - the only thing that keeps the have-set honest across a

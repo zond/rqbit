@@ -632,6 +632,69 @@ impl crate::storage::TorrentStorage for ReleasingStorage {
     }
 }
 
+// piece_reclaim is persisted with the torrent: a torrent restored at startup keeps the
+// API. It didn't, so every restart turned a reclaim torrent into a plain one - the disk it
+// was keeping small refilled, and drop_pieces() was refused.
+async fn e2e_piece_reclaim_survives_a_restart() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (_files, torrent_bytes, _server_session, peer) =
+        seeding_server("test_piece_reclaim_restart", FILE_SIZE).await?;
+
+    let dir = TempDir::with_prefix("test_piece_reclaim_restart_client")?;
+    let output_folder = dir.path().join("out");
+    let persistence_folder = dir.path().join("session");
+    let storage = InMemoryPieceStorageFactory::default();
+    let session_opts = || crate::SessionOptions {
+        dht: None,
+        persistence: Some(crate::SessionPersistenceConfig::Json {
+            folder: Some(persistence_folder.clone()),
+        }),
+        disable_local_service_discovery: true,
+        peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+        default_storage_factory: Some(storage.clone().boxed()),
+        ..Default::default()
+    };
+
+    let session = Session::new_with_opts(output_folder.clone(), session_opts()).await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent_bytes.clone()),
+            Some(crate::AddTorrentOptions {
+                paused: false,
+                initial_peers: Some(vec![peer]),
+                piece_reclaim: true,
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
+    drop(handle);
+    drop(session);
+
+    let session = Session::new_with_opts(output_folder.clone(), session_opts()).await?;
+    let handle = session
+        .get(crate::api::TorrentIdOrHash::Id(0))
+        .context("expected the torrent to be restored from persistence")?;
+    timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
+
+    let dropped = handle
+        .drop_pieces(TOTAL_PIECES - 1..TOTAL_PIECES)
+        .context("the restored torrent lost piece_reclaim")?;
+    assert_eq!(dropped.pieces(), [TOTAL_PIECES - 1]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_piece_reclaim_survives_a_restart() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_piece_reclaim_survives_a_restart(),
+    )
+    .await?
+}
+
 // When the torrent finishes under an open stream, the peers that have all of it are sent
 // away (there is nothing left to want from them). Dropping pieces keeps the torrent
 // finished, so nothing brings them back when that same stream then seeks into the dropped
