@@ -126,7 +126,7 @@ fn make_piece_bitfield(lengths: &Lengths) -> BF {
 // The piece range is the caller's, and "everything from here on" is a natural way to
 // ask for it. Walking it to the end of u32 to find out that none of it is a piece of
 // this torrent stalls the executor for seconds, so bound it first.
-fn clamp_piece_range(pieces: Range<u32>, lengths: &Lengths) -> Range<u32> {
+pub(crate) fn clamp_piece_range(pieces: Range<u32>, lengths: &Lengths) -> Range<u32> {
     let end = pieces.end.min(lengths.total_pieces());
     pieces.start.min(end)..end
 }
@@ -832,11 +832,11 @@ impl TorrentStateLive {
         Err(res)
     }
 
-    /// Drop the pieces in the given range that we have: forget that we have them, stop
-    /// advertising them and stop wanting them back. Bookkeeping only - releasing the
-    /// storage is the caller's job.
+    /// Drop the pieces in the given range: forget that we have the ones we do, stop
+    /// advertising them, and stop wanting them either way. Bookkeeping only - releasing
+    /// the storage is the caller's job. See [`crate::ManagedTorrent::drop_pieces`].
     ///
-    /// Pieces we don't have, and pieces a live stream is about to read, are skipped.
+    /// Pieces a live stream is about to read are skipped.
     pub(crate) fn drop_pieces(&self, pieces: Range<u32>) -> anyhow::Result<Vec<u32>> {
         let mut g = self.lock_write("drop_pieces");
         let locked = &mut **g;
@@ -850,16 +850,16 @@ impl TorrentStateLive {
         let candidates = clamp_piece_range(pieces, &self.lengths)
             .filter(|id| !wanted.iter().any(|r| r.contains(id)))
             .filter_map(|id| self.lengths.validate_piece_index(id));
-        let dropped = locked
-            .get_pieces_mut()?
-            .drop_pieces(&self.metadata.file_infos, candidates)?;
-
-        for id in dropped.iter() {
-            self.stats
-                .have_bytes
-                .fetch_sub(self.lengths.piece_length(*id) as u64, Ordering::Relaxed);
-            locked.unflushed_bitv_bytes += self.lengths.piece_length(*id) as u64;
-        }
+        let (dropped, freed) = {
+            let pieces = locked.get_pieces_mut()?;
+            let have_before = pieces.chunks().get_hns().have_bytes;
+            let dropped = pieces.drop_pieces(&self.metadata.file_infos, candidates)?;
+            // Only the pieces we had move the have-bitfield and the have counter; a
+            // dropped piece we didn't have changes neither.
+            (dropped, have_before - pieces.chunks().get_hns().have_bytes)
+        };
+        self.stats.have_bytes.fetch_sub(freed, Ordering::Relaxed);
+        locked.unflushed_bitv_bytes += freed;
         // Same deal as on piece completion: let the bitfield drift until it's worth a
         // write. A crash that beats the flush leaves resume data claiming a piece whose
         // storage the caller has since released, which is why startup intersects the

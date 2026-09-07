@@ -296,8 +296,8 @@ impl PieceTracker {
         self.chunks.mark_chunk_downloaded(piece)
     }
 
-    /// Drop pieces we have: see [`ChunkTracker::drop_pieces`]. A piece we have is never
-    /// in-flight, so this doesn't interact with inflight tracking.
+    /// Drop pieces: see [`ChunkTracker::drop_pieces`]. A piece a peer owns is left alone,
+    /// so this never takes anything out of the in-flight map.
     ///
     /// The pieces it returns are claimed until [`Self::finish_release`] is called for
     /// them: the caller is about to delete their storage, and until that is done nothing
@@ -307,7 +307,9 @@ impl PieceTracker {
         file_infos: &FileInfos,
         pieces: impl IntoIterator<Item = ValidPieceIndex>,
     ) -> crate::Result<Vec<ValidPieceIndex>> {
-        self.chunks.drop_pieces(file_infos, pieces)
+        let inflight = &self.inflight;
+        self.chunks
+            .drop_pieces(file_infos, pieces, |piece| inflight.contains_key(&piece))
     }
 
     /// The caller is done releasing the storage of these pieces, so they may be
