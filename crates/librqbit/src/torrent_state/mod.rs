@@ -711,6 +711,39 @@ impl ManagedTorrent {
                 ManagedTorrentState::Initializing(init) => {
                     let init = init.clone();
                     init.clear_pause_request();
+                    // KNOWN BUG, not yet fixed. This early return makes both
+                    // `Session::pause` and `Session::unpause` return `Ok(())`
+                    // having done nothing, and the torrent then settles on the
+                    // *add-time* `start_paused` captured by the in-flight
+                    // check's continuation rather than on the intent just
+                    // recorded. So `is_paused()` can disagree with the state in
+                    // BOTH directions:
+                    //
+                    //  * unpause during a running check -> parked in `Paused`
+                    //    with `is_paused() == false`;
+                    //  * pause during a *fastresume* check -> `Live` with
+                    //    `is_paused() == true`, because `validate_fastresume`
+                    //    never reads `pause_requested` the way
+                    //    `FileOps::initial_check` does. Measured downstream as a
+                    //    torrent that kept downloading after being told to stop.
+                    //
+                    // Both are reachable through the HTTP API by hitting
+                    // pause/start during the initial check.
+                    //
+                    // AN ATTEMPTED FIX WAS REVERTED, and the trap is worth
+                    // recording: making the continuation read the live intent is
+                    // necessary but NOT sufficient. It also has to carry the
+                    // *current* peer stream. `start()` builds a peer_rx and
+                    // drops it on this early return, while the continuation
+                    // holds the one captured at add time -- which is `None` for
+                    // any torrent added paused. Honouring the intent without
+                    // fixing that takes the torrent Live with no peers and no
+                    // announce, permanently, because `start()` on a `Live`
+                    // torrent bails. That is strictly worse than the bug: this
+                    // one is recoverable by unpausing again, that one is not.
+                    //
+                    // A test for it needs a real peer source, so that "started"
+                    // means "can actually fetch" and not merely `live().is_some()`.
                     if !init.try_start_check() {
                         return Ok(());
                     }
@@ -919,6 +952,21 @@ impl ManagedTorrent {
     }
 
     #[inline(never)]
+    /// # Known hang
+    ///
+    /// This never returns for a torrent whose initial check was *paused*:
+    /// `pause()` on an `Initializing` torrent sets `pause_requested`, the check
+    /// bails, and the `Err` arm leaves the state `Initializing` with
+    /// `check_running == false`. Nothing will move that state, so the loop below
+    /// polls forever and callers have to bound it themselves.
+    ///
+    /// An attempted fix -- bail when `is_pause_requested() && !is_check_running()`
+    /// -- was reverted, because that pair is ALSO true in a healthy state: in
+    /// `Session::add_torrent` the handle is published and awaited on before
+    /// `start()` runs, so a `pause()` landing in that window sets exactly those
+    /// two conditions on a torrent whose check then completes normally. A correct
+    /// fix has to distinguish "the check stalled" from "the check has not started
+    /// yet", which the current state does not express.
     pub fn wait_until_initialized(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         async move {
             // TODO: rewrite, this polling is horrible
