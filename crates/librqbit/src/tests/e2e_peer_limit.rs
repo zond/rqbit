@@ -57,6 +57,22 @@ impl Swarm {
         self.live.stats_snapshot().peer_stats
     }
 
+    /// How many connections the seeders themselves have. Our own peer counters cannot
+    /// stand in for this: `queued` and `connecting` both move when the adder claims the
+    /// table slot, a transition before the dial task has been polled, so a peer they
+    /// account for may have no socket yet -- 3168e821 fixed the sibling test for waiting
+    /// on exactly that. A connection the far end has is a socket that exists.
+    fn far_end_live(&self) -> usize {
+        self.seeders
+            .iter()
+            .map(|(_, h)| {
+                h.live()
+                    .map(|l| l.stats_snapshot().peer_stats.live)
+                    .unwrap_or(0) as usize
+            })
+            .sum()
+    }
+
     /// Take the rate limit off the seeders so the client can finish.
     fn unthrottle(&self) {
         for (seeder, _) in &self.seeders {
@@ -417,17 +433,9 @@ async fn forgetting_a_parked_peer_strands_none_of_its_pieces_inner() {
     // Wait for those connections to close, seen from the other end, then let the tasks that
     // owned them finish reporting their death.
     wait_until(
-        || {
-            let live: u32 = swarm
-                .seeders
-                .iter()
-                .map(|(_, h)| h.live().map(|l| l.stats_snapshot().peer_stats.live))
-                .map(|l| l.unwrap_or(0))
-                .sum();
-            match live as usize {
-                LOWERED => Ok(()),
-                other => bail!("waiting for the parked connections to close, {other} left"),
-            }
+        || match swarm.far_end_live() {
+            LOWERED => Ok(()),
+            other => bail!("waiting for the parked connections to close, {other} left"),
         },
         WAIT,
     )
@@ -652,16 +660,43 @@ async fn a_raise_dials_the_peers_it_parked_before_the_backlog_inner() {
     )
     .await
     .unwrap();
+    // And for the seeders to lose those connections, so that every socket the far end
+    // reports from here on is one this raise made.
+    wait_until(
+        || match swarm.far_end_live() {
+            LOWERED => Ok(()),
+            n => bail!("waiting for the seeders to lose the parked connections, {n} still up"),
+        },
+        WAIT,
+    )
+    .await
+    .unwrap();
 
     let dialled_before = backlog.accepted.load(Ordering::Relaxed);
     swarm.handle.set_peer_limit(SEEDERS);
+    // The raise frees `SEEDERS - LOWERED` slots, and the count below is done when every
+    // one of them has reached a far end: a seeder that has the connection, or a tarpit
+    // that accepted one. That is the whole point of asking the far ends rather than our
+    // own counters, which is what this waited on before: `queued` drops in
+    // `mark_peer_connecting`, one transition before the dial task is polled, so it fell
+    // to the backlog's size while a slot handed to a guess was still an unopened socket,
+    // and the `dialled` count below read 0 for a dial that had not landed yet. Measured
+    // on a `reconnect_all_not_needed_peers` mutated to skip one parked peer -- a real
+    // regression of the property asserted here, with the guess winning the last slot
+    // rather than the first: the old wait let it through 9 times in 80 runs.
     wait_until(
-        || match swarm.peer_stats() {
-            // Every address the raise asked for has left the queue; only the backlog is
-            // still waiting. Said this way rather than counting live peers, because how
-            // fast a re-dialled seeder finishes its handshake is beside the point here.
-            s if s.queued as usize <= backlog.addrs.len() => Ok(()),
-            s => bail!("waiting for the raise to hand out its slots: {s:?}"),
+        || {
+            let dialled = backlog.accepted.load(Ordering::Relaxed) - dialled_before;
+            // `>=`, not `==`: a slot released and spent again inside the window would put
+            // more sockets at the far ends than the raise handed out, and waiting for the
+            // exact number would then wait until it ran out.
+            match swarm.far_end_live() + dialled {
+                n if n >= SEEDERS => Ok(()),
+                n => bail!(
+                    "waiting for the raise's slots to reach a far end: {n} of {SEEDERS} \
+                     sockets, {dialled} of them the backlog's"
+                ),
+            }
         },
         // Well inside the read timeout a wedged dial would otherwise hold a slot for.
         Duration::from_secs(5),
