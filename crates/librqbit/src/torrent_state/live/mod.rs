@@ -1304,7 +1304,13 @@ impl TorrentStateLive {
             // which has been standing on the semaphore with a guessed address in hand --
             // takes it. Every one of those returns that lands between the write-off and
             // this walk is a slot spent on a guess with the proven queue still empty.
-            // Measured: with the walk stretched by a 20ms sleep, four runs in five.
+            // Measured, by moving this walk below the write-off with a 20 ms sleep in
+            // the gap: 10 failures in 10 of
+            // `a_raise_dials_the_peers_it_parked_before_the_backlog`, against 25 clean
+            // runs unmutated. That test must NOT wait for the seeders to close the
+            // parked sockets before raising: a far-end close is strictly later than the
+            // parked peer's own permit drop, so waiting for it empties the debt and the
+            // semaphore, and this ordering stops mattering.
             self.reconnect_all_not_needed_peers();
             // A lower cap may still be waiting to collect permits from dying peers; those
             // debts are simply written off before any new permit is issued.

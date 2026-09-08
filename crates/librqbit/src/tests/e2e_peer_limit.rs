@@ -660,18 +660,15 @@ async fn a_raise_dials_the_peers_it_parked_before_the_backlog_inner() {
     )
     .await
     .unwrap();
-    // And for the seeders to lose those connections, so that every socket the far end
-    // reports from here on is one this raise made.
-    wait_until(
-        || match swarm.far_end_live() {
-            LOWERED => Ok(()),
-            n => bail!("waiting for the seeders to lose the parked connections, {n} still up"),
-        },
-        WAIT,
-    )
-    .await
-    .unwrap();
-
+    // NOT waited on here: that the seeders have *closed* the parked sockets. A far-end
+    // close is strictly later than the parked peer's own `PeerPermit::drop`, so waiting
+    // for it leaves `peer_permits_to_forget` at 0 and the semaphore empty -- which is
+    // exactly the state in which it cannot matter whether `set_peer_limit` walks the
+    // table before or after it writes the debt off. Such a wait was added here to
+    // settle a flake and silently deleted the only coverage of that ordering:
+    // measured, with `reconnect_all_not_needed_peers` moved back after the write-off
+    // and a 20 ms sleep in the gap, 8 failures in 10 without the wait and 0 in 10 with
+    // it. The flake it was aimed at is fixed by the far-end gate below instead.
     let dialled_before = backlog.accepted.load(Ordering::Relaxed);
     swarm.handle.set_peer_limit(SEEDERS);
     // The raise frees `SEEDERS - LOWERED` slots, and the count below is done when every
