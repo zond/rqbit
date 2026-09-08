@@ -1252,14 +1252,20 @@ impl TorrentStateLive {
     pub fn set_peer_limit(&self, limit: usize) {
         let prev = self.peer_limit.swap(limit, Ordering::AcqRel);
         if limit > prev {
+            let add = limit - prev;
+            // Ask for the parked peers back before a slot to dial them with can exist.
+            // Not merely before `add_permits`: writing the debt off is itself a way of
+            // handing slots out. A peer the lowering parked returns its permit as it dies,
+            // and while the debt stands that permit is forgotten to pay it; the instant the
+            // debt is gone the next one goes to the semaphore instead, and the adder --
+            // which has been standing on the semaphore with a guessed address in hand --
+            // takes it. Every one of those returns that lands between the write-off and
+            // this walk is a slot spent on a guess with the proven queue still empty.
+            // Measured: with the walk stretched by a 20ms sleep, four runs in five.
+            self.reconnect_all_not_needed_peers();
             // A lower cap may still be waiting to collect permits from dying peers; those
             // debts are simply written off before any new permit is issued.
-            let add = limit - prev;
             let written_off = sub_saturating(&self.peer_permits_to_forget, add);
-            // Ask for the parked peers back before the slots to dial them with exist. The
-            // adder is waiting on a slot with an address already in hand, and takes the
-            // next the instant it has one: put the proven peers where it will look first.
-            self.reconnect_all_not_needed_peers();
             if add > written_off {
                 self.peer_semaphore.add_permits(add - written_off);
             }
