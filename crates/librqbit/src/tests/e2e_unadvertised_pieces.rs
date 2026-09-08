@@ -15,7 +15,7 @@ use tokio::{io::AsyncReadExt, time::timeout};
 use tracing::info;
 
 use crate::{
-    AddTorrent, CreateTorrentOptions, ManagedTorrent, Session, create_torrent,
+    AddTorrent, CreateTorrentOptions, ManagedTorrent, ManagedTorrentState, Session, create_torrent,
     spawn_utils::BlockingSpawner,
     tests::test_util::{TestPeerMetadata, setup_test_logging},
     torrent_state::live::peer::stats::snapshot::{PeerStatsFilter, PeerStatsFilterState},
@@ -689,6 +689,69 @@ async fn test_e2e_unadvertised_pieces_gate_comes_back_down() -> anyhow::Result<(
     timeout(
         Duration::from_secs(120),
         e2e_unadvertised_pieces_gate_comes_back_down(),
+    )
+    .await?
+}
+
+// A call the torrent refuses must leave the gate exactly as it found it. The gate lives on
+// ManagedTorrentShared, which outlives every state the torrent passes through, so nothing
+// later comes along to correct one left up: every Have takes the state lock for the rest of
+// the torrent's life. And the raise happens on the way in, before we know whether the call
+// can go through at all.
+//
+// The refused state is swapped in by hand. The one a caller actually meets is
+// `initializing` - the window between add_torrent(paused: true) returning and the check of
+// what is on disk finishing, which is what the test below is about - and that window cannot
+// be held open from outside. The arm that refuses the call is the same one either way.
+async fn e2e_unadvertised_pieces_gate_survives_a_refused_call() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (_files, _torrent_bytes, (_session, handle), _addr) =
+        seeder("test_unadvertised_pieces_gate_refused").await?;
+
+    // In and out with no await in between, so nothing else gets a look at it.
+    let refuse = |handle: &ManagedTorrent| {
+        let stashed = std::mem::replace(
+            &mut handle.locked.write().state,
+            ManagedTorrentState::Error(anyhow::anyhow!("a state this call does not serve")),
+        );
+        let refused = handle.set_pieces_advertised(HELD_BACK, false);
+        let gate_after = gate(handle);
+        handle.locked.write().state = stashed;
+        (refused, gate_after)
+    };
+
+    // Refused with nothing held back: the gate has to come back down.
+    let (refused, gate_after) = refuse(&handle);
+    assert!(refused.is_err());
+    assert!(!anything_held_back(&handle)?);
+    assert!(
+        !gate_after,
+        "a refused hold-back left the Have path taking the lock for the life of the torrent"
+    );
+
+    // Refused with pieces held back: the gate has to stay up. So it is put back to what it
+    // said, not cleared - clearing it here would be the one thing the gate may never do.
+    assert_eq!(
+        handle.set_pieces_advertised(HELD_BACK, false)?,
+        HELD_BACK.len()
+    );
+    assert!(gate(&handle));
+    let (refused, gate_after) = refuse(&handle);
+    assert!(refused.is_err());
+    assert!(anything_held_back(&handle)?);
+    assert!(
+        gate_after,
+        "a refused call put the gate down with pieces still held back, so the Have path \
+         will announce them without ever looking"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_unadvertised_pieces_gate_survives_a_refused_call() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_unadvertised_pieces_gate_survives_a_refused_call(),
     )
     .await?
 }

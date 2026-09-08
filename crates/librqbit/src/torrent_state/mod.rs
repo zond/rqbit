@@ -531,33 +531,52 @@ impl ManagedTorrent {
         pieces: Range<u32>,
         advertised: bool,
     ) -> anyhow::Result<usize> {
+        let gate = &self.shared.unadvertised_pieces;
         let mut g = self.locked.write();
+        let was = gate.load(Ordering::Relaxed);
         if !advertised {
             // Before the set itself changes, never after, so the window between the two
             // may only cost the Have path a lock and not let out a piece the caller has
             // just asked us to hold back. Inside the lock, because holding that lock
             // across both writes is what orders this against another caller doing the
             // same thing - see the field's doc.
-            self.shared
-                .unadvertised_pieces
-                .store(true, Ordering::Relaxed);
+            gate.store(true, Ordering::Relaxed);
         }
-        let (changed, still_held_back) = match &mut g.state {
-            ManagedTorrentState::Live(live) => live.set_pieces_advertised(pieces, advertised)?,
-            ManagedTorrentState::Paused(paused) => paused.set_pieces_advertised(pieces, advertised),
-            state => bail!("torrent is neither live nor paused: {}", state.name()),
+        let result = match &mut g.state {
+            ManagedTorrentState::Live(live) => live.set_pieces_advertised(pieces, advertised),
+            ManagedTorrentState::Paused(paused) => {
+                Ok(paused.set_pieces_advertised(pieces, advertised))
+            }
+            state => Err(anyhow::anyhow!(
+                "torrent is neither live nor paused: {}",
+                state.name()
+            )),
         };
-        // Recomputed rather than cleared, since this call may have put back only part of
-        // what is held back - and unconditionally, so a hold-back that held nothing back
-        // does not leave the gate stuck on. Still under the lock: two callers write the
-        // gate in the order they wrote the set, so whoever goes last leaves the gate
-        // saying what the set says. Store it after the lock and the loser of that race
-        // stores what the set looked like before the winner changed it.
-        self.shared
-            .unadvertised_pieces
-            .store(still_held_back, Ordering::Relaxed);
-        drop(g);
-        Ok(changed)
+        match result {
+            // Recomputed rather than cleared, since this call may have put back only part
+            // of what is held back - and unconditionally, so a hold-back that held nothing
+            // back does not leave the gate stuck on. Still under the lock: two callers
+            // write the gate in the order they wrote the set, so whoever goes last leaves
+            // the gate saying what the set says. Store it after the lock and the loser of
+            // that race stores what the set looked like before the winner changed it.
+            Ok((changed, still_held_back)) => {
+                gate.store(still_held_back, Ordering::Relaxed);
+                drop(g);
+                Ok(changed)
+            }
+            // Nothing reached the set: the state arm refused the call, or the live arm
+            // failed to reach the chunk tracker, both before a bit was touched. So the
+            // gate goes back to what it said when we came in - it was right about the set
+            // then and the set has not moved. Without this the raise above sticks: this
+            // lives on ManagedTorrentShared, which outlives every state the torrent goes
+            // through, so there is nothing later to bring it down and every Have takes the
+            // lock for the life of the torrent.
+            Err(e) => {
+                gate.store(was, Ordering::Relaxed);
+                drop(g);
+                Err(e)
+            }
+        }
     }
 
     /// Make pieces dropped by [`Self::drop_pieces`] wanted again, e.g. after seeking
