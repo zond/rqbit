@@ -104,6 +104,10 @@ impl TorrentStateInitializing {
         self.pause_requested.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn is_check_running(&self) -> bool {
+        self.check_running.load(Ordering::Acquire)
+    }
+
     pub(crate) fn try_start_check(&self) -> bool {
         self.check_running
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)

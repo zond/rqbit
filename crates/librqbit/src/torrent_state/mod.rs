@@ -781,11 +781,16 @@ impl ManagedTorrent {
                                 .context("bug: concurrent init semaphore was closed")?;
 
                             let check_result = init.check().await;
-                            init.finish_check();
 
                             match check_result {
                                 Ok(paused) => {
                                     let mut g = t.locked.write();
+                                    // Under the lock, so that nobody can observe "no
+                                    // check running" while the state still says
+                                    // Initializing - that pair is how a waiter tells a
+                                    // check that has stopped for good from one that is
+                                    // still going.
+                                    init.finish_check();
                                     if let ManagedTorrentState::Initializing(_) = &g.state {
                                     } else {
                                         debug!(
@@ -799,6 +804,7 @@ impl ManagedTorrent {
                                     _start(&t, peer_rx, session, Some(g), token)
                                 }
                                 Err(err) => {
+                                    init.finish_check();
                                     if init.is_pause_requested() {
                                         debug!("initial check paused");
                                         t.state_change_notify.notify_waiters();
@@ -981,7 +987,19 @@ impl ManagedTorrent {
             // TODO: rewrite, this polling is horrible
             loop {
                 let done = self.with_state(|s| match s {
-                    ManagedTorrentState::Initializing(_) => Ok(false),
+                    ManagedTorrentState::Initializing(i) => {
+                        // A pause aborts the initial check where it stands
+                        // (FileOps::initial_check bails on it), and leaves the torrent
+                        // Initializing with nothing running. Only an unpause starts a
+                        // new check, so nothing will move this state on its own and
+                        // waiting for it is waiting forever.
+                        if i.is_pause_requested() && !i.is_check_running() {
+                            bail!(
+                                "the initial check was paused and is not running; unpause the torrent to run it again"
+                            )
+                        }
+                        Ok(false)
+                    }
                     ManagedTorrentState::Error(e) => bail!("{:?}", e),
                     ManagedTorrentState::None => bail!("bug: torrent state is None"),
                     _ => Ok(true),

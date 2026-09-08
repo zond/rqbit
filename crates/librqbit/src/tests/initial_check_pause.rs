@@ -5,7 +5,8 @@
 //! writes down. The initial check runs in a spawned task, so the intent can move while
 //! it runs. What these tests pin down is that the state the check lands the torrent in
 //! is the intent as it stands when the check finishes, not as it stood when the check
-//! was started.
+//! was started - and that a check a pause stopped for good is reported rather than
+//! waited on.
 
 use std::{
     any::TypeId,
@@ -62,11 +63,15 @@ impl Gate {
         self.open.store(true, Ordering::SeqCst);
     }
 
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+
     /// Returns once a check is inside `hold`: it has started, and it cannot get past
     /// this read until the test says so.
     async fn wait_until_check_started(&self) -> anyhow::Result<()> {
         wait_until(
-            || match self.reads.load(Ordering::SeqCst) {
+            || match self.reads() {
                 0 => bail!("the initial check hasn't read anything yet"),
                 _ => Ok(()),
             },
@@ -106,10 +111,14 @@ impl StorageFactory for GatedStorageFactory {
         })
     }
 
-    // Session persistence refuses any storage that isn't the filesystem one, so this
-    // has to keep answering for what it wraps.
+    // Session persistence asks the storage what it promises about a restart, and a
+    // wrapper has to keep answering for what it wraps.
     fn is_type_id(&self, type_id: TypeId) -> bool {
         self.inner.is_type_id(type_id)
+    }
+
+    fn ensure_persistable(&self) -> anyhow::Result<()> {
+        self.inner.ensure_persistable()
     }
 
     fn clone_box(&self) -> BoxStorageFactory {
@@ -332,6 +341,65 @@ async fn pause_during_a_fastresume_check_leaves_the_torrent_paused_inner() -> an
     assert!(
         handle.live().is_none(),
         "a stopped torrent has no live state"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paused_initial_check_fails_the_wait_instead_of_hanging() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        a_paused_initial_check_fails_the_wait_instead_of_hanging_inner(),
+    )
+    .await?
+}
+
+/// A pause aborts the initial check between pieces, and there is nowhere for the torrent
+/// to go from there: it stays Initializing with no check running, and only an unpause
+/// starts a new one. `wait_until_initialized` polls that state, so it has to say so
+/// rather than wait for a check that will never run.
+async fn a_paused_initial_check_fails_the_wait_instead_of_hanging_inner() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (dir, torrent_bytes) = complete_torrent_on_disk("rqbit_pause_during_check").await?;
+    let gate = Arc::new(Gate::default());
+
+    let session = Session::new_with_opts(dir.path().into(), session_opts(None, None)).await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent_bytes),
+            Some(add_opts(&dir, false, &gate)),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+
+    gate.wait_until_check_started().await?;
+    session.pause(&handle).await?;
+    info!("paused while the initial check was running");
+    gate.open();
+
+    let err = timeout(Duration::from_secs(10), handle.wait_until_initialized())
+        .await
+        .context("wait_until_initialized hung on a check that had stopped")?
+        .expect_err("the check was paused, so it never initialized");
+    info!("wait_until_initialized said: {err:#}");
+    assert!(
+        format!("{err:#}").contains("paused"),
+        "the error should say why nothing is coming: {err:#}"
+    );
+    assert!(
+        matches!(handle.stats().state, TorrentStatsState::Initializing { .. }),
+        "the torrent is still where the check left it: {:?}",
+        handle.stats().state
+    );
+
+    // And it is not a dead end: unpausing runs a new check, which this time finishes.
+    let reads_while_stopped = gate.reads();
+    session.unpause(&handle).await?;
+    timeout(WAIT, handle.wait_until_initialized()).await??;
+    assert!(
+        gate.reads() > reads_while_stopped,
+        "the unpause read the files again rather than resuming the abandoned check"
     );
     Ok(())
 }
