@@ -602,14 +602,25 @@ async fn a_raise_dials_the_peers_it_parked_before_the_backlog() {
 /// While the cap is low the adder drains nothing: it takes one address and then waits for
 /// a slot, so everything a tracker, the DHT or PEX names in the meantime piles up behind
 /// it. On the way back up, those guesses must not be dialled ahead of the peers the cap
-/// parked, which are proven and are the reason the raise happened.
+/// parked, which are proven and are the reason the raise happened. The one the adder is
+/// holding when the raise comes is a guess as much as the queued ones are, and waits its
+/// turn with them.
 async fn a_raise_dials_the_peers_it_parked_before_the_backlog_inner() {
     setup_test_logging();
 
     let swarm = swarm("rqbit_peer_limit_requeue", SEEDERS, 8_000_000).await;
-    // Stood up before the cap moves, so that nothing but the raise itself sits between
-    // the backlog arriving and the slots being handed out.
+
+    // A swarm naming addresses at a client with no slot to spare: every peer it has is one
+    // it wants, so these pile up undialled and the adder takes the first of them and stands
+    // on the semaphore holding it. Named before the cap moves so that it is holding one for
+    // certain by the time the raise comes, and so that nothing but the raise itself sits
+    // between the backlog arriving and the slots being handed out. Every one of them
+    // accepts and then says nothing, so a dial spent on one is a slot wedged for the read
+    // timeout.
     let backlog = tarpits(SEEDERS * 4).await;
+    for addr in &backlog.addrs {
+        assert!(swarm.live.add_peer_if_not_seen(*addr).unwrap());
+    }
 
     swarm.handle.set_peer_limit(LOWERED);
     wait_until(
@@ -626,12 +637,6 @@ async fn a_raise_dials_the_peers_it_parked_before_the_backlog_inner() {
     .await
     .unwrap();
 
-    // A swarm naming addresses at a backgrounded client. Every one of them accepts and
-    // then says nothing, so a dial spent on one is a dial wedged for the read timeout.
-    for addr in &backlog.addrs {
-        assert!(swarm.live.add_peer_if_not_seen(*addr).unwrap());
-    }
-
     let dialled_before = backlog.accepted.load(Ordering::Relaxed);
     swarm.handle.set_peer_limit(SEEDERS);
     wait_until(
@@ -647,15 +652,18 @@ async fn a_raise_dials_the_peers_it_parked_before_the_backlog_inner() {
     )
     .await
     .unwrap();
-    // Those slots went to peers we had already talked to. Asked of the other end, which
-    // knows for certain, where the peer counters cannot tell a re-queued peer from a fresh
-    // guess. Two addresses are allowed for: the adder holds one it took off the queue
-    // before the raise and could not dial until now, and a dial it started while the cap
-    // was low may be accepted only after the count above was read. Nine went this way
-    // before the parked peers had a queue of their own.
+    // Not one of them: every slot the raise gave out went to a peer we had already talked
+    // to, and the address the adder was holding waits its turn with the queued ones. Asked
+    // of the other end, which knows for certain, where the peer counters cannot tell a
+    // re-queued peer from a fresh guess. Nor can a dial started earlier be landing only
+    // now: until this raise every slot was either held by a peer we were keeping or on loan
+    // against the debt the lowering booked, so the adder never had one to spend. Nine went
+    // this way before the parked peers had a queue of their own, three more while the raise
+    // wrote off that debt before filling the queue, and one for as long as the adder dialled
+    // whatever it happened to be holding.
     let dialled = backlog.accepted.load(Ordering::Relaxed) - dialled_before;
-    assert!(
-        dialled <= 2,
+    assert_eq!(
+        dialled, 0,
         "the raise gave {dialled} of its slots to the backlog, ahead of the peers it parked"
     );
     info!(stats = ?swarm.peer_stats(), "the proven peers came back first");

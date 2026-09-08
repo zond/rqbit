@@ -703,28 +703,79 @@ impl TorrentStateLive {
         Ok(())
     }
 
+    /// Whether the peer adder should spend a slot dialling `addr`: a torrent that has
+    /// everything and will not upload wants nobody, and the session's own rules -- the
+    /// blocklist, the allowlist, ipv4-only -- rule out the rest. Marks a peer it turns down
+    /// on the first count as not needed, the way the adder always has.
+    fn worth_dialling(&self, session: &crate::Session, addr: SocketAddr) -> bool {
+        if self.shared.options.disable_upload() && self.is_finished_and_no_active_streams() {
+            debug!(?addr, "ignoring peer as we are finished");
+            self.peers.mark_peer_not_needed(addr);
+            return false;
+        }
+
+        if session.ipv4_only && addr.is_ipv6() {
+            debug!(?addr, "skipping ipv6 peer (ipv4_only=true)");
+            return false;
+        }
+
+        if addr.port() == 0 {
+            debug!(?addr, "skipping peer with port 0");
+            return false;
+        }
+
+        if session.blocklist.has(addr.ip()) {
+            session
+                .stats
+                .counters
+                .blocked_outgoing
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(?addr, "blocked outgoing connection (by the blacklist)");
+            return false;
+        }
+
+        if session
+            .allowlist
+            .as_ref()
+            .is_some_and(|l| !l.has(addr.ip()))
+        {
+            session
+                .stats
+                .counters
+                .blocked_outgoing
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(?addr, "blocked outgoing connection (by the allowlist)");
+            return false;
+        }
+
+        true
+    }
+
     async fn task_peer_adder(
         self: Arc<Self>,
         mut peer_queue_rx: UnboundedReceiver<SocketAddr>,
         mut peer_requeue_rx: UnboundedReceiver<SocketAddr>,
     ) -> crate::Result<()> {
         let state = self;
+        // A guess taken off the queue that no slot was free to dial. It waits here rather
+        // than going back on the queue, which would put it behind everything named since.
+        let mut in_hand: Option<SocketAddr> = None;
         loop {
             // Peers we have already talked to go first. A raised cap asks for every peer
             // the lowered one parked, and those are the proven ones -- at the back of a
             // queue holding whatever the trackers and the DHT named while the cap was low,
             // they would be dialled minutes after the app came back to the foreground.
-            let addr = tokio::select! {
-                biased;
-                addr = peer_requeue_rx.recv() => addr,
-                addr = peer_queue_rx.recv() => addr,
-            }
-            .ok_or(Error::TorrentIsNotLive)?;
-            if state.shared.options.disable_upload() && state.is_finished_and_no_active_streams() {
-                debug!(?addr, "ignoring peer as we are finished");
-                state.peers.mark_peer_not_needed(addr);
-                continue;
-            }
+            let (addr, is_proven) = match in_hand.take() {
+                Some(addr) => (addr, false),
+                None => {
+                    let (addr, is_proven) = tokio::select! {
+                        biased;
+                        addr = peer_requeue_rx.recv() => (addr, true),
+                        addr = peer_queue_rx.recv() => (addr, false),
+                    };
+                    (addr.ok_or(Error::TorrentIsNotLive)?, is_proven)
+                }
+            };
 
             let session = state
                 .shared
@@ -732,41 +783,31 @@ impl TorrentStateLive {
                 .upgrade()
                 .ok_or(Error::SessionDestroyed)?;
 
-            if session.ipv4_only && addr.is_ipv6() {
-                debug!(?addr, "skipping ipv6 peer (ipv4_only=true)");
-                continue;
-            }
-
-            if addr.port() == 0 {
-                debug!(?addr, "skipping peer with port 0");
-                continue;
-            }
-
-            if session.blocklist.has(addr.ip()) {
-                session
-                    .stats
-                    .counters
-                    .blocked_outgoing
-                    .fetch_add(1, Ordering::Relaxed);
-                debug!(?addr, "blocked outgoing connection (by the blacklist)");
-                continue;
-            }
-
-            if session
-                .allowlist
-                .as_ref()
-                .is_some_and(|l| !l.has(addr.ip()))
-            {
-                session
-                    .stats
-                    .counters
-                    .blocked_outgoing
-                    .fetch_add(1, Ordering::Relaxed);
-                debug!(?addr, "blocked outgoing connection (by the allowlist)");
+            if !state.worth_dialling(&session, addr) {
                 continue;
             }
 
             let permit = PeerPermit::acquire(&state).await?;
+            // The wait for that slot is as long as the cap is low, which on a backgrounded
+            // app is however long it stays in the background -- and what ends it is the
+            // raise, which asks for every peer it parked back before it hands a slot out.
+            // A guess picked up before that wait has no claim on the slot over them: let one
+            // of them have it and keep the guess for the next. A proven peer keeps the slot
+            // it waited for, so the order they were asked back in is the order they go out.
+            let addr = if is_proven {
+                addr
+            } else {
+                match peer_requeue_rx.try_recv() {
+                    Ok(proven) => {
+                        in_hand = Some(addr);
+                        if !state.worth_dialling(&session, proven) {
+                            continue;
+                        }
+                        proven
+                    }
+                    Err(_) => addr,
+                }
+            };
             // Claim the table slot under the same permit, before the spawn. A cap lowered
             // in between would find this peer neither `Live` nor `Connecting`, rank it as
             // absent and leave it unparked, and the swarm would settle one peer above the
@@ -1234,8 +1275,10 @@ impl TorrentStateLive {
     ///
     /// Raising it hands the peer adder that many more permits and asks for the parked peers
     /// back, ahead of every address a tracker or the DHT has named in the meantime -- see
-    /// [`Self::reconnect_all_not_needed_peers`]. They still come back over a moment rather
-    /// than at once, since each has to be dialled and handshaked again.
+    /// [`Self::reconnect_all_not_needed_peers`]. That includes the address the peer adder
+    /// is already holding when the raise arrives, which it hands the slot to a parked peer
+    /// instead. They still come back over a moment rather than at once, since each has to
+    /// be dialled and handshaked again.
     ///
     /// Only peers we have an address to dial come back that way -- one we dialled ourselves,
     /// or one that named its listening port in the extended handshake. A peer that dialled
