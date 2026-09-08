@@ -755,3 +755,70 @@ async fn test_e2e_unadvertised_pieces_gate_survives_a_refused_call() -> anyhow::
     )
     .await?
 }
+
+// The sequence set_pieces_advertised documents for a torrent that has to be added again
+// with the set already in force: add it paused, wait for the check of what is on disk to
+// finish, hold back, then unpause. The wait is the step that is easy to leave out and
+// cannot be skipped - add_torrent returns while the torrent is still `initializing`, and
+// holding back is refused there.
+async fn e2e_unadvertised_pieces_readded_paused() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (files, torrent_bytes, (session, seeder), addr) =
+        seeder("test_unadvertised_pieces_readd").await?;
+
+    // Out of the session, data left where it is. The set is per-session, so the torrent
+    // comes back announcing everything it finds - which is what the sequence is for.
+    session.delete(seeder.id().into(), false).await?;
+    drop(seeder);
+
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent_bytes.clone()),
+            Some(crate::AddTorrentOptions {
+                paused: true,
+                output_folder: Some(files.path().to_str().unwrap().to_owned()),
+                overwrite: true,
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+
+    // The step. Without it the torrent is still checking the files and the hold-back below
+    // is refused; with it the torrent is paused, which is a state this call serves.
+    timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+    assert!(handle.is_paused());
+    assert!(handle.live().is_none());
+    assert_eq!(
+        handle.set_pieces_advertised(HELD_BACK, false)?,
+        HELD_BACK.len()
+    );
+
+    // Only now does it get to talk to anyone, and the first bitfield it sends is already
+    // short.
+    session.unpause(&handle).await?;
+    timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
+
+    let leecher_dir = TempDir::with_prefix("test_unadvertised_pieces_readd_leecher")?;
+    let (_leecher_session, leecher) = leecher(&leecher_dir, &torrent_bytes, addr).await?;
+    let advertised = (HELD_BACK.end..TOTAL_PIECES).collect::<Vec<_>>();
+    wait_for_pieces(&leecher, &advertised).await?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        have_pieces(&leecher)?,
+        advertised,
+        "the peer got a piece held back on the torrent before it was ever unpaused"
+    );
+    assert!(!leecher.stats().finished);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_unadvertised_pieces_readded_paused() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_unadvertised_pieces_readded_paused(),
+    )
+    .await?
+}

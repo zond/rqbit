@@ -516,7 +516,14 @@ impl ManagedTorrent {
     /// we have is announced again.
     ///
     /// Whether that is recoverable depends on how the re-check came about. A torrent
-    /// added again is: add it paused, hold back what must be held back, then unpause it.
+    /// added again is, but not in one breath: adding it with
+    /// [`crate::AddTorrentOptions::paused`] returns while it is still `initializing` -
+    /// the check of what is on disk runs in the background - and this call refuses that
+    /// state. So: add it paused, await [`Self::wait_until_initialized`], which returns
+    /// once the check is done and the torrent is `paused`, hold back what must be held
+    /// back, then unpause. Nothing has been announced at any point in that, because a
+    /// torrent that has not been live has had no peers to announce to.
+    ///
     /// A torrent restarted after an error (`error` -> `initializing`) is not - the check
     /// runs in the background and the torrent goes initializing -> paused -> live in one
     /// locked step when it finishes, so there is no state a caller can catch it in and
