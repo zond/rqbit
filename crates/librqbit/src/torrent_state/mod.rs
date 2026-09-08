@@ -704,10 +704,16 @@ impl ManagedTorrent {
         peer_rx: Option<PeerStream>,
         start_paused: bool,
     ) -> anyhow::Result<()> {
+        // Everything below reads the pause intent off the guard (`g.paused`) rather
+        // than taking it as an argument. `start` writes the intent there before the
+        // first call, so within one synchronous call the two are the same thing - but
+        // the initial check's continuation runs after an await, by which time
+        // `pause`/`unpause` may have moved the intent, and an argument captured before
+        // the check would put the torrent in the state the caller asked for a whole
+        // check ago.
         fn _start<'a>(
             t: &'a Arc<ManagedTorrent>,
             peer_rx: Option<PeerStream>,
-            start_paused: bool,
             session: Arc<Session>,
             g: Option<parking_lot::RwLockWriteGuard<'a, ManagedTorrentLocked>>,
             token: CancellationToken,
@@ -790,7 +796,7 @@ impl ManagedTorrent {
 
                                     g.state = ManagedTorrentState::Paused(paused);
                                     t.state_change_notify.notify_waiters();
-                                    _start(&t, peer_rx, start_paused, session, Some(g), token)
+                                    _start(&t, peer_rx, session, Some(g), token)
                                 }
                                 Err(err) => {
                                     if init.is_pause_requested() {
@@ -810,7 +816,7 @@ impl ManagedTorrent {
                     Ok(())
                 }
                 ManagedTorrentState::Paused(_) => {
-                    if start_paused {
+                    if g.paused {
                         return Ok(());
                     }
                     let paused = g.state.take().assert_paused();
@@ -840,7 +846,7 @@ impl ManagedTorrent {
                     t.state_change_notify.notify_waiters();
 
                     // Recurse.
-                    _start(t, peer_rx, start_paused, session, Some(g), token)
+                    _start(t, peer_rx, session, Some(g), token)
                 }
                 ManagedTorrentState::None => bail!("bug: torrent is in empty state"),
             }
@@ -855,14 +861,7 @@ impl ManagedTorrent {
         g.paused = start_paused;
         let cancellation_token = session.cancellation_token().child_token();
 
-        _start(
-            self,
-            peer_rx,
-            start_paused,
-            session,
-            Some(g),
-            cancellation_token,
-        )
+        _start(self, peer_rx, session, Some(g), cancellation_token)
     }
 
     pub fn is_paused(&self) -> bool {
