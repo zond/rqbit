@@ -617,11 +617,21 @@ async fn e2e_unadvertised_pieces_gate_survives_two_callers() -> anyhow::Result<(
 
     // Two threads that live for the whole test and are let off a barrier together, rather
     // than a pair spawned per round: spawning them is slow enough that the first would be
-    // done before the second started, and there would be no race to lose. The window a
-    // wrong ordering leaves open is a few instructions wide, so the rounds are many and
-    // cheap - the whole thing is under a second, and it caught the bad ordering on every
-    // one of eight runs.
-    const ROUNDS: usize = 60000;
+    // done before the second started, and there would be no race to lose.
+    //
+    // This is a probabilistic test and cannot be made a deterministic one from out here:
+    // the losing interleave needs the advertising thread stopped in the few instructions
+    // between dropping the lock and storing the gate, and nothing outside the call can hold
+    // it there - only a hook in the production path could, which is not worth carrying. So
+    // it buys its odds with rounds. Measured against the wrong ordering (the gate stored
+    // after the lock is dropped) on a 20-run batch each: 60000 rounds caught it 15 times of
+    // 20, 240000 caught it 20 of 20. Hence the number below, at about 3 seconds - which
+    // costs the suite nothing, since another test in this file takes longer than that.
+    //
+    // A red run means a real violation whatever the odds are: the gate and the set are read
+    // with both threads parked on the barrier, so there is nothing in flight that could
+    // explain the two disagreeing.
+    const ROUNDS: usize = 240000;
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
     let failed = std::sync::Arc::new(parking_lot::Mutex::new(None));
     let caller = |advertised: bool| {
