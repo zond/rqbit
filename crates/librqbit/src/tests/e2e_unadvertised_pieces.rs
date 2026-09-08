@@ -434,9 +434,8 @@ async fn wait_for_live_peers(handle: &ManagedTorrent, n: u32) -> anyhow::Result<
 // knows only the middle and so can have learnt nothing anywhere else.
 async fn e2e_unadvertised_pieces_completing_while_held_back() -> anyhow::Result<()> {
     setup_test_logging();
-    let (seeder_files, torrent_bytes, (_seeder_session, _seeder), seeder_addr) =
+    let (_seeder_files, torrent_bytes, (_seeder_session, _seeder), seeder_addr) =
         seeder("test_unadvertised_pieces_completing").await?;
-    let orig_content = std::fs::read(seeder_files.path().join("0.data")).unwrap();
 
     // Held back before the middle has a single piece, and before it has anywhere to get
     // one: every piece it ever completes, it completes held back.
@@ -497,16 +496,35 @@ async fn e2e_unadvertised_pieces_completing_while_held_back() -> anyhow::Result<
 
     info!("nothing leaked, now advertising the lot");
 
-    // The control, and the reason the silence above means something: the same connection
-    // carries every one of those pieces the moment they are put back.
+    // The control, and the reason the silence above means something: that connection was
+    // never mute, it just had nothing to say. Put the pieces back and all sixteen Haves
+    // travel down it at once - the watcher goes from thinking we have nothing to thinking
+    // we have the lot. Same connection, so the counters must not move: a redial would
+    // carry the pieces too, in a fresh handshake bitfield, and would say nothing about
+    // the Have path.
+    let before = peer_connection_counters(&watcher, middle_addr)?;
     assert_eq!(
         middle.set_pieces_advertised(0..TOTAL_PIECES, true)?,
         TOTAL_PIECES as usize
     );
-    timeout(Duration::from_secs(30), watcher.wait_until_completed()).await??;
+    // What the watcher then downloads is not waited for here: its request loop parks on a
+    // five-second timer when a peer has nothing it wants, and nothing wakes it when that
+    // changes, so waiting for the transfer would time the timer and not the announcement.
+    // A piece put back reaching a connected peer's disk is what
+    // test_e2e_unadvertised_pieces_come_back asserts.
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if live_peers(&watcher)?.1 == 1 {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
     assert_eq!(
-        std::fs::read(watcher_dir.path().join("0.data")).unwrap(),
-        orig_content
+        peer_connection_counters(&watcher, middle_addr)?,
+        before,
+        "the watcher heard about the pieces on a new connection, so the Have did not reach it"
     );
     Ok(())
 }
