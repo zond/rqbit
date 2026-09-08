@@ -511,7 +511,11 @@ async fn a_parked_dial_gives_its_slot_back_at_once_inner() {
     const TARPITS: usize = 4;
     const KEPT: usize = 1;
 
-    let Tarpits { addrs, closed, .. } = tarpits(TARPITS).await;
+    let Tarpits {
+        addrs,
+        closed,
+        accepted,
+    } = tarpits(TARPITS).await;
 
     let tempdir = create_default_random_dir_with_torrents(1, 100_000, Some("rqbit_tarpit"));
     let torrent_file = create_torrent(
@@ -561,10 +565,22 @@ async fn a_parked_dial_gives_its_slot_back_at_once_inner() {
         .await
         .expect("the client torrent goes live");
 
+    // Wait for the far end, not for our own count of it. `connecting` is written when the
+    // adder claims the table slot, which is before the dial task has run, let alone opened
+    // a socket -- and a dial cancelled before it connects leaves nothing at the far end to
+    // close, so `closed` below could never reach `TARPITS - KEPT` and the wait for it would
+    // run out. The listeners know: a connection they have accepted is a socket that exists.
     wait_until(
-        || match live.stats_snapshot().peer_stats {
-            s if s.connecting as usize == TARPITS => Ok(()),
-            s => bail!("waiting for every dial to wedge in the handshake: {s:?}"),
+        || {
+            match (
+                live.stats_snapshot().peer_stats,
+                accepted.load(Ordering::Relaxed),
+            ) {
+                (s, a) if s.connecting as usize == TARPITS && a == TARPITS => Ok(()),
+                (s, a) => bail!(
+                    "waiting for every dial to reach a listener and wedge in the handshake: {s:?}, {a} accepted"
+                ),
+            }
         },
         WAIT,
     )
