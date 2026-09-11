@@ -39,7 +39,13 @@ const FILE_SIZE: usize = (PIECE_LEN * 8) as usize;
 /// Peers to try. Each is a closed port on localhost, so each dies with an error the moment
 /// it is tried - the path that holds a shard while asking the state lock. Many of them
 /// also make the peer table big, so re-queueing under the state lock takes a while.
-const PEERS: usize = 2000;
+///
+/// Fewer on Windows, where a connect to a closed localhost port is not refused at once:
+/// the stack retries the SYN for about a second before it gives up, so 2000 of them could
+/// not all die inside the wait below (the first CI run saw 924). The race still gets
+/// hundreds of dying peers, and the debug builds' order assertion - which is what catches
+/// an inversion deterministically - fires on the first call either way.
+const PEERS: usize = if cfg!(windows) { 400 } else { 2000 };
 /// Selections to flip between. Neither is ever finished (nothing is downloaded), so every
 /// flip walks the whole peer table looking for peers to re-queue. It never finds one - a
 /// refused connect leaves its peer dead, not not-needed - but it is the walk, not the
