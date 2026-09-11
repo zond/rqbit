@@ -84,7 +84,7 @@ There are also unit tests next to the code they cover (`chunk_tracker.rs`, `piec
 
 ---
 
-*Everything below is upstream's README, unchanged.*
+*Everything below is upstream's README, unchanged apart from the notes marked "Fork note".*
 
 ---
 
@@ -193,6 +193,8 @@ I've got a report that rqbit can saturate a 20Gbps link, although I don't have t
 
 ## Installation
 
+> **Fork note:** everything in this section installs upstream's rqbit, not this fork. The fork publishes no builds; build it from source (see [Build](#build)).
+
 There are pre-built binaries in [Releases](https://github.com/ikatson/rqbit/releases).
 
 [![](https://repology.org/badge/vertical-allrepos/rqbit.svg)](https://repology.org/project/rqbit/versions)
@@ -212,6 +214,8 @@ cargo install rqbit
 ```
 
 ## Docker
+
+> **Fork note:** these images are upstream's, not built from this fork.
 
 Docker images are published at [ikatson/rqbit](https://hub.docker.com/r/ikatson/rqbit)
 
