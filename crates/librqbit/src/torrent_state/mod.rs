@@ -263,6 +263,13 @@ pub struct ManagedTorrent {
 /// [`crate::storage::TorrentStorage::has_piece`], so a piece the caller has not deleted
 /// yet comes back as one we have. Dropping the claim in that state logs a warning and
 /// does nothing else. Finish releasing before restarting an errored torrent.
+///
+/// Dropping it takes the torrent's lock for writing, on the thread that drops it. So drop
+/// it where that thread holds no lock of this torrent: inside
+/// [`ManagedTorrent::with_state`] the drop waits for a lock the thread already holds, and
+/// never returns. It does not hand the release to a task when the lock is busy instead,
+/// because the release has to be done by the time the drop returns: a caller that drops
+/// the claim and then asks for the same pieces again must find them free.
 #[must_use = "the pieces stay claimed until this is dropped: release their storage first"]
 pub struct DroppedPieces {
     torrent: Weak<ManagedTorrent>,
