@@ -236,13 +236,17 @@ impl AsyncRead for FileStream {
         }));
         if !have {
             debug!(stream_id = self.stream_id, file_id = self.file_id, piece_id = %current.id, "poll pending, not have");
-            // When the torrent finished, the peers that had all of it were sent away
+            // Nothing else asks for the peers a parked read may need. When the torrent
+            // finished, the peers that had all of it were sent away
             // (TorrentStateLive::on_piece_completed), and a stream that was already open
-            // then is the one thing that can want a piece again afterwards - by seeking
-            // into a range that has since been dropped. Nothing else brings those peers
-            // back for it, so a read that has to wait asks for them here. Cheap: only a
-            // read that is about to park gets this far, and it is a no-op unless the
-            // file is unfinished and some peer is parked.
+            // then is the one thing that can want a piece again afterwards, by seeking
+            // into a range that has since been dropped. And a peer still connected that
+            // found nothing to ask for sleeps until a piece is queued or its timer fires,
+            // five seconds on, while a dropped piece comes in through the stream's
+            // priority window and is never queued. So a read that has to wait brings the
+            // first back and wakes the second. Only a read about to park gets this far,
+            // and for a finished file it does nothing; otherwise each idle requester
+            // wakes, looks once, and sleeps again.
             self.torrent
                 .maybe_reconnect_needed_peers_for_file(self.file_id);
             return Poll::Pending;
