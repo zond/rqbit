@@ -367,6 +367,16 @@ impl LivePeerState {
         }
     }
 
+    /// Take back a request we marked in flight and never sent. Unlike
+    /// [`Self::remove_inflight_request`] it spends none of the late-cancel tolerance when
+    /// the request is already gone: a choke's handback may have forgotten it first, and
+    /// that is not a chunk arriving.
+    pub fn withdraw_unsent_request(&mut self, chunk: &ChunkInfo) {
+        if self.inflight_requests.remove(chunk) {
+            self.request_slots_changed.notify_waiters();
+        }
+    }
+
     pub fn cancel_inflight_requests_for_piece(&mut self, piece: ValidPieceIndex) {
         let tx = &self.tx;
         let late_cancelled_request_tolerance = &mut self.late_cancelled_request_tolerance;

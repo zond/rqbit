@@ -2492,7 +2492,7 @@ impl PeerHandler {
                 }
             };
 
-            for chunk in self.state.lengths.iter_chunk_infos(next) {
+            'chunks: for chunk in self.state.lengths.iter_chunk_infos(next) {
                 let request = Request {
                     index: next.get(),
                     begin: chunk.offset,
@@ -2513,34 +2513,54 @@ impl PeerHandler {
                         .await?;
                 }
 
-                aframe!(self.wait_for_request_slot()).await;
+                // The slot was free when we looked, but a Choke can land between that look
+                // and the insert, and its handback may already have forgotten our requests:
+                // this one would then be marked in flight after the choke discarded the rest,
+                // sent to a peer that drops it, and its piece left reserved to us with
+                // nothing ever asking for it again. So the choke is asked once more after the
+                // insert, which the handback cannot slip past: it sets the flag before it
+                // forgets, so a request inserted before the forget goes with the rest, and one
+                // inserted after it finds the flag here and is taken back to wait for the
+                // unchoke.
+                loop {
+                    aframe!(self.wait_for_request_slot()).await;
 
-                match self
-                    .state
-                    .peers
-                    .with_live_mut(handle, "add chunk request", |live| {
-                        live.add_inflight_request(chunk)
-                    }) {
-                    Some(true) => {}
-                    Some(false) => {
-                        // This request was already in-flight for this peer for this chunk.
-                        // This might happen in theory, but not very likely.
-                        //
-                        // Example:
-                        // someone stole a piece from us, and then died, the piece became "needed" again, and we reserved it
-                        // all before the piece request was processed by us.
-                        warn!(
-                            id = self.state.shared.id,
-                            info_hash = ?self.state.shared.info_hash,
-                            addr = ?self.addr,
-                            "we already requested {:?} previously",
-                            chunk
-                        );
-                        continue;
+                    match self
+                        .state
+                        .peers
+                        .with_live_mut(handle, "add chunk request", |live| {
+                            live.add_inflight_request(chunk)
+                        }) {
+                        Some(true) => {}
+                        Some(false) => {
+                            // This request was already in-flight for this peer for this chunk.
+                            // This might happen in theory, but not very likely.
+                            //
+                            // Example:
+                            // someone stole a piece from us, and then died, the piece became "needed" again, and we reserved it
+                            // all before the piece request was processed by us.
+                            warn!(
+                                id = self.state.shared.id,
+                                info_hash = ?self.state.shared.info_hash,
+                                addr = ?self.addr,
+                                "we already requested {:?} previously",
+                                chunk
+                            );
+                            continue 'chunks;
+                        }
+                        // peer died
+                        None => return Ok(()),
+                    };
+
+                    if !self.is_choked() {
+                        break;
                     }
-                    // peer died
-                    None => return Ok(()),
-                };
+                    self.state
+                        .peers
+                        .with_live_mut(handle, "withdraw chunk request", |live| {
+                            live.withdraw_unsent_request(&chunk)
+                        });
+                }
 
                 if self
                     .tx
