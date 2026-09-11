@@ -1,3 +1,93 @@
+# zond/rqbit: a fork of rqbit
+
+This is zond's fork of [ikatson/rqbit](https://github.com/ikatson/rqbit), kept for [stream-server](https://github.com/zond/stream-server) and [xtremio](https://github.com/zond/xtremio). It is not meant to go upstream, and no pull requests are planned.
+
+## Branches
+
+- **`pinned`** is the branch consumers build. They depend on `librqbit` by git `rev`, not by branch, so a push here reaches them only when they bump the rev.
+- `pinned` is rebased onto `upstream/main` from time to time, which rewrites its commit hashes. Some earlier tips are kept as `pinned-<short-sha>` tags.
+- The other branches here (`main`, and branches that each carry a single change) are not what consumers build.
+
+The fork publishes no binaries, crates, Docker images or desktop builds. The Releases, crates.io, docs.rs, Homebrew and Docker links in the upstream README below point at upstream's builds.
+
+## What the fork adds
+
+All of it is in `librqbit`, apart from the TLS change, which also covers `librqbit-upnp` and `upnp-serve`. The fork adds nothing to the `rqbit` CLI or the Web UI. The HTTP API gains two things: the stream route's `lookahead_bytes` query parameter and a `live_seeders` stats field.
+
+**Piece reclaim: dropping pieces.** For keeping a bounded cache of a torrent larger than the disk.
+
+- `AddTorrentOptions::piece_reclaim` (off by default) turns it on for one torrent. `add_torrent` refuses it unless the storage factory's `StorageFactory::ensure_can_release_pieces` says the storage can release a single piece. The default filesystem storage can't. `storage::examples::inmemory::InMemoryPieceStorageFactory` (feature `storage_examples`) is an example storage that can.
+- `ManagedTorrent::drop_pieces(range)` forgets the pieces we have in that range, stops advertising them and stops wanting them. It also drops pieces we don't have. It returns a `DroppedPieces` claim: release the storage of `pieces()`, then drop the claim. Nothing downloads those pieces again while the claim is alive. It skips pieces a live stream's lookahead covers, pieces a peer is downloading or hash-checking, and pieces an earlier claim still holds. It works on a live or a paused torrent.
+- A dropped piece is wanted again after `ManagedTorrent::reselect_pieces(range)`, after its file is re-selected with `update_only_files`, or when a stream's lookahead reaches it.
+- The flag is persisted with the torrent. The set of dropped pieces is not. A restored reclaim torrent always starts paused, so the caller can drop what it doesn't want before it unpauses.
+- `TorrentStorage::has_piece` lets a storage say at startup which pieces it still holds. A piece counts as ours only if the resume data (or the full check) and the storage both say so.
+
+**Holding pieces back from announcements.** `ManagedTorrent::set_pieces_advertised(range, false)` leaves pieces out of the handshake bitfield and sends no Have for them. They are still downloaded, readable by streams, and served to a peer that asks for them. `set_pieces_advertised(range, true)` puts them back and sends connected peers a Have for each one we have. It works on a live or a paused torrent and needs no option. The set is not persisted. It survives a pause but not a re-check.
+
+**Session upload switch.** `Session::set_upload_enabled(false)` chokes every peer of every torrent, including peers that connect later, and keeps them choked. Downloading carries on, and the bitfield and Haves still say what we have. `set_upload_enabled(true)` unchokes them again, and `Session::upload_enabled()` reads the switch. This is not the same as the `disable-upload` build feature, which hangs up on a peer that asks for data.
+
+**Choke handback.** When a peer chokes us, the requests the choke discarded are forgotten and their pieces go back into the queue. Upstream left them reserved to that peer until a steal or a disconnect freed them.
+
+**Runtime peer cap.** `ManagedTorrent::set_peer_limit(n)` changes a torrent's live-peer cap while it runs. Lowering it disconnects the surplus, least useful first: peers still connecting, then peers with nothing to exchange in either direction, then peers that moved the fewest bytes lately (sent and received count the same). Raising it re-dials the peers it parked that have an address we can dial, ahead of newly discovered addresses. `ManagedTorrentShared::peer_limit()` reads the cap. `TorrentStateLive::forget_disconnected_peers()` removes dead and parked entries from the peer table. `DEFAULT_PEER_LIMIT` is 128, upstream's default, and applies when neither the torrent nor the session sets a limit.
+
+**Per-piece chunk progress and live-seeder stats.** `ManagedTorrent::piece_chunk_progress(piece)` returns a `PieceChunkProgress`: `downloaded_chunks` and `total_chunks` (16 KiB chunks), plus `verified`. The chunk count is downloaded, not verified, so it goes back to zero if the piece fails its hash check. The aggregate peer stats gain `live_seeders`, the number of connected peers that have the whole torrent. The HTTP API shows it in `GET /torrents/{id_or_infohash}/stats/v1`.
+
+**Stream lookahead.** `FileStreamOptions { lookahead_bytes }`, passed to `ManagedTorrent::stream_with_options` or `Api::api_stream_with_options`, sets how far ahead of the reader pieces are prioritized. The default, `DEFAULT_STREAM_LOOKAHEAD_BYTES`, is upstream's 32 MiB. Over HTTP it is `GET /torrents/{id_or_infohash}/stream/{file_idx}?lookahead_bytes=N`. The server refuses 0 and anything over 1 GiB (1073741824) with 400.
+
+**Storage.**
+
+- Commit before have: `TorrentStorage::on_piece_completed` runs after the hash check and before the piece is marked have. If it returns an error, the torrent stops with a fatal error.
+- Vectored writes: `Box<dyn TorrentStorage>` and the storage middlewares now forward `pwrite_all_vectored`, `has_piece` and `on_piece_completed`. Before, they fell back to the trait defaults, so vectored writes never reached the storage.
+- The filesystem storage can write past 2 GiB where `off_t` is 32 bits, as on 32-bit Android.
+- Session persistence accepts any storage whose factory implements `StorageFactory::ensure_persistable`. Upstream accepted only `FilesystemStorageFactory`. The default implementation refuses, and the filesystem storage accepts.
+
+**Lock-order fix.** `update_only_files` no longer holds the torrent's state lock while it re-queues peers. Under peer churn, holding it could deadlock against a dying peer. Debug builds assert the lock order.
+
+**TLS roots.** With `rust-tls` and without `default-tls`, every HTTP client that `librqbit` and `librqbit-upnp` build trusts only Mozilla's root certificates compiled into the binary (`webpki-root-certs`), not the platform store. `librqbit::http_client_builder()` returns a client builder with that policy, for embedders.
+
+**CI on `pinned`.** `.github/workflows/test.yml` also runs on pushes to `pinned`, and one failing matrix entry no longer cancels the others (`fail-fast: false`).
+
+## Behaviour if you don't opt in
+
+This is meant to match upstream. `piece_reclaim` is off by default, and the code behind it is gated on that flag. Nothing is held back until you call `set_pieces_advertised`. Uploading stays on until you call `set_upload_enabled(false)`. The peer cap and the stream lookahead have upstream's defaults.
+
+These changes apply to every user, opted in or not:
+
+- **Chokes:** a choke hands back the requests it discarded (see above).
+- **Not interested:** a peer's `NotInterested` now clears its interested flag. Upstream logged it and ignored it. So a finished torrent now disconnects a peer that has the whole torrent once that peer says it is no longer interested. Upstream kept such a peer, because the flag never went back to false.
+- **Haves:** we send Haves to a peer that hasn't sent us a bitfield. Upstream read the empty bitfield as "already has it" and sent that peer none.
+- **Piece picking:** a peer reserves a free piece before stealing one. The only steal ahead of the queue is the first piece of a stream's lookahead window, and only from a peer 10x slower. Upstream stole first.
+- **Peer deaths and reconnects:** in-flight pieces are reserved to a connection, not just an address. They are handed back whatever state the peer's table entry is in. A dying connection no longer overwrites a newer connection's entry for the same address. Peers we have already talked to are re-dialled ahead of newly discovered addresses.
+- **Writes:** a chunk that arrives in two parts of the peer's read buffer now reaches the filesystem storage as one `pwritev`. Upstream split it into two writes, because `Box<dyn TorrentStorage>` did not forward the vectored call.
+- **Streams:** a read that has to wait for a piece re-queues peers that were sent away and wakes connected peers that had nothing to request.
+- **Bug fixes:**
+  - the `update_only_files` lock order;
+  - the chunk tracker now clears a piece's queue bit and counts the piece into its files at the moment it becomes have;
+  - `wait_until_completed` no longer misses a completion that lands just as it starts waiting;
+  - vectored writes past 2 GiB on 32-bit targets.
+- **Storage implementers:** an error from `on_piece_completed` is now fatal to the torrent, and the call comes before the piece is marked have. Upstream called it afterwards and logged errors at debug level. `has_piece` (default `Ok(true)`) is asked at startup. The wrappers forward the methods listed above.
+- **Persistence format:** JSON records gain a `piece_reclaim` field (a missing field reads as false). Postgres gets a `piece_reclaim BOOLEAN NOT NULL DEFAULT FALSE` column, added with `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` when the store opens.
+- **TLS under `rust-tls`:** a CA installed on the device, such as a corporate proxy or mitmproxy, no longer verifies rqbit's HTTPS. A root that Mozilla adds after the build is not trusted until you rebuild. Under `default-tls`, which the `rqbit` binary uses by default, nothing changes.
+
+## Tests
+
+The fork's tests are in `crates/librqbit/src/tests/`:
+
+- `e2e_piece_reclaim.rs`
+- `e2e_unadvertised_pieces.rs`
+- `e2e_upload_switch.rs`
+- `e2e_peer_limit.rs`
+- `e2e_pause.rs`
+- `lock_order.rs` and `session_persistence.rs`
+
+There are also unit tests next to the code they cover (`chunk_tracker.rs`, `piece_tracker.rs`, the storage modules). `crates/librqbit/tests/tls_roots.rs` only builds with `rust-tls` and without `default-tls`, on Linux, so a default-feature `cargo test` (which is what CI runs) skips it.
+
+---
+
+*Everything below is upstream's README, unchanged.*
+
+---
+
 [![crates.io](https://img.shields.io/crates/v/rqbit.svg)](https://crates.io/crates/rqbit)
 [![crates.io](https://img.shields.io/crates/v/librqbit.svg)](https://crates.io/crates/librqbit)
 [![docs.rs](https://img.shields.io/docsrs/librqbit.svg)](https://docs.rs/librqbit/latest/librqbit/)
