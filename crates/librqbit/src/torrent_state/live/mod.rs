@@ -298,6 +298,9 @@ pub struct TorrentStateLive {
         ChunkInfo,
     )>,
     ratelimits: Limits,
+    /// The session's upload switch ([`Session::set_upload_enabled`]), or `None` for a
+    /// torrent whose session was gone when it went live, which uploads.
+    upload_enabled: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl TorrentStateLive {
@@ -342,6 +345,11 @@ impl TorrentStateLive {
             ChunkInfo,
         )>();
         let ratelimits = Limits::new(paused.shared.options.ratelimits);
+        let upload_enabled = paused
+            .shared
+            .session
+            .upgrade()
+            .map(|session| session.upload_enabled.subscribe());
 
         let state = Arc::new(TorrentStateLive {
             shared: paused.shared.clone(),
@@ -382,6 +390,7 @@ impl TorrentStateLive {
                 .collect(),
             ratelimit_upload_tx,
             ratelimits,
+            upload_enabled,
         });
 
         state.spawn(
@@ -602,7 +611,8 @@ impl TorrentStateLive {
             Some(options),
             self.shared.spawner.clone(),
             self.shared.connector.clone(),
-        );
+        )
+        .with_upload_switch(self.upload_enabled.clone());
         let requester = handler.task_peer_chunk_requester();
 
         let res = tokio::select! {
@@ -665,7 +675,8 @@ impl TorrentStateLive {
             Some(options),
             state.shared.spawner.clone(),
             state.shared.connector.clone(),
-        );
+        )
+        .with_upload_switch(state.upload_enabled.clone());
         let requester = aframe!(
             handler
                 .task_peer_chunk_requester()
