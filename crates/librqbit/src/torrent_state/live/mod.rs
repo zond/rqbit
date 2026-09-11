@@ -950,11 +950,20 @@ impl TorrentStateLive {
         }
     }
 
+    /// Wait until every piece of the selected files is had (see `is_finished`).
+    ///
+    /// The waiter is registered before the check, not after it: `notify_waiters` stores no
+    /// permit, so a completion landing between a check that said "not yet" and a waiter
+    /// created afterwards was never seen, and the caller waited for a completion that had
+    /// already happened.
     pub async fn wait_until_completed(&self) {
+        let notified = self.finished_notify.notified();
+        let mut notified = std::pin::pin!(notified);
+        notified.as_mut().enable();
         if self.is_finished() {
             return;
         }
-        self.finished_notify.notified().await;
+        notified.await;
     }
 
     pub fn pause(&self) -> anyhow::Result<TorrentStatePaused> {
