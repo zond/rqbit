@@ -413,10 +413,13 @@ impl ManagedTorrent {
     /// nothing of ours to release behind such a piece, but a half-finished download may
     /// have left something, and the piece is in the returned list so that can go too.
     ///
-    /// Skipped: pieces already dropped; pieces that a live stream is about to read -
-    /// dropping those would only make them be re-requested at once; and pieces a peer is
-    /// working on, in-flight or fully downloaded and being hash-checked, which complete
-    /// and can be dropped then.
+    /// A piece already dropped is in the list again, so a caller whose release failed can
+    /// retry it.
+    ///
+    /// Skipped: pieces an earlier claim still holds; pieces that a live stream is about
+    /// to read - dropping those would only make them be re-requested at once; and pieces
+    /// a peer is working on, in-flight or fully downloaded and being hash-checked, which
+    /// complete and can be dropped then.
     ///
     /// A dropped piece stays dropped until [`Self::reselect_pieces`] is called for it,
     /// the file it belongs to is re-selected through `update_only_files`, or a live

@@ -308,9 +308,10 @@ impl ChunkTracker {
     /// the caller's job, and takes a storage that can let one piece go; see
     /// [`crate::ManagedTorrent::drop_pieces`].
     ///
-    /// Pieces already dropped are skipped, and so is a piece a peer is working on: one
-    /// that is in-flight - `is_inflight` says, the tracker has no view of that - or one
-    /// whose chunks are all in and whose hash is being checked, which is neither in-flight
+    /// A piece already dropped is handed out again, with nothing else changed, so that a
+    /// caller whose release failed to take the storage can ask again - unless a claim
+    /// still holds it. A piece a peer is working on is skipped: one that is in-flight -
+    /// `is_inflight` says, the tracker has no view of that - or one whose chunks are all in and whose hash is being checked, which is neither in-flight
     /// nor have. Dropping either would hand the caller a piece to delete while a peer is
     /// still writing it, or the storage still committing it; it completes, becomes have,
     /// and can be dropped then. It is the caller's job not to pass pieces that a live
@@ -396,7 +397,8 @@ impl ChunkTracker {
         Ok(res)
     }
 
-    // Returns true if the piece was dropped: it wasn't already, and no peer is working on it.
+    // Returns true if the piece is the caller's to release: no other claim holds it, and
+    // no peer is working on it.
     fn drop_piece(
         &mut self,
         file_infos: &FileInfos,
@@ -404,10 +406,16 @@ impl ChunkTracker {
         is_inflight: &impl Fn(ValidPieceIndex) -> bool,
     ) -> bool {
         let id = index.get() as usize;
-        match self.reclaim.as_ref() {
-            Some(r) if !r.dropped[id] => {}
-            _ => return false,
+        let Some(r) = self.reclaim.as_ref() else {
+            return false;
+        };
+        // Another caller is releasing it right now. A second claim on it would have the
+        // first one's finish_release() let the piece be downloaded while the second
+        // caller is still deleting its storage.
+        if r.releasing.contains(&index) {
+            return false;
         }
+        let already_dropped = r.dropped[id];
         let have = self.have.as_slice()[id];
         if !have {
             // Not had and not selected is not the same as nothing behind it: a piece whose
@@ -426,6 +434,13 @@ impl ChunkTracker {
             if downloading || is_inflight(index) {
                 return false;
             }
+        }
+        // Handed out again, with nothing to change: the bookkeeping was done the first
+        // time. A caller whose release could not take the storage - an unlink the volume
+        // refused - still has it on the disk, and asking again is its only way to retry.
+        // Refusing here left such a piece there until a restart.
+        if already_dropped {
+            return true;
         }
         if let Some(r) = self.reclaim.as_mut() {
             r.dropped.set(id, true);
@@ -1572,12 +1587,67 @@ mod piece_reclaim_tests {
         assert!(ct.is_piece_dropped(piece(&l, 0)));
         assert!(ct.is_finished());
 
-        // Dropping what is already dropped is a no-op, so a policy can be sloppy about it.
+        // Dropping it again while the first claim stands hands out nothing: two claims on
+        // one piece and the first release would open it for download under the second.
         assert!(
             ct.drop_pieces(&fi, [piece(&l, 0)], |_| false)
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    // A release can fail to take the storage - the volume refuses an unlink - and the
+    // bytes stay behind a piece that is already dropped. Asking again is the caller's only
+    // retry, so a dropped piece nobody holds a claim on is handed out again, and nothing
+    // it was counted in moves a second time.
+    #[test]
+    fn test_a_dropped_piece_is_handed_out_again_once_its_claim_is_gone() {
+        let l = lengths();
+        let fi = file_infos();
+        let mut ct = tracker(l, &fi);
+        ct.enable_piece_reclaim();
+        for id in 0..3 {
+            download(&mut ct, &l, id);
+        }
+        let p0 = piece(&l, 0);
+        assert_eq!(ct.drop_pieces(&fi, [p0], |_| false).unwrap(), [p0]);
+        assert!(ct.drop_pieces(&fi, [p0], |_| false).unwrap().is_empty());
+        assert_eq!(ct.finish_release([p0]), 0);
+        let after_the_first = snapshot(&ct);
+
+        assert_eq!(ct.drop_pieces(&fi, [p0], |_| false).unwrap(), [p0]);
+        assert!(ct.is_releasing(p0));
+        assert!(ct.is_piece_dropped(p0));
+        assert_eq!(snapshot(&ct), after_the_first);
+        assert!(ct.is_finished());
+        assert_eq!(ct.finish_release([p0]), 0);
+
+        // A live stream's priority window can pull a dropped piece back in without the
+        // queue. While its chunks are arriving it is a peer's, and not handed out.
+        let block = vec![0u8; CHUNK_SIZE as usize];
+        ct.mark_chunk_downloaded(&Piece::from_data(p0.get(), 0, &block))
+            .unwrap();
+        assert!(ct.drop_pieces(&fi, [p0], |_| false).unwrap().is_empty());
+    }
+
+    // A piece reselected while its claim is still being released is not dropped again
+    // under that claim: the first release would let it be downloaded while the second
+    // caller is deleting its storage.
+    #[test]
+    fn test_a_piece_under_release_is_not_claimed_twice() {
+        let l = lengths();
+        let fi = file_infos();
+        let mut ct = tracker(l, &fi);
+        ct.enable_piece_reclaim();
+        for id in 0..3 {
+            download(&mut ct, &l, id);
+        }
+        let p0 = piece(&l, 0);
+        assert_eq!(ct.drop_pieces(&fi, [p0], |_| false).unwrap(), [p0]);
+        ct.reselect_pieces([p0], |_| false).unwrap();
+        assert!(!ct.is_piece_dropped(p0));
+        assert!(ct.drop_pieces(&fi, [p0], |_| false).unwrap().is_empty());
+        assert!(!ct.is_piece_dropped(p0));
     }
 
     #[test]
