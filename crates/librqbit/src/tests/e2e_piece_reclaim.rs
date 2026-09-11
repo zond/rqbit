@@ -1343,11 +1343,28 @@ async fn e2e_piece_reclaim_resume_data_is_intersected_with_storage() -> anyhow::
     // The have-bitfield as it stands with everything downloaded. This is what is on disk
     // at the moment of the crash below: dropping pieces defers the flush to the same
     // 16 MiB threshold as completing them, and this torrent is 256 KiB.
-    let bitv = std::fs::read_dir(&persistence_folder)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| p.extension().is_some_and(|e| e == "bitv"))
-        .context("expected a .bitv file in the persistence folder")?;
-    let resume_before_drop = std::fs::read(&bitv)?;
+    //
+    // Polled until it says every piece. wait_until_completed answers from the have-set,
+    // which the last piece joins a moment before its completion flushes the file, so a
+    // read straight after it can miss that piece -- and the restart below then rightly
+    // does not have it, which failed this test on the macOS runner (piece 8, the last to
+    // finish there).
+    let mut on_disk = None;
+    for _ in 0..100 {
+        let bitv = std::fs::read_dir(&persistence_folder)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.extension().is_some_and(|e| e == "bitv"));
+        if let Some(bitv) = bitv {
+            let bytes = std::fs::read(&bitv)?;
+            if bytes.iter().map(|b| b.count_ones()).sum::<u32>() == TOTAL_PIECES {
+                on_disk = Some((bitv, bytes));
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (bitv, resume_before_drop) =
+        on_disk.context("the completion never flushed a bitfield with every piece in it")?;
 
     // The caller takes half the pieces and releases their storage.
     let dropped = handle.drop_pieces(DROP)?;
