@@ -54,9 +54,9 @@ This is meant to match upstream. `piece_reclaim` is off by default, and the code
 These changes apply to every user, opted in or not:
 
 - **Chokes:** a choke hands back the requests it discarded (see above).
-- **Not interested:** a peer's `NotInterested` now clears its interested flag. Upstream logged it and ignored it. So a finished torrent now disconnects a peer that has the whole torrent once that peer says it is no longer interested. Upstream kept such a peer, because the flag never went back to false.
+- **Not interested:** a peer's `NotInterested` now clears its interested flag. Upstream logged it and ignored it. So a finished torrent with no stream open now disconnects a peer that has the whole torrent once that peer says it is no longer interested. Upstream kept such a peer, because the flag never went back to false.
 - **Haves:** we send Haves to a peer that hasn't sent us a bitfield. Upstream read the empty bitfield as "already has it" and sent that peer none.
-- **Piece picking:** a peer reserves a free piece before stealing one. The only steal ahead of the queue is the first piece of a stream's lookahead window, and only from a peer 10x slower. Upstream stole first.
+- **Piece picking:** a peer reserves a free piece before stealing one. The only steal ahead of the queue is for a stream: when every piece of its lookahead window that this peer could take is already in flight, it takes the first of them, and only from a peer 10x slower. Upstream tried a steal from any 10x slower peer before it looked for a free piece.
 - **Peer deaths and reconnects:** in-flight pieces are reserved to a connection, not just an address. They are handed back whatever state the peer's table entry is in. A dying connection no longer overwrites a newer connection's entry for the same address. Peers we have already talked to are re-dialled ahead of newly discovered addresses.
 - **Writes:** a chunk that arrives in two parts of the peer's read buffer now reaches the filesystem storage's vectored write: one `pwritev` on Unix, and one write of the joined parts on other platforms. Upstream wrote the two parts with two separate writes, because `Box<dyn TorrentStorage>` did not forward the vectored call.
 - **Streams:** a read that has to wait for a piece re-queues peers that were sent away and wakes connected peers that had nothing to request.
