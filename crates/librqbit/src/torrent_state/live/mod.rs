@@ -1187,6 +1187,10 @@ impl TorrentStateLive {
         // With the state lock released. A dying peer holds its shard of the peer table
         // while it asks whether the torrent is finished (on_peer_died), so touching the
         // table under the state lock is the reverse order, and the two deadlock.
+        //
+        // The question here is whether there is something to fetch, which is the stats'
+        // `finished` and not is_finished(): a selection whose missing pieces are all
+        // dropped gives the peers nothing to do.
         if !hns.finished() {
             self.reconnect_all_not_needed_peers();
         }
@@ -1194,8 +1198,17 @@ impl TorrentStateLive {
     }
 
     // If we have all selected pieces but not necessarily all pieces.
+    //
+    // Not the stats' `finished`, which is "nothing left that we want". A caller keeping a
+    // bounded window drops what is outside it, so every time the window filled that said
+    // finished, and a finished torrent hangs up on the seeders it no longer needs: the
+    // caller's next reselect had to dial them all again, a connect, a handshake and a
+    // bitfield per window, and the torrent announced it had finished downloading, flushed
+    // the bitfield and woke the waiters for completion once per window.
     pub(crate) fn is_finished(&self) -> bool {
-        self.get_hns().map(|h| h.finished()).unwrap_or_default()
+        self.lock_read("is_finished")
+            .get_chunks()
+            .is_ok_and(|c| c.has_all_selected_pieces())
     }
 
     fn has_active_streams_unfinished_files(&self, state: &TorrentStateLocked) -> bool {
@@ -1230,7 +1243,8 @@ impl TorrentStateLive {
         }
 
         let chunks = locked.get_chunks()?;
-        if chunks.is_finished() {
+        // See is_finished() for why not the stats' `finished`.
+        if chunks.has_all_selected_pieces() {
             if chunks.get_selected_pieces()[id.get_usize()] {
                 locked.try_flush_bitv(&self.shared, false);
                 info!(id=self.shared.id, info_hash=?self.shared.info_hash, "torrent finished downloading");

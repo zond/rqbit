@@ -19,6 +19,7 @@ use crate::{
     spawn_utils::BlockingSpawner,
     storage::{StorageFactoryExt, examples::inmemory::InMemoryPieceStorageFactory},
     tests::test_util::{TestPeerMetadata, setup_test_logging},
+    torrent_state::live::peer::stats::snapshot::{PeerStatsFilter, PeerStatsFilterState},
 };
 
 use super::test_util::create_default_random_dir_with_torrents;
@@ -846,6 +847,106 @@ async fn test_e2e_piece_reclaim_seek_back_after_finishing() -> anyhow::Result<()
     timeout(
         Duration::from_secs(120),
         e2e_piece_reclaim_seek_back_after_finishing(),
+    )
+    .await?
+}
+
+// A caller keeping a bounded window drops what is outside it before it arrives, and
+// wants it again as the window moves. The moment the window is in, the torrent wants
+// nothing - and has half of its file. It used to call that finished and hang up on the
+// seeder it was downloading from, as a finished torrent does, so the reselect that moved
+// the window had to dial it all over again: a connect, a handshake and a bitfield per
+// window, with no stream open to keep the seeder around.
+async fn e2e_piece_reclaim_a_full_window_keeps_its_seeder() -> anyhow::Result<()> {
+    const WINDOW: std::ops::Range<u32> = 0..TOTAL_PIECES / 2;
+    const REST: std::ops::Range<u32> = WINDOW.end..TOTAL_PIECES;
+    setup_test_logging();
+    let (files, torrent_bytes, _server_session, peer) =
+        seeding_server("test_piece_reclaim_window", FILE_SIZE).await?;
+    let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
+
+    let storage = InMemoryPieceStorageFactory::default();
+    let dir = TempDir::with_prefix("test_piece_reclaim_window_client")?;
+    let session = Session::new_with_opts(
+        dir.path().into(),
+        crate::SessionOptions {
+            dht: None,
+            persistence: None,
+            peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    // Paused, so the rest is dropped before a single piece of it can arrive.
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent_bytes.to_owned()),
+            Some(crate::AddTorrentOptions {
+                paused: true,
+                initial_peers: Some(vec![peer]),
+                piece_reclaim: true,
+                storage_factory: Some(storage.clone().boxed()),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+    let claim = handle.drop_pieces(REST)?;
+    assert_eq!(claim.pieces(), REST.collect::<Vec<_>>());
+    drop(claim);
+    session.unpause(&handle).await?;
+
+    // The window is in: nothing left that the torrent wants.
+    timeout(Duration::from_secs(30), async {
+        while !handle.stats().finished {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?;
+    let live = handle.live().context("expected a live torrent")?;
+    assert!(
+        !live.is_finished(),
+        "half the file is missing, so the torrent is not finished"
+    );
+    // Two things hang up on a seeder once the torrent is finished: the piece that finishes
+    // it, at once, and the seeder's own request loop, the next time it wakes to look for
+    // work - which, with nothing to ask for, is on a five-second timer. So watched for
+    // longer than that.
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        assert_eq!(
+            live.stats_snapshot().peer_stats.live,
+            1,
+            "the torrent hung up on its seeder once the window was in"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The window moves on.
+    assert_eq!(handle.reselect_pieces(REST)?, REST.len());
+    timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
+    assert_eq!(read_back(handle.clone()).await?, orig_content);
+    let stats = live.per_peer_stats_snapshot(PeerStatsFilter {
+        state: PeerStatsFilterState::All,
+    });
+    let seeder = stats
+        .peers
+        .get(&peer.to_string())
+        .context("expected the seeder in the peer table")?;
+    assert_eq!(
+        seeder.counters.connection_attempts, 1,
+        "the next window had to dial the seeder again"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_piece_reclaim_a_full_window_keeps_its_seeder() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_piece_reclaim_a_full_window_keeps_its_seeder(),
     )
     .await?
 }

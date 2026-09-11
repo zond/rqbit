@@ -831,8 +831,30 @@ impl ChunkTracker {
             .unwrap_or(true)
     }
 
+    // Nothing left that we want. The live torrent asks has_all_selected_pieces() instead.
+    #[cfg(test)]
     pub(crate) fn is_finished(&self) -> bool {
         self.get_hns().finished()
+    }
+
+    /// Whether we have every piece of the selected files, wanted or not.
+    ///
+    /// Not [`HaveNeededSelected::finished`], which is "nothing left that we want": a piece
+    /// we stopped wanting through drop_pieces() is not one we need. A caller keeping a
+    /// bounded window drops everything outside it, pieces it never had included, so each
+    /// time the window fills the torrent wants nothing - and it has a fraction of its
+    /// files, and will want the next window as soon as the caller moves it.
+    pub(crate) fn has_all_selected_pieces(&self) -> bool {
+        // Something we want and lack.
+        if !self.hns.finished() {
+            return false;
+        }
+        // Every selected piece we still want is had, so what is left is whether a selected
+        // piece is one we stopped wanting - and those we lack: a drop clears the have-bit,
+        // a completion undrops. Without reclaim there are none.
+        self.reclaim
+            .as_ref()
+            .is_none_or(|r| r.dropped.iter_ones().all(|id| !self.selected[id]))
     }
 
     pub fn per_file_have_bytes(&self) -> &[u64] {
@@ -1705,6 +1727,46 @@ mod piece_reclaim_tests {
                 needed_bytes: 0,
                 selected_bytes: PIECE_LEN as u64 * 2,
             }
+        );
+    }
+
+    // A full window is not a whole torrent. A caller keeping a window drops what is outside
+    // it before it has it, so once the window is in, nothing is left that we want - and
+    // pieces of the selected files are still missing. Only a dropped piece in a file nobody
+    // selected is not.
+    #[test]
+    fn test_wanting_nothing_is_not_having_every_selected_piece() {
+        let l = lengths();
+        let fi = file_infos();
+        let mut ct = tracker(l, &fi);
+        ct.enable_piece_reclaim();
+        assert!(
+            !ct.has_all_selected_pieces(),
+            "nothing had, all of it wanted"
+        );
+
+        // The window is piece 0; the rest go before they arrive.
+        ct.drop_pieces(&fi, [piece(&l, 1), piece(&l, 2)], |_| false)
+            .unwrap();
+        download(&mut ct, &l, 0);
+        assert!(ct.is_finished(), "nothing left that we want");
+        assert!(
+            !ct.has_all_selected_pieces(),
+            "and two pieces of the selected files that we lack"
+        );
+
+        // File 1 deselected: piece 2 is dropped and in no selected file. Piece 1 is in
+        // file 0, still selected, and still dropped.
+        ct.update_only_files(&fi, &HashSet::from_iter([0])).unwrap();
+        assert_eq!(selected(&ct), vec![0, 1]);
+        assert!(!ct.has_all_selected_pieces());
+
+        ct.reselect_pieces([piece(&l, 1)], |_| false).unwrap();
+        download(&mut ct, &l, 1);
+        assert!(ct.is_piece_dropped(piece(&l, 2)));
+        assert!(
+            ct.has_all_selected_pieces(),
+            "the only piece we lack is in a file nobody selected"
         );
     }
 
