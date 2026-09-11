@@ -12,7 +12,7 @@ The fork publishes no binaries, crates, Docker images or desktop builds. The Rel
 
 ## What the fork adds
 
-All of it is in `librqbit`, apart from the TLS change, which also covers `librqbit-upnp` and `upnp-serve`. The fork adds nothing to the `rqbit` CLI or the Web UI. The HTTP API gains two things: the stream route's `lookahead_bytes` query parameter and a `live_seeders` stats field.
+All of the code is in `librqbit`, apart from the TLS change, which also covers `librqbit-upnp` and `upnp-serve`, and the CI change. The fork adds nothing to the `rqbit` CLI or the Web UI. The HTTP API gains two things: the stream route's `lookahead_bytes` query parameter and a `live_seeders` stats field.
 
 **Piece reclaim: dropping pieces.** For keeping a bounded cache of a torrent larger than the disk.
 
@@ -30,7 +30,7 @@ All of it is in `librqbit`, apart from the TLS change, which also covers `librqb
 
 **Runtime peer cap.** `ManagedTorrent::set_peer_limit(n)` changes a torrent's live-peer cap while it runs. Lowering it disconnects the surplus, least useful first: peers still connecting, then peers with nothing to exchange in either direction, then peers that moved the fewest bytes lately (sent and received count the same). Raising it re-dials the peers it parked that have an address we can dial, ahead of newly discovered addresses. `ManagedTorrentShared::peer_limit()` reads the cap. `TorrentStateLive::forget_disconnected_peers()` removes dead and parked entries from the peer table. `DEFAULT_PEER_LIMIT` is 128, upstream's default, and applies when neither the torrent nor the session sets a limit.
 
-**Per-piece chunk progress and live-seeder stats.** `ManagedTorrent::piece_chunk_progress(piece)` returns a `PieceChunkProgress`: `downloaded_chunks` and `total_chunks` (16 KiB chunks), plus `verified`. The chunk count is downloaded, not verified, so it goes back to zero if the piece fails its hash check. The aggregate peer stats gain `live_seeders`, the number of connected peers that have the whole torrent. The HTTP API shows it in `GET /torrents/{id_or_infohash}/stats/v1`.
+**Per-piece chunk progress and live-seeder stats.** `ManagedTorrent::piece_chunk_progress(piece)` returns a `PieceChunkProgress`: `downloaded_chunks` and `total_chunks` (16 KiB chunks), plus `verified`. The chunk count is downloaded, not verified, so it goes back to zero if the piece fails its hash check. The aggregate peer stats gain `live_seeders`, the number of connected peers that have the whole torrent. The HTTP API shows it per torrent in `GET /torrents/{id_or_infohash}/stats/v1`, and summed over the session in `GET /stats`.
 
 **Stream lookahead.** `FileStreamOptions { lookahead_bytes }`, passed to `ManagedTorrent::stream_with_options` or `Api::api_stream_with_options`, sets how far ahead of the reader pieces are prioritized. The default, `DEFAULT_STREAM_LOOKAHEAD_BYTES`, is upstream's 32 MiB. Over HTTP it is `GET /torrents/{id_or_infohash}/stream/{file_idx}?lookahead_bytes=N`. The server refuses 0 and anything over 1 GiB (1073741824) with 400.
 
