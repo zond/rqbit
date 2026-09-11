@@ -464,9 +464,10 @@ impl ChunkTracker {
         if self.selected[id] {
             self.hns.selected_bytes -= len;
             // A piece we had wasn't needed and still isn't, so needed_bytes doesn't move:
-            // that keeps the torrent "finished" and progress at 100% instead of re-opening
-            // a torrent the user already finished. A piece we didn't have was needed, and
-            // now isn't.
+            // that keeps the stats' `finished` and progress at 100% instead of re-opening
+            // a torrent the user already finished. The live torrent's own "finished" is
+            // has_all_selected_pieces(), and this drop does take that away. A piece we
+            // didn't have was needed, and now isn't.
             if !have {
                 self.hns.needed_bytes -= len;
             }
