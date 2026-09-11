@@ -1747,6 +1747,32 @@ impl PeerHandler {
 
     fn on_i_am_choked(&self) {
         self.lock_flow_control("i_am_choked = true").i_am_choked = true;
+        // A choke discards every request we have outstanding with this peer, and without
+        // the fast extension nothing says which. Kept, they would hold their pieces
+        // reserved to a peer that is not going to send them: the unchoke that follows
+        // asks for new pieces, and the stranded ones wait for a steal - which needs a
+        // faster peer to steal them, so a torrent with one peer stalled short of the end.
+        // The same handback as a dying peer's, and in the same order: the table first,
+        // then the pieces, never both locks at once.
+        let dropped = self
+            .state
+            .peers
+            .with_live_mut(self.addr, "forget_inflight_requests_on_choke", |live| {
+                live.forget_inflight_requests_on_choke()
+            })
+            .unwrap_or(0);
+        if dropped > 0 {
+            let released = self
+                .state
+                .lock_write("release_choked_peer_pieces")
+                .get_pieces_mut()
+                .map(|pieces| pieces.release_pieces_owned_by(self.addr))
+                .unwrap_or(0);
+            trace!(dropped, released, "choked, handed our requests back");
+            if released > 0 {
+                self.state.new_pieces_notify.notify_waiters();
+            }
+        }
         self.notify_request_slots_changed();
     }
 
