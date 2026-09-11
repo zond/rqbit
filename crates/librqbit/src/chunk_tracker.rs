@@ -396,7 +396,7 @@ impl ChunkTracker {
         Ok(res)
     }
 
-    // Returns true if the piece was dropped, i.e. if we had it or wanted it.
+    // Returns true if the piece was dropped: it wasn't already, and no peer is working on it.
     fn drop_piece(
         &mut self,
         file_infos: &FileInfos,
@@ -410,10 +410,13 @@ impl ChunkTracker {
         }
         let have = self.have.as_slice()[id];
         if !have {
-            // Not have and not selected is already everything dropping would make it.
-            if !self.selected[id] {
-                return false;
-            }
+            // Not had and not selected is not the same as nothing behind it: a piece whose
+            // hash failed the initial check, or one written after the last bitfield flush
+            // before a crash, is in the storage and not in the have-set. In a file nobody
+            // selects, nothing downloads it again, so the caller's release is the only
+            // thing that can take that storage, and a piece left out of the claim is a
+            // piece it can never take.
+            //
             // A peer is working on it: in-flight, or fully downloaded and being
             // hash-checked. See drop_pieces().
             let downloading = self
@@ -1701,6 +1704,40 @@ mod piece_reclaim_tests {
         assert!(!ct.is_piece_dropped(piece(&l, 2)));
         assert_eq!(queued(&ct), vec![2]);
         assert!(!ct.is_finished());
+    }
+
+    // A piece we don't have in a file nobody selected can still have storage behind it:
+    // a hash that failed the initial check, or a piece written after the last bitfield
+    // flush before a crash. Nothing downloads it again, so the claim is the only way its
+    // storage goes, and it has to be in it.
+    #[test]
+    fn test_a_piece_we_lack_in_a_deselected_file_is_dropped_too() {
+        let l = lengths();
+        let fi = file_infos();
+        let mut ct = tracker(l, &fi);
+        ct.enable_piece_reclaim();
+        download(&mut ct, &l, 0);
+        download(&mut ct, &l, 1);
+        ct.update_only_files(&fi, &HashSet::from_iter([0])).unwrap();
+        assert_eq!(selected(&ct), vec![0, 1]);
+        let before = snapshot(&ct);
+
+        assert_eq!(
+            ct.drop_pieces(&fi, [piece(&l, 2)], |_| false).unwrap(),
+            [piece(&l, 2)]
+        );
+        assert!(ct.is_piece_dropped(piece(&l, 2)));
+        assert!(ct.is_releasing(piece(&l, 2)));
+        // Nothing it counted moves: it was neither had, nor needed, nor selected.
+        assert_eq!(snapshot(&ct), before);
+        assert!(ct.is_finished());
+
+        // Asking for the file back still outranks the drop.
+        assert_eq!(ct.finish_release([piece(&l, 2)]), 0);
+        ct.update_only_files(&fi, &HashSet::from_iter([0, 1]))
+            .unwrap();
+        assert!(!ct.is_piece_dropped(piece(&l, 2)));
+        assert_eq!(queued(&ct), vec![2]);
     }
 
     // The want-set is per-session. The have-bitfield is the only per-piece state that
