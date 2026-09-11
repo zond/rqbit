@@ -586,6 +586,7 @@ impl TorrentStateLive {
         permit: PeerPermit,
     ) -> crate::Result<()> {
         let handler = PeerHandler {
+            connection: next_connection(),
             addr: checked_peer.addr,
             incoming: true,
             on_bitfield_notify: Default::default(),
@@ -649,6 +650,7 @@ impl TorrentStateLive {
     ) -> crate::Result<()> {
         let state = self;
         let handler = PeerHandler {
+            connection: next_connection(),
             addr,
             incoming: false,
             on_bitfield_notify: Default::default(),
@@ -1289,18 +1291,8 @@ impl TorrentStateLive {
         buf: &mut [u8],
     ) -> anyhow::Result<()> {
         let (tx, _rx) = unbounded_channel();
-        let handler = PeerHandler {
-            state: self.clone(),
-            counters: Default::default(),
-            flow_control: Mutex::new(PeerFlowControl::default()),
-            on_bitfield_notify: Notify::new(),
-            addr: SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 1)),
-            incoming: true,
-            tx,
-            first_message_received: AtomicBool::new(true),
-            cancel_token: CancellationToken::new(),
-            client_name_and_version: String::new(),
-        };
+        let handler =
+            PeerHandler::for_test(self.clone(), SocketAddr::from(([127, 0, 0, 1], 1)), tx);
         (&handler).read_chunk(chunk, buf)
     }
 
@@ -1742,10 +1734,19 @@ impl Default for PeerFlowControl {
     }
 }
 
+// A number no other connection of this process has had.
+fn next_connection() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 // All peer state that would never be used by other actors should pe put here.
 // This state tracks a live peer.
 struct PeerHandler {
     state: Arc<TorrentStateLive>,
+    // Which connection to `addr` this is. The pieces it reserves are reserved to it, and
+    // not to whichever connection to the same address comes next.
+    connection: u64,
     counters: Arc<AtomicPeerCounters>,
     // Semantically, we don't need a lock here, as this is only requested from
     // one future (requester + manage_peer).
@@ -2019,22 +2020,44 @@ impl PeerConnectionHandler for &'_ PeerHandler {
 }
 
 impl PeerHandler {
+    /// A handler for a connection to `addr` that no socket is behind, unchoked. Tests only.
+    #[cfg(test)]
+    fn for_test(state: Arc<TorrentStateLive>, addr: SocketAddr, tx: PeerTx) -> Self {
+        PeerHandler {
+            state,
+            connection: next_connection(),
+            counters: Default::default(),
+            flow_control: Mutex::new(PeerFlowControl {
+                i_am_choked: false,
+                ..Default::default()
+            }),
+            on_bitfield_notify: Notify::new(),
+            addr,
+            incoming: false,
+            tx,
+            first_message_received: AtomicBool::new(true),
+            cancel_token: CancellationToken::new(),
+            client_name_and_version: String::new(),
+        }
+    }
+
     fn on_peer_died(self, error: Option<crate::Error>) -> crate::Result<()> {
         let peers = &self.state.peers;
         let handle = self.addr;
 
         // The task that is dying may still own pieces it reserved while it was live, and a
-        // reserved piece is owned by an address, not by a table entry: the entry may since
+        // reserved piece is owned by a connection, not by a table entry: the entry may since
         // have been parked by a lowered peer limit, re-queued by a raised one, given to a
         // fresh dial, or dropped outright by `forget_disconnected_peers`. Hand the pieces
         // back before the table is even looked at -- until they are back in the queue
         // nobody else may download them, and the torrent stalls until a steal comes by.
+        // Only this connection's: a fresh dial to the same address has pieces of its own.
         // Not fatal if the chunk tracker is gone: the torrent is being paused.
         let released = self
             .state
             .lock_write("release_dead_peer_pieces")
             .get_pieces_mut()
-            .map(|pieces| pieces.release_pieces_owned_by(self.addr))
+            .map(|pieces| pieces.release_pieces_owned_by(self.addr, self.connection))
             .unwrap_or(0);
         if released > 0 {
             trace!(
@@ -2219,6 +2242,7 @@ impl PeerHandler {
                 let pieces = pieces.as_mut().ok_or(Error::ChunkTrackerEmpty)?;
                 let result = pieces.acquire_piece(AcquireRequest {
                     peer: self.addr,
+                    connection: self.connection,
                     peer_avg_time: self.counters.average_piece_download_time(),
                     priority_pieces: self.state.streams.iter_next_pieces(&self.state.lengths),
                     file_priorities,
@@ -2550,7 +2574,7 @@ impl PeerHandler {
                 .state
                 .lock_write("release_choked_peer_pieces")
                 .get_pieces_mut()
-                .map(|pieces| pieces.release_pieces_owned_by(self.addr))
+                .map(|pieces| pieces.release_pieces_owned_by(self.addr, self.connection))
                 .unwrap_or(0);
             trace!(dropped, released, "choked, handed our requests back");
             if released > 0 {
@@ -2988,6 +3012,103 @@ fn format_peer_client_name(value: &ByteBuf<'_>) -> Option<String> {
     }
 
     Some(client_name)
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use std::{
+        net::{Ipv4Addr, SocketAddr},
+        time::Duration,
+    };
+
+    use anyhow::Context;
+    use librqbit_core::{constants::CHUNK_SIZE, hash_id::Id20};
+    use tempfile::TempDir;
+    use tokio::sync::mpsc::unbounded_channel;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{BF, PeerHandler};
+    use crate::{
+        AddTorrent, CreateTorrentOptions, Session, create_torrent,
+        spawn_utils::BlockingSpawner,
+        stream_connect::ConnectionKind,
+        tests::test_util::{
+            TestPeerMetadata, create_default_random_dir_with_torrents, setup_test_logging,
+        },
+    };
+
+    // Two connections to one address, alive at once: a task winding down, and a fresh dial
+    // that already has the table entry. The old one's death hands back its own pieces and
+    // leaves the new one's reserved to it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dying_connection_hands_back_only_its_own_pieces() -> anyhow::Result<()> {
+        setup_test_logging();
+        let files = create_default_random_dir_with_torrents(
+            1,
+            CHUNK_SIZE as usize * 8,
+            Some("connection_pieces"),
+        );
+        let torrent = create_torrent(
+            files.path(),
+            CreateTorrentOptions {
+                piece_length: Some(CHUNK_SIZE),
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await?;
+        // Somewhere else, so it has nothing and wants all of it.
+        let dir = TempDir::with_prefix("connection_pieces_client")?;
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            crate::SessionOptions {
+                dht: None,
+                persistence: None,
+                peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let handle = session
+            .add_torrent(AddTorrent::from_bytes(torrent.as_bytes()?.to_vec()), None)
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        tokio::time::timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+        let live = handle.live().context("expected a live torrent")?;
+
+        // The table entry is the new connection's, live and holding every piece.
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1));
+        live.peers
+            .add_if_not_seen(addr)
+            .context("a fresh address")?;
+        let (_new_rx, new_tx) = live
+            .peers
+            .mark_peer_connecting(addr, CancellationToken::new())?;
+        live.peers.with_peer_mut(addr, "test", |p| {
+            p.connecting_to_live(Id20::new([0u8; 20]), &live.peers, ConnectionKind::Tcp);
+        });
+        live.peers.with_live_mut(addr, "test", |l| {
+            l.bitfield = BF::from_boxed_slice(vec![0xff].into_boxed_slice());
+        });
+        let (old_tx, _old_rx) = unbounded_channel();
+        let old = PeerHandler::for_test(live.clone(), addr, old_tx);
+        let new = PeerHandler::for_test(live.clone(), addr, new_tx);
+
+        let old_piece = old
+            .acquire_next_piece()?
+            .context("the old one gets a piece")?;
+        let new_piece = new.acquire_next_piece()?.context("so does the new one")?;
+        assert_ne!(old_piece, new_piece);
+
+        old.on_peer_died(None)?;
+        assert_eq!(
+            live.inflight_piece_owners(),
+            vec![(new_piece.get(), addr)],
+            "the old connection's death took the new one's piece with it, or kept its own"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]

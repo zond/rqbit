@@ -33,6 +33,8 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct InflightPiece {
     pub peer: PeerHandle,
+    /// Which connection to `peer` reserved it: see [`AcquireRequest::connection`].
+    pub connection: u64,
     pub started: Instant,
 }
 
@@ -59,6 +61,10 @@ where
 {
     /// The peer requesting a piece.
     pub peer: PeerHandle,
+    /// Which connection to that peer is asking. Two connections can share an address in
+    /// turn - a peer redialled while its old task is still winding down - and each hands
+    /// back only the pieces it reserved: see [`PieceTracker::release_pieces_owned_by`].
+    pub connection: u64,
     /// The peer's average piece download time (for steal calculations).
     pub peer_avg_time: Option<Duration>,
     /// Priority pieces to check first (e.g., for streaming).
@@ -152,7 +158,7 @@ impl PieceTracker {
                 continue;
             }
             match self.inflight.get(&piece) {
-                None => return self.reserve_piece(piece, req.peer),
+                None => return self.reserve_piece(piece, req.peer, req.connection),
                 Some(inflight) => {
                     if held_priority_piece.is_none() && inflight.peer != req.peer {
                         held_priority_piece = Some(piece);
@@ -175,7 +181,7 @@ impl PieceTracker {
 
         for piece in queued {
             if (req.peer_has_piece)(piece) && !self.chunks.is_releasing(piece) {
-                return self.reserve_piece(piece, req.peer);
+                return self.reserve_piece(piece, req.peer, req.connection);
             }
         }
 
@@ -189,12 +195,18 @@ impl PieceTracker {
     }
 
     /// Reserve a piece: remove from queue, add to inflight.
-    fn reserve_piece(&mut self, piece: ValidPieceIndex, peer: PeerHandle) -> AcquireResult {
+    fn reserve_piece(
+        &mut self,
+        piece: ValidPieceIndex,
+        peer: PeerHandle,
+        connection: u64,
+    ) -> AcquireResult {
         self.chunks.reserve_needed_piece(piece);
         self.inflight.insert(
             piece,
             InflightPiece {
                 peer,
+                connection,
                 started: Instant::now(),
             },
         );
@@ -256,6 +268,7 @@ impl PieceTracker {
         // Update ownership (piece stays in inflight, just changes owner)
         let info = self.inflight.get_mut(&piece)?;
         info.peer = req.peer;
+        info.connection = req.connection;
         info.started = Instant::now();
 
         Some(AcquireResult::Stolen {
@@ -287,16 +300,21 @@ impl PieceTracker {
         self.chunks.mark_piece_broken_if_not_have(piece);
     }
 
-    /// Release all pieces owned by a peer (on peer death).
+    /// Release all pieces one connection to a peer owns (on its death, or a choke).
     ///
     /// Moves all pieces owned by the peer from IN_FLIGHT back to QUEUED.
     /// Returns the number of pieces released.
-    pub fn release_pieces_owned_by(&mut self, peer: PeerHandle) -> usize {
+    ///
+    /// By connection and not by address alone: a task that is winding down asks after its
+    /// address has been dialled again, and the address alone would hand back the new
+    /// connection's pieces too. It goes on asking for their chunks and throws away every
+    /// one that arrives, since the piece is no longer reserved to it.
+    pub fn release_pieces_owned_by(&mut self, peer: PeerHandle, connection: u64) -> usize {
         // Collect pieces to release (can't modify while iterating)
         let pieces_to_release: Vec<_> = self
             .inflight
             .iter()
-            .filter(|(_, info)| info.peer == peer)
+            .filter(|(_, info)| info.peer == peer && info.connection == connection)
             .map(|(p, _)| *p)
             .collect();
 
@@ -518,6 +536,7 @@ mod tests {
     ) -> AcquireResult {
         tracker.acquire_piece(AcquireRequest {
             peer: peer(1),
+            connection: 0,
             peer_avg_time: None,
             priority_pieces: priority.into_iter(),
             file_priorities,
@@ -716,6 +735,7 @@ mod tests {
 
         let result = tracker.acquire_piece(AcquireRequest {
             peer: peer(1),
+            connection: 0,
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
@@ -749,6 +769,7 @@ mod tests {
         // With filter >= 2, we get 4 first (skips 0, takes 4)
         let result = tracker.acquire_piece(AcquireRequest {
             peer: peer(1),
+            connection: 0,
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
@@ -777,6 +798,7 @@ mod tests {
         // Reserve a piece first
         let result = tracker.acquire_piece(AcquireRequest {
             peer: peer(1),
+            connection: 0,
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
@@ -810,6 +832,7 @@ mod tests {
         // Reserve piece 0
         let result = tracker.acquire_piece(AcquireRequest {
             peer: peer(1),
+            connection: 0,
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
@@ -838,6 +861,7 @@ mod tests {
         // Should be back in queue - verify by trying to reserve it again
         let result2 = tracker.acquire_piece(AcquireRequest {
             peer: peer(2),
+            connection: 0,
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
@@ -850,6 +874,59 @@ mod tests {
             AcquireResult::Reserved(p) => assert_eq!(p, piece),
             _ => panic!("Expected piece to be re-reservable after fail"),
         }
+    }
+
+    // Two connections to one address in turn, the first still winding down when the
+    // second reserves: the first one's death hands back what it reserved and nothing else.
+    #[test]
+    fn test_release_pieces_owned_by_one_connection() {
+        let chunks = make_test_chunk_tracker(5);
+        let mut tracker = PieceTracker::new(chunks);
+        let file_infos = make_test_file_infos(5);
+        let file_priorities = make_default_file_priorities(&file_infos);
+        let mut acquire = |connection| match tracker.acquire_piece(AcquireRequest {
+            peer: peer(1),
+            connection,
+            peer_avg_time: None,
+            priority_pieces: std::iter::empty(),
+            file_priorities: &file_priorities,
+            file_infos: &file_infos,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+        }) {
+            AcquireResult::Reserved(p) => p,
+            other => panic!("expected Reserved, got {other:?}"),
+        };
+        let old = acquire(1);
+        let new = acquire(2);
+
+        assert_eq!(tracker.release_pieces_owned_by(peer(1), 1), 1);
+        assert!(!tracker.is_inflight(old));
+        assert!(
+            tracker.is_inflight(new),
+            "the new connection lost its piece"
+        );
+
+        // A steal hands the piece to the thief's connection, whose death hands it back.
+        let stolen = tracker.acquire_piece(AcquireRequest {
+            peer: peer(2),
+            connection: 3,
+            peer_avg_time: Some(Duration::ZERO),
+            priority_pieces: std::iter::empty(),
+            file_priorities: &file_priorities,
+            file_infos: &file_infos,
+            peer_has_piece: |p| p == new,
+            can_steal: |_| true,
+        });
+        assert!(
+            matches!(stolen, AcquireResult::Stolen { piece, .. } if piece == new),
+            "{stolen:?}"
+        );
+        assert_eq!(tracker.release_pieces_owned_by(peer(2), 3), 1);
+        assert!(
+            !tracker.is_inflight(new),
+            "the thief's death kept the piece"
+        );
     }
 
     #[test]
@@ -867,6 +944,7 @@ mod tests {
         // So peer A gets pieces 0 and 4
         let piece_a1 = match tracker.acquire_piece(AcquireRequest {
             peer: peer_a,
+            connection: 0,
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
@@ -879,6 +957,7 @@ mod tests {
         };
         let piece_a2 = match tracker.acquire_piece(AcquireRequest {
             peer: peer_a,
+            connection: 0,
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
@@ -893,6 +972,7 @@ mod tests {
         // Peer B reserves next piece
         let piece_b = match tracker.acquire_piece(AcquireRequest {
             peer: peer_b,
+            connection: 0,
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
@@ -910,7 +990,7 @@ mod tests {
         assert!(tracker.is_inflight(piece_b));
 
         // Peer A dies
-        let released = tracker.release_pieces_owned_by(peer_a);
+        let released = tracker.release_pieces_owned_by(peer_a, 0);
         assert_eq!(released, 2);
         assert_eq!(tracker.inflight_count(), 1); // Only peer B's piece remains
 
@@ -932,6 +1012,7 @@ mod tests {
         // Reserve pieces 0 and 1
         tracker.acquire_piece(AcquireRequest {
             peer: peer(1),
+            connection: 0,
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
@@ -941,6 +1022,7 @@ mod tests {
         });
         tracker.acquire_piece(AcquireRequest {
             peer: peer(1),
+            connection: 0,
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
@@ -958,6 +1040,7 @@ mod tests {
         let mut new_tracker = PieceTracker::new(chunks);
         let result = new_tracker.acquire_piece(AcquireRequest {
             peer: peer(2),
+            connection: 0,
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
@@ -996,6 +1079,7 @@ mod tests {
 
         let result = tracker.acquire_piece(AcquireRequest {
             peer: peer(1),
+            connection: 0,
             peer_avg_time: None,
             priority_pieces: priority.into_iter(),
             file_priorities: &file_priorities,
@@ -1022,6 +1106,7 @@ mod tests {
         // Peer has no pieces
         let result = tracker.acquire_piece(AcquireRequest {
             peer: peer(1),
+            connection: 0,
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
@@ -1065,7 +1150,7 @@ mod tests {
         let file_priorities = make_default_file_priorities(&file_infos);
 
         // The incumbent is sitting on piece 0, and has been for an age by our standards.
-        tracker.reserve_piece(piece(&tracker, 0), peer(1));
+        tracker.reserve_piece(piece(&tracker, 0), peer(1), 0);
         tracker
             .inflight
             .get_mut(&piece(&tracker, 0))
@@ -1075,6 +1160,7 @@ mod tests {
         let acquire = |tracker: &mut PieceTracker| {
             tracker.acquire_piece(AcquireRequest {
                 peer: peer(2),
+                connection: 0,
                 // Fast: the incumbent is a thousand times over the 10x bar.
                 peer_avg_time: Some(Duration::from_millis(600)),
                 priority_pieces: std::iter::empty(),
@@ -1114,12 +1200,13 @@ mod tests {
         let file_priorities = make_default_file_priorities(&file_infos);
 
         let stream_piece = piece(&tracker, 3);
-        tracker.reserve_piece(stream_piece, peer(1));
+        tracker.reserve_piece(stream_piece, peer(1), 0);
         tracker.inflight.get_mut(&stream_piece).unwrap().started =
             Instant::now() - Duration::from_secs(600);
 
         let result = tracker.acquire_piece(AcquireRequest {
             peer: peer(2),
+            connection: 0,
             peer_avg_time: Some(Duration::from_millis(600)),
             priority_pieces: std::iter::once(stream_piece),
             file_priorities: &file_priorities,
@@ -1155,6 +1242,7 @@ mod tests {
         // Peer A reserves pieces 0 and 4 (first two in iteration order)
         let piece_0 = match tracker.acquire_piece(AcquireRequest {
             peer: peer_a,
+            connection: 0,
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
@@ -1171,6 +1259,7 @@ mod tests {
 
         let piece_4 = match tracker.acquire_piece(AcquireRequest {
             peer: peer_a,
+            connection: 0,
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
@@ -1193,6 +1282,7 @@ mod tests {
         // - peer_has_piece returns true ONLY for piece 4, NOT piece 0
         let result = tracker.acquire_piece(AcquireRequest {
             peer: peer_b,
+            connection: 0,
             peer_avg_time: Some(Duration::from_millis(1)),
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
