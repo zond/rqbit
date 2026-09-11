@@ -317,6 +317,14 @@ impl TorrentStorage for InMemoryPieceStorage {
     }
 
     fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+        // A chunk that arrived in one contiguous buffer is written as two slices, the
+        // second one empty, at the offset where the chunk ends. For the last chunk of the
+        // torrent that offset is in no piece at all, and the write failed the torrent. For
+        // any other it is the start of the next piece, and the write staged an empty copy
+        // of that piece, which reads then preferred over the complete one.
+        if buf.is_empty() {
+            return Ok(());
+        }
         let (piece_id, piece_offset) =
             piece_and_offset(&self.lengths, &self.file_infos, file_id, offset)?;
         let mut g = self.store.write();
@@ -467,6 +475,43 @@ mod tests {
         assert!(!storage.has_piece(piece).unwrap());
         assert_eq!(factory.piece_count(torrent()), 0);
         assert!(storage.pread_exact(0, 0, &mut buf).is_err());
+    }
+
+    // What a chunk that arrived in one buffer looks like to the storage: its bytes, then an
+    // empty write where they end. At the end of the torrent that is past the last piece,
+    // and anywhere else it is the start of the next one - which may be complete already.
+    #[test]
+    fn test_an_empty_write_where_a_chunk_ends_is_nothing() {
+        let (_factory, storage) = storage();
+        let chunk = vec![1u8; CHUNK_SIZE as usize];
+        let end = PIECE_LEN as u64 * NUM_PIECES as u64;
+        let last = storage
+            .lengths
+            .validate_piece_index(NUM_PIECES - 1)
+            .unwrap();
+
+        storage
+            .pwrite_all(0, end - CHUNK_SIZE as u64, &chunk)
+            .unwrap();
+        storage
+            .pwrite_all(0, end, &[])
+            .expect("the tail of the last chunk is not an error");
+        storage
+            .pwrite_all(0, end - PIECE_LEN as u64, &chunk)
+            .unwrap();
+        storage.on_piece_completed(last).unwrap();
+
+        // Piece 0's last chunk, and its empty tail at the start of the complete piece 1.
+        storage
+            .pwrite_all(0, PIECE_LEN as u64 - CHUNK_SIZE as u64, &chunk)
+            .unwrap();
+        storage.pwrite_all(0, PIECE_LEN as u64, &[]).unwrap();
+        let mut buf = vec![0u8; CHUNK_SIZE as usize];
+        storage.pread_exact(0, PIECE_LEN as u64, &mut buf).unwrap();
+        assert_eq!(
+            buf, chunk,
+            "an empty write staged a blank copy of a complete piece, and the read got it"
+        );
     }
 
     // A factory serves a whole session, and a piece index means nothing without the
