@@ -390,6 +390,22 @@ impl LivePeerState {
         }
     }
 
+    /// The peer choked us, which discards every request we have outstanding with it
+    /// (BEP-3). Forget them, and say how many there were. No Cancel goes out - there is
+    /// nothing left on the peer's side to cancel - but a chunk it had already put on the
+    /// wire may still arrive, so each one is tolerated the way a late cancelled one is.
+    pub fn forget_inflight_requests_on_choke(&mut self) -> usize {
+        let dropped = self.inflight_requests.len();
+        if dropped > 0 {
+            self.inflight_requests.clear();
+            self.late_cancelled_request_tolerance = self
+                .late_cancelled_request_tolerance
+                .saturating_add(u32::try_from(dropped).unwrap_or(u32::MAX));
+            self.request_slots_changed.notify_waiters();
+        }
+        dropped
+    }
+
     pub fn inflight_requests(&self) -> impl Iterator<Item = &InflightRequest> {
         self.inflight_requests.iter()
     }
