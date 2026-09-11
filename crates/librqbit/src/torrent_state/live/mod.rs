@@ -1154,10 +1154,29 @@ impl TorrentStateLive {
                 return;
             }
         };
-        if queued > 0 {
+        // Read after the release, so a reader that seeks in later is one whose own read
+        // wakes the peers, and finds the piece no longer held.
+        //
+        // A dropped piece is released without going back in the queue, so `queued` says
+        // nothing about a reader parked on it: a stream pulls a dropped piece in through
+        // its priority window, and the peers passed over it while it was held. Nothing
+        // else wakes them for it.
+        let wanted_by_a_stream = || {
+            let wanted = self.streams.wanted_ranges(&self.lengths);
+            pieces
+                .iter()
+                .any(|id| wanted.iter().any(|range| range.contains(id)))
+        };
+        if queued > 0 || wanted_by_a_stream() {
             self.reconnect_all_not_needed_peers();
             self.new_pieces_notify.notify_waiters();
         }
+    }
+
+    /// Wake every peer that found nothing to ask for and is waiting for a piece to be
+    /// queued. See `maybe_reconnect_needed_peers_for_file`.
+    pub(crate) fn wake_idle_requesters(&self) {
+        self.new_pieces_notify.notify_waiters();
     }
 
     /// Make previously dropped pieces wanted again. Returns how many pieces stopped being

@@ -364,6 +364,11 @@ impl ManagedTorrent {
         self.with_state(|state| {
             if let crate::ManagedTorrentState::Live(l) = &state {
                 l.reconnect_all_not_needed_peers();
+                // And the peers still connected. One that found nothing to ask for sleeps
+                // until a piece is queued or its timer fires, five seconds on; a piece a
+                // stream wants is not queued when it was dropped, so a reader that seeked
+                // into a dropped range waited out that timer before anyone asked for it.
+                l.wake_idle_requesters();
             }
         });
         true

@@ -851,22 +851,20 @@ async fn test_e2e_piece_reclaim_seek_back_after_finishing() -> anyhow::Result<()
     .await?
 }
 
-// A caller keeping a bounded window drops what is outside it before it arrives, and
-// wants it again as the window moves. The moment the window is in, the torrent wants
-// nothing - and has half of its file. It used to call that finished and hang up on the
-// seeder it was downloading from, as a finished torrent does, so the reselect that moved
-// the window had to dial it all over again: a connect, a handshake and a bitfield per
-// window, with no stream open to keep the seeder around.
-async fn e2e_piece_reclaim_a_full_window_keeps_its_seeder() -> anyhow::Result<()> {
-    const WINDOW: std::ops::Range<u32> = 0..TOTAL_PIECES / 2;
-    const REST: std::ops::Range<u32> = WINDOW.end..TOTAL_PIECES;
-    setup_test_logging();
-    let (files, torrent_bytes, _server_session, peer) =
-        seeding_server("test_piece_reclaim_window", FILE_SIZE).await?;
-    let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
+// Outside a window of the first half of the file: what a caller keeping a bounded window
+// has dropped before any of it arrived.
+const OUTSIDE_THE_WINDOW: std::ops::Range<u32> = TOTAL_PIECES / 2..TOTAL_PIECES;
 
+// A reclaiming client whose window, the first half of the file, is in and whose rest was
+// dropped before a single piece of it could arrive. It wants nothing, and it is still
+// connected to the seeder it downloaded the window from.
+async fn windowed_client(
+    prefix: &str,
+    torrent_bytes: &[u8],
+    peer: std::net::SocketAddr,
+) -> anyhow::Result<(TempDir, Client, InMemoryPieceStorageFactory)> {
     let storage = InMemoryPieceStorageFactory::default();
-    let dir = TempDir::with_prefix("test_piece_reclaim_window_client")?;
+    let dir = TempDir::with_prefix(prefix)?;
     let session = Session::new_with_opts(
         dir.path().into(),
         crate::SessionOptions {
@@ -877,7 +875,6 @@ async fn e2e_piece_reclaim_a_full_window_keeps_its_seeder() -> anyhow::Result<()
         },
     )
     .await?;
-    // Paused, so the rest is dropped before a single piece of it can arrive.
     let handle = session
         .add_torrent(
             AddTorrent::from_bytes(torrent_bytes.to_owned()),
@@ -893,8 +890,8 @@ async fn e2e_piece_reclaim_a_full_window_keeps_its_seeder() -> anyhow::Result<()
         .into_handle()
         .context("expected a handle")?;
     timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
-    let claim = handle.drop_pieces(REST)?;
-    assert_eq!(claim.pieces(), REST.collect::<Vec<_>>());
+    let claim = handle.drop_pieces(OUTSIDE_THE_WINDOW)?;
+    assert_eq!(claim.pieces(), OUTSIDE_THE_WINDOW.collect::<Vec<_>>());
     drop(claim);
     session.unpause(&handle).await?;
 
@@ -905,6 +902,23 @@ async fn e2e_piece_reclaim_a_full_window_keeps_its_seeder() -> anyhow::Result<()
         }
     })
     .await?;
+    Ok((dir, (session, handle), storage))
+}
+
+// A caller keeping a bounded window drops what is outside it before it arrives, and
+// wants it again as the window moves. The moment the window is in, the torrent wants
+// nothing - and has half of its file. It used to call that finished and hang up on the
+// seeder it was downloading from, as a finished torrent does, so the reselect that moved
+// the window had to dial it all over again: a connect, a handshake and a bitfield per
+// window, with no stream open to keep the seeder around.
+async fn e2e_piece_reclaim_a_full_window_keeps_its_seeder() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (files, torrent_bytes, _server_session, peer) =
+        seeding_server("test_piece_reclaim_window", FILE_SIZE).await?;
+    let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
+    let (_dir, (_session, handle), _storage) =
+        windowed_client("test_piece_reclaim_window_client", &torrent_bytes, peer).await?;
+
     let live = handle.live().context("expected a live torrent")?;
     assert!(
         !live.is_finished(),
@@ -925,7 +939,10 @@ async fn e2e_piece_reclaim_a_full_window_keeps_its_seeder() -> anyhow::Result<()
     }
 
     // The window moves on.
-    assert_eq!(handle.reselect_pieces(REST)?, REST.len());
+    assert_eq!(
+        handle.reselect_pieces(OUTSIDE_THE_WINDOW)?,
+        OUTSIDE_THE_WINDOW.len()
+    );
     timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
     assert_eq!(read_back(handle.clone()).await?, orig_content);
     let stats = live.per_peer_stats_snapshot(PeerStatsFilter {
@@ -947,6 +964,124 @@ async fn test_e2e_piece_reclaim_a_full_window_keeps_its_seeder() -> anyhow::Resu
     timeout(
         Duration::from_secs(120),
         e2e_piece_reclaim_a_full_window_keeps_its_seeder(),
+    )
+    .await?
+}
+
+// A stream that seeks out of the window, into a piece that was dropped. The stream pulls
+// it in through its priority window, which is not the queue, and the seeder's request loop
+// found nothing to ask for when the window filled: it sleeps until a piece is queued or
+// its five-second timer fires. Nothing queues a dropped piece, so the read waited out the
+// timer.
+async fn e2e_piece_reclaim_a_seek_out_of_the_window_wakes_the_seeder() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (files, torrent_bytes, _server_session, peer) =
+        seeding_server("test_piece_reclaim_window_seek", FILE_SIZE).await?;
+    let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
+    let (_dir, (_session, handle), _storage) = windowed_client(
+        "test_piece_reclaim_window_seek_client",
+        &torrent_bytes,
+        peer,
+    )
+    .await?;
+
+    // A lookahead of one piece, so the stream wants the piece it reads and nothing else.
+    let mut stream = handle
+        .clone()
+        .stream_with_options(
+            0,
+            crate::FileStreamOptions {
+                lookahead_bytes: PIECE_LEN as u64,
+            },
+        )
+        .await?;
+    let target = OUTSIDE_THE_WINDOW.start + 2;
+    let offset = (target * PIECE_LEN) as usize;
+    Pin::new(&mut stream).start_seek(SeekFrom::Start(offset as u64))?;
+    let started = Instant::now();
+    let mut piece = vec![0u8; PIECE_LEN as usize];
+    timeout(Duration::from_secs(30), stream.read_exact(&mut piece)).await??;
+    assert_eq!(piece, orig_content[offset..offset + PIECE_LEN as usize]);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the read took {:?}: the seeder was asleep and nothing woke it",
+        started.elapsed()
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_piece_reclaim_a_seek_out_of_the_window_wakes_the_seeder() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_piece_reclaim_a_seek_out_of_the_window_wakes_the_seeder(),
+    )
+    .await?
+}
+
+// A stream parked on a piece whose storage a claim is still releasing. The seeder's
+// request loop passes over a piece under a claim, finds nothing else, and goes to sleep.
+// The release is what makes the piece available, and it woke the peers only for pieces it
+// put back in the queue - which a dropped piece is not, so the read waited out the timer.
+async fn e2e_piece_reclaim_a_release_under_a_parked_read_wakes_the_seeder() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (files, torrent_bytes, _server_session, peer) =
+        seeding_server("test_piece_reclaim_window_release", FILE_SIZE).await?;
+    let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
+    let (_dir, (_session, handle), storage) = windowed_client(
+        "test_piece_reclaim_window_release_client",
+        &torrent_bytes,
+        peer,
+    )
+    .await?;
+
+    // Dropped before the stream exists, since a stream's lookahead protects what it covers.
+    let lengths = *handle
+        .metadata
+        .load_full()
+        .context("no metadata")?
+        .lengths();
+    let claim = handle.drop_pieces(0..1)?;
+    assert_eq!(claim.pieces(), &[0]);
+    assert!(storage.release_piece(handle.info_hash(), lengths.validate_piece_index(0).unwrap()));
+
+    let mut stream = handle
+        .clone()
+        .stream_with_options(
+            0,
+            crate::FileStreamOptions {
+                lookahead_bytes: PIECE_LEN as u64,
+            },
+        )
+        .await?;
+    let reader = tokio::spawn(async move {
+        let mut piece = vec![0u8; PIECE_LEN as usize];
+        stream.read_exact(&mut piece).await?;
+        Ok::<_, anyhow::Error>((piece, Instant::now()))
+    });
+    // Long enough for the read to park and for the seeder to look, pass over the piece
+    // under the claim, and go back to sleep.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!reader.is_finished(), "the read did not wait for the claim");
+
+    let released = Instant::now();
+    drop(claim);
+    let (piece, read) = timeout(Duration::from_secs(30), reader).await???;
+    assert_eq!(piece, orig_content[..PIECE_LEN as usize]);
+    assert!(
+        read - released < Duration::from_secs(2),
+        "the read took {:?} after the release: the seeder was asleep and nothing woke it",
+        read - released
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_piece_reclaim_a_release_under_a_parked_read_wakes_the_seeder()
+-> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_piece_reclaim_a_release_under_a_parked_read_wakes_the_seeder(),
     )
     .await?
 }

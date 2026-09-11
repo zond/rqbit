@@ -336,8 +336,8 @@ impl ChunkTracker {
     }
 
     /// The caller is done releasing the storage of these pieces, so they may be
-    /// downloaded again. Returns how many of them are queued, i.e. whether anything is
-    /// waiting on them.
+    /// downloaded again. Returns how many of them are queued. That is not whether anything
+    /// waits on them: a stream can wait on a dropped piece, which is released unqueued.
     pub fn finish_release(&mut self, pieces: impl IntoIterator<Item = ValidPieceIndex>) -> usize {
         let mut queued = 0;
         for piece in pieces {
