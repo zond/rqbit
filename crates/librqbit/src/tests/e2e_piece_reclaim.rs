@@ -1086,6 +1086,57 @@ async fn test_e2e_piece_reclaim_a_release_under_a_parked_read_wakes_the_seeder()
     .await?
 }
 
+// A peer's writer reads the chunk it uploads long after the upload scheduler checked we
+// have the piece. Dropped in between and downloading again, the piece has the first chunk
+// of the new download staged, and a storage that stages serves that copy first: the peer
+// would be sent part of a piece, and fail its hash.
+async fn e2e_piece_reclaim_a_read_queued_before_a_drop_is_refused() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (files, torrent_bytes, _server_session, peer) =
+        seeding_server("test_piece_reclaim_stale_read", FILE_SIZE).await?;
+    let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
+    let (_dir, (_session, handle), _storage) =
+        windowed_client("test_piece_reclaim_stale_read_client", &torrent_bytes, peer).await?;
+    let live = handle.live().context("expected a live torrent")?;
+    let lengths = *handle
+        .metadata
+        .load_full()
+        .context("no metadata")?
+        .lengths();
+    let piece = lengths.validate_piece_index(0).unwrap();
+    let chunk = lengths
+        .chunk_info_from_received_data(piece, 0, CHUNK_SIZE)
+        .unwrap();
+
+    let mut buf = vec![0u8; CHUNK_SIZE as usize];
+    live.read_chunk_for_upload(&chunk, &mut buf)?;
+    assert_eq!(buf, orig_content[..CHUNK_SIZE as usize]);
+
+    // Dropped with its storage still there, and the first chunk of a new download staged.
+    let claim = handle.drop_pieces(0..1)?;
+    assert_eq!(claim.pieces(), &[0]);
+    live.files
+        .pwrite_all(0, 0, &vec![0u8; CHUNK_SIZE as usize])?;
+
+    let res = live.read_chunk_for_upload(&chunk, &mut buf);
+    assert!(
+        res.is_err(),
+        "a read for a piece we no longer have went through, and read {:?}",
+        &buf[..8]
+    );
+    drop(claim);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_piece_reclaim_a_read_queued_before_a_drop_is_refused() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_piece_reclaim_a_read_queued_before_a_drop_is_refused(),
+    )
+    .await?
+}
+
 // A storage that takes every chunk and refuses to commit any piece: what a full disk or
 // a directory that won't take a rename looks like to a storage that stages pieces.
 #[derive(Clone, Default)]

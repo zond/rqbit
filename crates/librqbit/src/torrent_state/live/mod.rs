@@ -1281,6 +1281,29 @@ impl TorrentStateLive {
         Ok(())
     }
 
+    /// Read a chunk the way a peer's writer does when it uploads it. Tests only.
+    #[cfg(test)]
+    pub(crate) fn read_chunk_for_upload(
+        self: &Arc<Self>,
+        chunk: &ChunkInfo,
+        buf: &mut [u8],
+    ) -> anyhow::Result<()> {
+        let (tx, _rx) = unbounded_channel();
+        let handler = PeerHandler {
+            state: self.clone(),
+            counters: Default::default(),
+            flow_control: Mutex::new(PeerFlowControl::default()),
+            on_bitfield_notify: Notify::new(),
+            addr: SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 1)),
+            incoming: true,
+            tx,
+            first_message_received: AtomicBool::new(true),
+            cancel_token: CancellationToken::new(),
+            client_name_and_version: String::new(),
+        };
+        (&handler).read_chunk(chunk, buf)
+    }
+
     /// Every piece being downloaded right now, as `(piece, the address that reserved it)`.
     /// Tests only.
     #[cfg(test)]
@@ -1862,6 +1885,28 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     }
 
     fn read_chunk(&self, chunk: &ChunkInfo, buf: &mut [u8]) -> anyhow::Result<()> {
+        // The upload scheduler checked we have the piece before it queued this read, and
+        // the read waits behind whatever else the peer's writer has to send. A piece
+        // dropped in between may be downloading again by now, and a storage that stages
+        // pieces serves the staged copy first: the peer would get part of a piece and
+        // fail its hash. Checked again here, where the bytes are about to be read.
+        //
+        // What is left is a drop, a new request and its first chunk all landing between
+        // this check and the read below, which is a network round trip against a read of
+        // one chunk. Guarded on the opt-in flag, like the scheduler's check, so the
+        // default path takes no extra lock.
+        if self.state.shared.options.piece_reclaim
+            && !self
+                .state
+                .lock_read("recheck_chunk_before_read")
+                .get_chunks()
+                .is_ok_and(|ct| ct.is_chunk_ready_to_upload(chunk))
+        {
+            anyhow::bail!(
+                "piece {} was dropped while the read for it was queued",
+                chunk.piece_index
+            );
+        }
         self.state.file_ops().read_chunk(self.addr, chunk, buf)
     }
 
