@@ -504,9 +504,9 @@ impl ManagedTorrent {
     /// that connect later.
     ///
     /// Putting pieces back sends a Have for each one we have and had held back, since the
-    /// peers already connected got a bitfield without them. Those go through the same
-    /// broadcast as a completed piece, which a peer far enough behind can miss - so
-    /// prefer to advertise as the window moves rather than a whole torrent at once.
+    /// peers already connected got a bitfield without them. Those are queued on each
+    /// peer's own writer channel, so a whole torrent at once reaches every peer as
+    /// surely as one piece does.
     ///
     /// Holding back is orthogonal to having: a piece can be held back before it is
     /// downloaded, and stays held back if it is dropped and downloaded again. It is a

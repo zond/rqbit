@@ -25,7 +25,6 @@ use super::test_util::create_default_random_dir_with_torrents;
 
 const PIECE_LEN: u32 = CHUNK_SIZE;
 const TOTAL_PIECES: u32 = 16;
-const FILE_SIZE: usize = (PIECE_LEN * TOTAL_PIECES) as usize;
 // The first half stands in for a playback window: pieces we have and read, and are about
 // to reclaim, so nobody should hear about them.
 const HELD_BACK: Range<u32> = 0..TOTAL_PIECES / 2;
@@ -35,7 +34,16 @@ type Client = (std::sync::Arc<Session>, std::sync::Arc<ManagedTorrent>);
 // A session that has the whole torrent and listens for peers, plus the torrent file, the
 // directory it was made from, and the address to dial it on.
 async fn seeder(prefix: &str) -> anyhow::Result<(TempDir, Vec<u8>, Client, std::net::SocketAddr)> {
-    let files = create_default_random_dir_with_torrents(1, FILE_SIZE, Some(prefix));
+    seeder_of(prefix, TOTAL_PIECES).await
+}
+
+// The same, for a torrent of `pieces` pieces.
+async fn seeder_of(
+    prefix: &str,
+    pieces: u32,
+) -> anyhow::Result<(TempDir, Vec<u8>, Client, std::net::SocketAddr)> {
+    let files =
+        create_default_random_dir_with_torrents(1, (PIECE_LEN * pieces) as usize, Some(prefix));
     let torrent = create_torrent(
         files.path(),
         CreateTorrentOptions {
@@ -319,6 +327,62 @@ async fn test_e2e_unadvertised_pieces_come_back() -> anyhow::Result<()> {
     timeout(
         Duration::from_secs(120),
         e2e_unadvertised_pieces_come_back(),
+    )
+    .await?
+}
+
+// More pieces put back at once than the Have broadcast holds, to a peer that is already
+// connected. A caller that holds back a playback window puts a whole extent back when the
+// window moves on, and that is hundreds of pieces in one call. The broadcast keeps the
+// last 128 and a writer that falls behind it skips what it missed, so the peer would hear
+// of the last 128 and never of the rest: it has no other way to learn of them short of
+// hanging up and getting a fresh bitfield, which nothing makes it do.
+async fn e2e_unadvertised_pieces_come_back_in_bulk() -> anyhow::Result<()> {
+    const PIECES: u32 = 512;
+    setup_test_logging();
+    let (files, torrent_bytes, (_seeder_session, seeder), addr) =
+        seeder_of("test_unadvertised_pieces_bulk", PIECES).await?;
+    let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
+
+    // All of it, so the handshake bitfield tells the peer nothing and every piece it gets
+    // it has to have heard of by Have.
+    assert_eq!(
+        seeder.set_pieces_advertised(0..PIECES, false)?,
+        PIECES as usize
+    );
+
+    let leecher_dir = TempDir::with_prefix("test_unadvertised_pieces_bulk_leecher")?;
+    let (_leecher_session, leecher) = leecher(&leecher_dir, &torrent_bytes, addr).await?;
+    // Both sides, and the seeder's is the one that matters: the pieces go back with the
+    // peer already on the other end of an open connection.
+    wait_for_live_peers(&leecher, 1).await?;
+    wait_for_live_peers(&seeder, 1).await?;
+    let before = peer_connection_counters(&leecher, addr)?;
+
+    info!("advertising all {PIECES} pieces again");
+    assert_eq!(
+        seeder.set_pieces_advertised(0..PIECES, true)?,
+        PIECES as usize
+    );
+
+    timeout(Duration::from_secs(30), leecher.wait_until_completed()).await??;
+    assert_eq!(
+        std::fs::read(leecher_dir.path().join("0.data")).unwrap(),
+        orig_content
+    );
+    assert_eq!(
+        peer_connection_counters(&leecher, addr)?,
+        before,
+        "the peer only got the pieces after redialling us, so the Haves did not reach it"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_unadvertised_pieces_come_back_in_bulk() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_unadvertised_pieces_come_back_in_bulk(),
     )
     .await?
 }

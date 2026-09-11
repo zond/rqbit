@@ -1095,10 +1095,41 @@ impl TorrentStateLive {
         let still_held_back = pt.chunks().has_unadvertised_pieces();
         drop(g);
 
-        for id in announce {
-            self.transmit_haves(id);
-        }
+        self.announce_to_connected_peers(&announce);
         Ok((changed, still_held_back))
+    }
+
+    /// Queue a Have for each of these pieces on every peer that has a writer, over the
+    /// peer's own channel rather than the broadcast.
+    ///
+    /// The broadcast keeps the last 128 pieces, and a writer that falls behind skips what
+    /// it missed. Completions arrive one by one, at download speed; a hold-back lifted
+    /// all at once is a single synchronous burst of hundreds, so every connected peer
+    /// would hear of the last 128 and never of the rest - its handshake bitfield came
+    /// without them, and nothing else tells it. The peer's channel is unbounded and
+    /// loses nothing.
+    ///
+    /// Run after the set has changed, so a peer this misses because it is not in the
+    /// table yet serializes its handshake bitfield after the change and has them there.
+    /// A peer that has both is told twice, which costs 9 bytes. The writer still asks
+    /// `should_transmit_have` before it sends, as it does for the broadcast, so a piece
+    /// dropped while its Have waits in the queue is not announced.
+    fn announce_to_connected_peers(&self, pieces: &[ValidPieceIndex]) {
+        if pieces.is_empty() {
+            return;
+        }
+        for pe in self.peers.states.iter() {
+            let tx = match pe.value().get_state() {
+                PeerState::Live(live) => &live.tx,
+                PeerState::Connecting(tx) => tx,
+                _ => continue,
+            };
+            for id in pieces {
+                if tx.send(WriterRequest::Have(*id)).is_err() {
+                    break;
+                }
+            }
+        }
     }
 
     /// The caller is done releasing the storage of these pieces: they may be downloaded

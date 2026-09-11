@@ -60,6 +60,9 @@ pub trait PeerConnectionHandler {
 #[derive(Debug)]
 pub enum WriterRequest {
     Message(Message<'static>),
+    /// A Have that goes out only if `should_transmit_have` still agrees when the writer
+    /// gets to it - the same check the Have broadcast gets.
+    Have(ValidPieceIndex),
     UtMetadata(UtMetadata<ByteBufOwned>),
     UtPex(UtPex<ByteBufOwned>),
     ReadChunkRequest(ChunkInfo),
@@ -435,6 +438,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     // the Choke that told the peer its requests are dropped.
                     WriterRequest::ReadChunkRequest(_) if am_choking => continue,
                     WriterRequest::Message(msg) => msg.serialize(&mut *write_buf, ext_msg_ids)?,
+                    WriterRequest::Have(id) => {
+                        if !self.handler.should_transmit_have(id) {
+                            continue;
+                        }
+                        Message::Have(id.get()).serialize(&mut *write_buf, ext_msg_ids)?
+                    }
                     WriterRequest::UtMetadata(utm) => {
                         Message::Extended(ExtendedMessage::UtMetadata(utm.as_borrowed()))
                             .serialize(&mut *write_buf, ext_msg_ids)?
