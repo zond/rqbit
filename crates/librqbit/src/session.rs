@@ -137,6 +137,10 @@ pub struct Session {
     // Limits and throttling
     pub(crate) concurrent_initialize_semaphore: Arc<tokio::sync::Semaphore>,
     pub ratelimits: Limits,
+    /// Whether we upload to anyone at all: [`Self::set_upload_enabled`]. A watch, so a
+    /// peer connection's writer learns of a flip without anybody walking the peers, and
+    /// a connection made while it is off starts from the current value.
+    pub(crate) upload_enabled: tokio::sync::watch::Sender<bool>,
 
     pub blocklist: IpRanges,
     pub allowlist: Option<IpRanges>,
@@ -801,6 +805,7 @@ impl Session {
                 )),
                 udp_tracker_client,
                 ratelimits: Limits::new(opts.ratelimits),
+                upload_enabled: tokio::sync::watch::channel(true).0,
                 ipv4_only: opts.ipv4_only,
                 trackers: opts.trackers,
                 disable_trackers: opts.disable_trackers,
@@ -1072,6 +1077,32 @@ impl Session {
         self.cancellation_token.cancel();
         // this sucks, but hopefully will be enough
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    /// Stop uploading to every peer of every torrent, or start again.
+    ///
+    /// Off, every connected peer is choked and stays choked, a peer that connects is
+    /// never unchoked, and a request that arrives anyway is dropped -- which is what
+    /// BitTorrent says a choked peer's requests are. Downloading is untouched: we stay
+    /// connected, stay interested and keep asking. Nothing is announced differently
+    /// either -- the bitfield and the Haves keep saying what we have -- so turning it
+    /// back on costs one Unchoke per peer and no re-announcement.
+    ///
+    /// Distinct from pausing a torrent, which stops its downloading too; from the
+    /// `disable-upload` build feature, which hangs up on a peer that asks; and from
+    /// [`Self::ratelimits`], which cannot be set to zero, because a limiter that never
+    /// lets a request through leaves it queued for ever and the peer snubs us for it.
+    ///
+    /// Saying what is already in force wakes nobody, so a caller may re-assert it as often
+    /// as it likes.
+    pub fn set_upload_enabled(&self, enabled: bool) {
+        self.upload_enabled
+            .send_if_modified(|current| std::mem::replace(current, enabled) != enabled);
+    }
+
+    /// Whether uploading is on: [`Self::set_upload_enabled`].
+    pub fn upload_enabled(&self) -> bool {
+        *self.upload_enabled.borrow()
     }
 
     /// Run a callback given the currently managed torrents.

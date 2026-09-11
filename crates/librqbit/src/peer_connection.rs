@@ -87,6 +87,7 @@ pub(crate) struct PeerConnection<H> {
     options: PeerConnectionOptions,
     spawner: BlockingSpawner,
     connector: Arc<StreamConnector>,
+    upload_enabled: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 #[cfg(not(feature = "miri"))]
@@ -108,6 +109,20 @@ pub(crate) async fn with_timeout<T>(
     fut: impl std::future::Future<Output = Result<T>>,
 ) -> crate::Result<T> {
     fut.await
+}
+
+/// The upload switch's next value, or never: for a connection following no switch, and
+/// for one whose session has gone, which forgets the receiver so it is not asked again.
+async fn upload_switch_flipped(
+    upload_enabled: &mut Option<tokio::sync::watch::Receiver<bool>>,
+) -> bool {
+    if let Some(rx) = upload_enabled {
+        match rx.changed().await {
+            Ok(()) => return *rx.borrow_and_update(),
+            Err(_) => *upload_enabled = None,
+        }
+    }
+    std::future::pending().await
 }
 
 struct ManagePeerArgs {
@@ -138,7 +153,19 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             spawner,
             options: options.unwrap_or_default(),
             connector,
+            upload_enabled: None,
         }
+    }
+
+    /// Follow the session's upload switch (`Session::set_upload_enabled`): unchoke the
+    /// peer only while it is on, and send Choke/Unchoke as it moves. Without one the
+    /// peer is unchoked at connect and left so.
+    pub fn with_upload_switch(
+        mut self,
+        upload_enabled: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Self {
+        self.upload_enabled = upload_enabled;
+        self
     }
 
     // By the time this is called:
@@ -333,14 +360,24 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 trace!("sent bitfield");
             }
 
-            let len = Message::Unchoke.serialize(&mut *write_buf, &Default::default)?;
-            with_timeout(
-                "writing",
-                rwtimeout,
-                write.write_all(&write_buf[..len]).map_err(Error::Write),
-            )
-            .await?;
-            trace!("sent unchoke");
+            // A peer starts out choked (BEP-3), and stays so while the session's upload
+            // switch is off. Read after the bitfield and marked seen, so that a flip from
+            // here on wakes the arm in the loop below rather than being missed between
+            // the read and the loop.
+            let mut upload_enabled = self.upload_enabled.clone();
+            let mut am_choking = !upload_enabled
+                .as_mut()
+                .is_none_or(|rx| *rx.borrow_and_update());
+            if !am_choking {
+                let len = Message::Unchoke.serialize(&mut *write_buf, &Default::default)?;
+                with_timeout(
+                    "writing",
+                    rwtimeout,
+                    write.write_all(&write_buf[..len]).map_err(Error::Write),
+                )
+                .await?;
+                trace!("sent unchoke");
+            }
 
             let mut broadcast_closed = false;
 
@@ -361,6 +398,14 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                                 continue
                             },
                             _ => continue
+                        },
+                        enabled = upload_switch_flipped(&mut upload_enabled) => {
+                            if enabled == am_choking {
+                                am_choking = !enabled;
+                                WriterRequest::Message(if am_choking { Message::Choke } else { Message::Unchoke })
+                            } else {
+                                continue
+                            }
                         },
                         r = timeout(keep_alive_interval, outgoing_chan.recv()) => match r {
                             Ok(Some(msg)) => msg,
@@ -386,6 +431,9 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 };
 
                 let len = match req {
+                    // Queued by the upload scheduler before the switch went off, and behind
+                    // the Choke that told the peer its requests are dropped.
+                    WriterRequest::ReadChunkRequest(_) if am_choking => continue,
                     WriterRequest::Message(msg) => msg.serialize(&mut *write_buf, ext_msg_ids)?,
                     WriterRequest::UtMetadata(utm) => {
                         Message::Extended(ExtendedMessage::UtMetadata(utm.as_borrowed()))
