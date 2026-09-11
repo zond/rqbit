@@ -37,9 +37,9 @@ All of it is in `librqbit`, apart from the TLS change, which also covers `librqb
 **Storage.**
 
 - Commit before have: `TorrentStorage::on_piece_completed` runs after the hash check and before the piece is marked have. If it returns an error, the torrent stops with a fatal error.
-- Vectored writes: `Box<dyn TorrentStorage>` and the storage middlewares now forward `pwrite_all_vectored`, `has_piece` and `on_piece_completed`. Before, they fell back to the trait defaults, so vectored writes never reached the storage.
+- Vectored writes: `Box<dyn TorrentStorage>` now forwards `pwrite_all_vectored`, and the storage middlewares (`slow`, `timing`, `write_through_cache`) forward it and `on_piece_completed`. Upstream they fell back to the trait defaults, so vectored writes never reached the storage and a wrapped storage never saw `on_piece_completed`. Both also forward the new `has_piece`.
 - The filesystem storage can write past 2 GiB where `off_t` is 32 bits, as on 32-bit Android.
-- Session persistence accepts any storage whose factory implements `StorageFactory::ensure_persistable`. Upstream accepted only `FilesystemStorageFactory`. The default implementation refuses, and the filesystem storage accepts.
+- The JSON session persistence store accepts any storage whose factory implements `StorageFactory::ensure_persistable`. Upstream it accepted only `FilesystemStorageFactory`. The default implementation refuses, and the filesystem storage accepts. (The Postgres store checks the storage neither here nor upstream.)
 
 **Lock-order fix.** `update_only_files` no longer holds the torrent's state lock while it re-queues peers. Under peer churn, holding it could deadlock against a dying peer. Debug builds assert the lock order.
 
@@ -58,7 +58,7 @@ These changes apply to every user, opted in or not:
 - **Haves:** we send Haves to a peer that hasn't sent us a bitfield. Upstream read the empty bitfield as "already has it" and sent that peer none.
 - **Piece picking:** a peer reserves a free piece before stealing one. The only steal ahead of the queue is the first piece of a stream's lookahead window, and only from a peer 10x slower. Upstream stole first.
 - **Peer deaths and reconnects:** in-flight pieces are reserved to a connection, not just an address. They are handed back whatever state the peer's table entry is in. A dying connection no longer overwrites a newer connection's entry for the same address. Peers we have already talked to are re-dialled ahead of newly discovered addresses.
-- **Writes:** a chunk that arrives in two parts of the peer's read buffer now reaches the filesystem storage as one `pwritev`. Upstream split it into two writes, because `Box<dyn TorrentStorage>` did not forward the vectored call.
+- **Writes:** a chunk that arrives in two parts of the peer's read buffer now reaches the filesystem storage's vectored write: one `pwritev` on Unix, and one write of the joined parts on other platforms. Upstream wrote the two parts with two separate writes, because `Box<dyn TorrentStorage>` did not forward the vectored call.
 - **Streams:** a read that has to wait for a piece re-queues peers that were sent away and wakes connected peers that had nothing to request.
 - **Bug fixes:**
   - the `update_only_files` lock order;
