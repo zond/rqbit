@@ -13,6 +13,9 @@ jobs:
   check-rust-compat:
     runs-on: ubuntu-latest
     strategy:
+      # One platform failing must not cancel the others: a flake on one runner
+      # otherwise hides what the rest would have said.
+      fail-fast: false
       matrix:
         rust_version: ["1.94", "1.97"]
     steps:
@@ -37,6 +40,9 @@ jobs:
 
   test:
     strategy:
+      # One platform failing must not cancel the others: a flake on one runner
+      # otherwise hides what the rest would have said.
+      fail-fast: false
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
