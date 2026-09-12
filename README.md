@@ -4,9 +4,9 @@ This is zond's fork of [ikatson/rqbit](https://github.com/ikatson/rqbit), kept f
 
 ## Branches
 
-- **`pinned`** is the branch consumers build. They depend on `librqbit` by git `rev`, not by branch, so a push here reaches them only when they bump the rev.
-- `pinned` is rebased onto `upstream/main` from time to time, which rewrites its commit hashes. Some earlier tips are kept as `pinned-<short-sha>` tags.
-- The other branches here (`main`, and branches that each carry a single change) are not what consumers build.
+- **`main`** is the fork: upstream's `main` with everything below on top of it. It is what consumers build, and they depend on `librqbit` by git `rev`, not by branch, so a push here reaches them only when they bump the rev.
+- `main` is rebased onto `upstream/main` from time to time, which rewrites its commit hashes and needs a force-push. Some earlier tips are kept as tags (`pinned-<short-sha>`, from when this branch was called `pinned`).
+- Single-change branches, cut from `upstream/main`, were there to be offered upstream. Nothing is planned for upstream now, so they are history.
 
 The fork publishes no binaries, crates, Docker images or desktop builds. The Releases, crates.io, docs.rs, Homebrew and Docker links in the upstream README below point at upstream's builds.
 
@@ -22,11 +22,11 @@ All of the code is in `librqbit`, apart from the TLS change, which also covers `
 - The flag is persisted with the torrent. The set of dropped pieces is not. A restored reclaim torrent always starts paused, so the caller can drop what it doesn't want before it unpauses.
 - `TorrentStorage::has_piece` lets a storage say at startup which pieces it still holds. A piece counts as ours only if the resume data (or the full check) and the storage both say so.
 
-**Holding pieces back from announcements.** `ManagedTorrent::set_pieces_advertised(range, false)` leaves pieces out of the handshake bitfield and sends no Have for them. They are still downloaded, readable by streams, and served to a peer that asks for them. `set_pieces_advertised(range, true)` puts them back and sends connected peers a Have for each one we have. It works on a live or a paused torrent and needs no option. The set is not persisted. It survives a pause but not a re-check.
+**Holding pieces back from announcements.** `ManagedTorrent::set_pieces_advertised(range, false)` leaves pieces out of the handshake bitfield and sends no Have for them. They are still downloaded, readable by streams, and served to a peer that asks for them. `set_pieces_advertised(range, true)` puts them back and sends connected peers a Have for each one we have — on each peer's own channel, so putting back more than 128 pieces at once reaches every connected peer rather than what fits in a shared broadcast. It works on a live or a paused torrent and needs no option. The set is not persisted. It survives a pause but not a re-check.
 
 **Session upload switch.** `Session::set_upload_enabled(false)` chokes every peer of every torrent, including peers that connect later, and keeps them choked. Downloading carries on, and the bitfield and Haves still say what we have. `set_upload_enabled(true)` unchokes them again, and `Session::upload_enabled()` reads the switch. This is not the same as the `disable-upload` build feature, which hangs up on a peer that asks for data.
 
-**Choke handback.** When a peer chokes us, the requests the choke discarded are forgotten and their pieces go back into the queue. Upstream left them reserved to that peer until a steal or a disconnect freed them.
+**Choke handback.** When a peer chokes us, the requests the choke discarded are forgotten and their pieces go back into the queue. Upstream left them reserved to that peer until a steal or a disconnect freed them. The requester also asks about the choke once more after it marks a request in flight, so a request inserted just as the handback ran is taken back rather than sent to a peer that drops it and never asked for again.
 
 **Runtime peer cap.** `ManagedTorrent::set_peer_limit(n)` changes a torrent's live-peer cap while it runs. Lowering it disconnects the surplus, least useful first: peers still connecting, then peers with nothing to exchange in either direction, then peers that moved the fewest bytes lately (sent and received count the same). Raising it re-dials the peers it parked that have an address we can dial, ahead of newly discovered addresses. `ManagedTorrentShared::peer_limit()` reads the cap. `TorrentStateLive::forget_disconnected_peers()` removes dead and parked entries from the peer table. `DEFAULT_PEER_LIMIT` is 128, upstream's default, and applies when neither the torrent nor the session sets a limit.
 
@@ -45,7 +45,7 @@ All of the code is in `librqbit`, apart from the TLS change, which also covers `
 
 **TLS roots.** With `rust-tls` and without `default-tls`, every HTTP client that `librqbit` and `librqbit-upnp` build trusts only Mozilla's root certificates compiled into the binary (`webpki-root-certs`), not the platform store. `librqbit::http_client_builder()` returns a client builder with that policy, for embedders.
 
-**CI on `pinned`.** `.github/workflows/test.yml` also runs on pushes to `pinned`, and one failing matrix entry no longer cancels the others (`fail-fast: false`).
+**CI.** `.github/workflows/test.yml` runs on pushes to `main`, which is the fork itself, and one failing matrix entry no longer cancels the others (`fail-fast: false`). Upstream ran it on `main` and `dev`, and this fork's own branch was tested by nobody until then.
 
 ## Behaviour if you don't opt in
 
@@ -64,6 +64,8 @@ These changes apply to every user, opted in or not:
   - the `update_only_files` lock order;
   - the chunk tracker now clears a piece's queue bit and counts the piece into its files at the moment it becomes have;
   - `wait_until_completed` no longer misses a completion that lands just as it starts waiting;
+  - a pause or an unpause that arrives during a torrent's initial check lands on the check's own pause intent, instead of being swallowed and leaving the torrent settled the other way;
+  - `wait_until_initialized` no longer waits forever on a check that a pause bailed out of; it fails the wait instead;
   - vectored writes past 2 GiB on 32-bit targets.
 - **Storage implementers:** an error from `on_piece_completed` is now fatal to the torrent, and the call comes before the piece is marked have. Upstream called it afterwards and logged errors at debug level. `has_piece` (default `Ok(true)`) is asked at startup. The wrappers forward the methods listed above.
 - **Persistence format:** JSON records gain a `piece_reclaim` field (a missing field reads as false). Postgres gets a `piece_reclaim BOOLEAN NOT NULL DEFAULT FALSE` column, added with `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` when the store opens.
