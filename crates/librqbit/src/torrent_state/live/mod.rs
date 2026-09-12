@@ -1315,10 +1315,14 @@ impl TorrentStateLive {
         };
         (0..self.lengths.total_pieces())
             .filter_map(|index| self.lengths.validate_piece_index(index))
-            .filter_map(|piece| {
+            .flat_map(|piece| {
+                // One entry per peer on the piece: a piece a stream waits
+                // on is split, so several peers can own a share of it.
                 pieces
-                    .get_inflight(piece)
-                    .map(|inf| (piece.get(), inf.peer))
+                    .participants(piece)
+                    .iter()
+                    .map(move |p| (piece.get(), p.peer))
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -2226,7 +2230,11 @@ impl PeerHandler {
     /// Acquire a piece for this peer: try steal (10x) → reserve → steal (3x).
     ///
     /// Returns the piece index to download, or None if no pieces are available.
-    fn acquire_next_piece(&self) -> crate::Result<Option<ValidPieceIndex>> {
+    /// The next share of a piece to fetch: the piece, and which of its
+    /// chunks this peer claimed. A piece a stream waits on is split, so the
+    /// claim is part of it and the same piece is handed to other peers at
+    /// the same time; anything else is claimed whole.
+    fn acquire_next_piece(&self) -> crate::Result<Option<(ValidPieceIndex, Range<u32>)>> {
         if self.is_choked() {
             debug!("we are choked, can't acquire piece");
             return Ok(None);
@@ -2265,15 +2273,19 @@ impl PeerHandler {
                 });
 
                 match result {
-                    AcquireResult::Reserved(piece) => {
-                        trace!("reserved piece {}", piece);
-                        Ok(Some(piece))
+                    AcquireResult::Reserved { piece, chunks } => {
+                        trace!("reserved piece {} chunks {:?}", piece, chunks);
+                        Ok(Some((piece, chunks)))
                     }
-                    AcquireResult::Stolen { piece, from_peer } => {
+                    AcquireResult::Stolen {
+                        piece,
+                        chunks,
+                        from_peer,
+                    } => {
                         debug!("stole piece {} from {}", piece, from_peer);
                         // Store steal info to process after releasing peer lock to avoid deadlock
                         steal_info = Some((from_peer, piece));
-                        Ok(Some(piece))
+                        Ok(Some((piece, chunks)))
                     }
                     AcquireResult::NoneAvailable => Ok(None),
                 }
@@ -2483,7 +2495,7 @@ impl PeerHandler {
 
             // Acquire a piece using the strategy: try steal (10x) → reserve → steal (3x).
             let new_piece_notify = self.state.new_pieces_notify.notified();
-            let next = match self.acquire_next_piece()? {
+            let (next, claimed) = match self.acquire_next_piece()? {
                 Some(next) => next,
                 None => {
                     debug!("no pieces to request");
@@ -2501,7 +2513,14 @@ impl PeerHandler {
                 }
             };
 
-            'chunks: for chunk in self.state.lengths.iter_chunk_infos(next) {
+            // Only this peer's share. The rest of the piece is either
+            // another peer's claim or still unclaimed, and this peer comes
+            // back round for one of those when it is done here.
+            'chunks: for chunk in self
+                .state
+                .lengths
+                .iter_chunk_infos_in(next, claimed.clone())
+            {
                 let request = Request {
                     index: next.get(),
                     begin: chunk.offset,
@@ -2716,11 +2735,15 @@ impl PeerHandler {
                     .map(|l| l.read());
 
                 match g.get_pieces()?.get_inflight(chunk_info.piece_index) {
-                    Some(inflight) if inflight.peer == addr => {}
-                    Some(inflight) => {
+                    // A share, not the piece: several peers may be filling
+                    // one piece, and each is entitled to write its own
+                    // chunks. What disqualifies this peer is having no
+                    // share left -- it was stolen from, or it was released.
+                    Some(inflight) if inflight.has_peer(addr) => {}
+                    Some(_) => {
                         debug!(
-                            "in-flight piece {} was stolen by {}, ignoring",
-                            chunk_info.piece_index, inflight.peer
+                            "no longer holding a share of in-flight piece {}, ignoring",
+                            chunk_info.piece_index
                         );
                         return Ok(());
                     }
@@ -3133,7 +3156,7 @@ mod connection_tests {
         old.on_peer_died(None)?;
         assert_eq!(
             live.inflight_piece_owners(),
-            vec![(new_piece.get(), addr)],
+            vec![(new_piece.0.get(), addr)],
             "the old connection's death took the new one's piece with it, or kept its own"
         );
         Ok(())

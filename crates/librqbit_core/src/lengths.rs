@@ -172,6 +172,21 @@ impl Lengths {
         start_piece_id..end_piece_id
     }
 
+    /// The chunks of `index` whose indices fall inside `claim`.
+    ///
+    /// One peer's share of a piece several are fetching at once. The
+    /// `offset` each carries is its offset in the *piece*, which is what
+    /// goes out as `Request { begin }`, so a claim that does not start at
+    /// zero still names the right bytes on the wire.
+    pub fn iter_chunk_infos_in(
+        &self,
+        index: ValidPieceIndex,
+        claim: std::ops::Range<u32>,
+    ) -> impl Iterator<Item = ChunkInfo> {
+        self.iter_chunk_infos(index)
+            .filter(move |chunk| claim.contains(&chunk.chunk_index))
+    }
+
     pub fn iter_chunk_infos(&self, index: ValidPieceIndex) -> impl Iterator<Item = ChunkInfo> {
         let mut remaining = self.piece_length(index);
         let absolute_offset = index.0 * self.chunks_per_piece;
@@ -299,6 +314,37 @@ mod tests {
 
     fn make_lengths() -> Lengths {
         Lengths::new(1174243328, 262144).unwrap()
+    }
+
+    /// **A peer asks for its share of a piece, and for the right bytes.**
+    ///
+    /// What makes a split piece actually split: several peers hold claims
+    /// on one piece, and each must put only its own chunks on the wire. The
+    /// `offset` is the other half -- it becomes `Request { begin }`, so a
+    /// claim starting at chunk 16 has to name byte 16 * 16 KiB, not zero.
+    /// Ask for the whole piece from every peer and it still completes, four
+    /// times over, which is the bug this is here to fail on.
+    #[test]
+    fn a_claim_asks_for_its_own_chunks_at_their_own_offsets() {
+        // 64 chunks to a piece, four claims of sixteen.
+        let l = Lengths::new(CHUNK_SIZE as u64 * 64 * 4, CHUNK_SIZE * 64).unwrap();
+        let piece = l.validate_piece_index(0).unwrap();
+
+        let claim: Vec<_> = l.iter_chunk_infos_in(piece, 16..32).collect();
+
+        assert_eq!(claim.len(), 16, "one claim, not the whole piece");
+        assert_eq!(claim.first().unwrap().chunk_index, 16);
+        assert_eq!(claim.last().unwrap().chunk_index, 31);
+        assert_eq!(
+            claim.first().unwrap().offset,
+            16 * CHUNK_SIZE,
+            "the offset is into the piece, which is what `Request.begin` carries"
+        );
+        assert_eq!(
+            claim.iter().map(|chunk| chunk.size).sum::<u32>(),
+            16 * CHUNK_SIZE,
+            "and a quarter of the piece is a quarter of its bytes"
+        );
     }
 
     #[test]

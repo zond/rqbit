@@ -9,6 +9,9 @@
 //! - IN_FLIGHT (currently being downloaded)
 //! - NOT_NEEDED (not selected for download)
 //!
+//! IN_FLIGHT does not mean one peer. A piece a stream is parked on is split
+//! into claims and several peers fetch it at once -- see [`InflightPiece`].
+//!
 //! On top of that, a piece dropped through [`PieceTracker::drop_pieces`] is RELEASING
 //! until the caller reports back through [`PieceTracker::finish_release`]: it is not
 //! HAVE, and nothing may make it HAVE again while the caller is deleting its storage.
@@ -16,7 +19,8 @@
 //! survive a pause - see [`ChunkTracker::is_releasing`].
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
+    ops::Range,
     time::{Duration, Instant},
 };
 
@@ -29,23 +33,142 @@ use crate::{
     type_aliases::{FileInfos, FilePriorities, PeerHandle},
 };
 
-/// Tracks a piece currently being downloaded.
+/// How many consecutive chunks one peer claims of a split piece at a time.
+///
+/// Small enough that several peers get a share of one piece, large enough
+/// that each keeps its request pipeline full between trips back for the
+/// next claim: at 16 KiB a chunk this is 256 KiB, which is over a second of
+/// work for the 209 kB/s peer that held a 4 MB piece for twenty seconds in
+/// the field while seventeen seeders were turned away from it.
+const CLAIM_CHUNKS: u32 = 16;
+
+/// One peer's share of a piece: which chunks it claimed, and since when.
 #[derive(Debug, Clone)]
-pub struct InflightPiece {
+pub struct Participant {
     pub peer: PeerHandle,
-    /// Which connection to `peer` reserved it: see [`AcquireRequest::connection`].
+    /// Which connection to `peer` claimed it: see [`AcquireRequest::connection`].
     pub connection: u64,
-    pub started: Instant,
+    /// Chunk indices *within the piece* this participant is fetching.
+    pub chunks: Range<u32>,
+}
+
+/// Tracks a piece currently being downloaded.
+///
+/// **A piece may have more than one peer on it.** A piece a stream is
+/// parked on is split into [`CLAIM_CHUNKS`]-sized claims so that several
+/// peers fetch it at once, because the wire protocol asks for chunks --
+/// `Request { index, begin, length }` -- and `chunk_status` records them
+/// globally, so two peers filling different chunks of one piece was always
+/// safe. Only this map made it exclusive, and exclusivity is what left a
+/// blocked read waiting twenty seconds on one slow peer.
+///
+/// A piece nobody is waiting on is still claimed whole by one peer: it has
+/// no deadline, splitting it would only cost lock round-trips, and single
+/// ownership is what lets a bad piece be blamed on the peer that sent it.
+#[derive(Debug)]
+pub struct InflightPiece {
+    /// Every peer fetching part of this piece. Never empty: the piece
+    /// leaves the map when the last participant goes.
+    participants: Vec<Participant>,
+    /// Claims nobody has taken yet, in ascending order.
+    unclaimed: VecDeque<Range<u32>>,
+    /// When the first participant started, which is how long the piece has
+    /// been in flight for the steal rule.
+    started: Instant,
+}
+
+impl InflightPiece {
+    /// The first participant, with the rest of the piece left unclaimed
+    /// when `split`, or claimed whole when not.
+    fn new(
+        peer: PeerHandle,
+        connection: u64,
+        chunks_in_piece: u32,
+        split: bool,
+    ) -> (Self, Range<u32>) {
+        let mut unclaimed = VecDeque::new();
+        let first = if split {
+            let mut start = 0;
+            while start < chunks_in_piece {
+                let end = (start + CLAIM_CHUNKS).min(chunks_in_piece);
+                unclaimed.push_back(start..end);
+                start = end;
+            }
+            unclaimed.pop_front().unwrap_or(0..chunks_in_piece)
+        } else {
+            0..chunks_in_piece
+        };
+        let started = Instant::now();
+        (
+            Self {
+                participants: vec![Participant {
+                    peer,
+                    connection,
+                    chunks: first.clone(),
+                }],
+                unclaimed,
+                started,
+            },
+            first,
+        )
+    }
+
+    /// Hand this peer the next unclaimed share, or `None` when the piece is
+    /// entirely spoken for.
+    fn claim(&mut self, peer: PeerHandle, connection: u64) -> Option<Range<u32>> {
+        let chunks = self.unclaimed.pop_front()?;
+        self.participants.push(Participant {
+            peer,
+            connection,
+            chunks: chunks.clone(),
+        });
+        Some(chunks)
+    }
+
+    /// Whether this peer already has a share.
+    pub fn has_peer(&self, peer: PeerHandle) -> bool {
+        self.participants.iter().any(|p| p.peer == peer)
+    }
+
+    /// Take one connection's shares back, returning their chunks to the
+    /// unclaimed pool. True when it held any.
+    ///
+    /// The chunks go back whole, including any the connection had already
+    /// delivered: `chunk_status` knows which those are and re-fetching one
+    /// costs a duplicate, where wiping the piece -- what a single-owner
+    /// release does -- costs everything every *other* peer delivered.
+    fn release(&mut self, peer: PeerHandle, connection: u64) -> bool {
+        let mut released = false;
+        self.participants.retain(|p| {
+            if p.peer == peer && p.connection == connection {
+                self.unclaimed.push_back(p.chunks.clone());
+                released = true;
+                false
+            } else {
+                true
+            }
+        });
+        if released {
+            self.unclaimed
+                .make_contiguous()
+                .sort_by_key(|range| range.start);
+        }
+        released
+    }
 }
 
 /// Result of attempting to acquire a piece.
 #[derive(Debug)]
 pub enum AcquireResult {
-    /// A new piece was reserved from the queue.
-    Reserved(ValidPieceIndex),
+    /// A share of a piece was reserved: its chunk indices within the piece.
+    Reserved {
+        piece: ValidPieceIndex,
+        chunks: Range<u32>,
+    },
     /// A piece was stolen from a slower peer.
     Stolen {
         piece: ValidPieceIndex,
+        chunks: Range<u32>,
         from_peer: PeerHandle,
     },
     /// No pieces are available for this peer.
@@ -84,7 +207,8 @@ where
 /// Wraps a [`ChunkTracker`] with tracking of which pieces are currently being downloaded
 /// (in-flight) and by which peer. This ensures that:
 ///
-/// - A piece is only assigned to one peer at a time (unless stolen)
+/// - A piece no stream waits on is assigned to one peer at a time (unless
+///   stolen); one a stream waits on is split between the peers that have it
 /// - Pieces are properly requeued when a peer dies
 /// - State transitions maintain invariants
 pub struct PieceTracker {
@@ -157,10 +281,16 @@ impl PieceTracker {
             {
                 continue;
             }
-            match self.inflight.get(&piece) {
-                None => return self.reserve_piece(piece, req.peer, req.connection),
+            match self.inflight.get_mut(&piece) {
+                // Split from the first peer on: a stream is waiting on this
+                // one, and every later peer that turns up takes a share
+                // rather than being sent away.
+                None => return self.reserve_piece(piece, req.peer, req.connection, true),
                 Some(inflight) => {
-                    if held_priority_piece.is_none() && inflight.peer != req.peer {
+                    if let Some(chunks) = inflight.claim(req.peer, req.connection) {
+                        return AcquireResult::Reserved { piece, chunks };
+                    }
+                    if held_priority_piece.is_none() && !inflight.has_peer(req.peer) {
                         held_priority_piece = Some(piece);
                     }
                 }
@@ -181,7 +311,7 @@ impl PieceTracker {
 
         for piece in queued {
             if (req.peer_has_piece)(piece) && !self.chunks.is_releasing(piece) {
-                return self.reserve_piece(piece, req.peer, req.connection);
+                return self.reserve_piece(piece, req.peer, req.connection, false);
             }
         }
 
@@ -195,22 +325,23 @@ impl PieceTracker {
     }
 
     /// Reserve a piece: remove from queue, add to inflight.
+    ///
+    /// `split` leaves all but the first claim unclaimed, so other peers can
+    /// join this piece and this one comes back for more when its share is
+    /// done. Without it the single claim covers the whole piece, which is
+    /// what every piece no stream is waiting on gets.
     fn reserve_piece(
         &mut self,
         piece: ValidPieceIndex,
         peer: PeerHandle,
         connection: u64,
+        split: bool,
     ) -> AcquireResult {
         self.chunks.reserve_needed_piece(piece);
-        self.inflight.insert(
-            piece,
-            InflightPiece {
-                peer,
-                connection,
-                started: Instant::now(),
-            },
-        );
-        AcquireResult::Reserved(piece)
+        let chunks_in_piece = self.chunks.get_lengths().chunks_per_piece(piece);
+        let (inflight, chunks) = InflightPiece::new(peer, connection, chunks_in_piece, split);
+        self.inflight.insert(piece, inflight);
+        AcquireResult::Reserved { piece, chunks }
     }
 
     /// Try to steal whichever piece has been in flight longest, from a slower peer.
@@ -230,7 +361,11 @@ impl PieceTracker {
         let (piece, _) = self
             .inflight
             .iter()
-            .filter(|(_, info)| info.peer != req.peer)
+            .filter(|(_, info)| !info.has_peer(req.peer))
+            // Only a piece one peer holds whole. A split piece has several
+            // peers on it and no single owner to take it from, and it is
+            // already getting the parallelism a steal would be buying.
+            .filter(|(_, info)| info.participants.len() == 1 && info.unclaimed.is_empty())
             .filter(|(p, _)| (req.peer_has_piece)(**p))
             .map(|(p, info)| (*p, info.started))
             .min_by_key(|(_, started)| *started)?;
@@ -255,7 +390,12 @@ impl PieceTracker {
         let min_elapsed = Duration::from_secs_f64(my_avg.as_secs_f64() * threshold);
 
         let info = self.inflight.get(&piece)?;
-        let old_peer = info.peer;
+        // Nothing to take from a piece several peers share, and nothing to
+        // take from ourselves.
+        let [only] = info.participants.as_slice() else {
+            return None;
+        };
+        let old_peer = only.peer;
         if old_peer == req.peer || info.started.elapsed() < min_elapsed {
             return None;
         }
@@ -267,12 +407,17 @@ impl PieceTracker {
 
         // Update ownership (piece stays in inflight, just changes owner)
         let info = self.inflight.get_mut(&piece)?;
-        info.peer = req.peer;
-        info.connection = req.connection;
+        let chunks = info.participants[0].chunks.clone();
+        info.participants[0] = Participant {
+            peer: req.peer,
+            connection: req.connection,
+            chunks: chunks.clone(),
+        };
         info.started = Instant::now();
 
         Some(AcquireResult::Stolen {
             piece,
+            chunks,
             from_peer: old_peer,
         })
     }
@@ -287,6 +432,16 @@ impl PieceTracker {
     pub fn take_inflight(&mut self, piece: ValidPieceIndex) -> Option<Duration> {
         let inflight = self.inflight.remove(&piece)?;
         Some(inflight.started.elapsed())
+    }
+
+    /// Every peer with a share of `piece`, for cancelling the duplicates of
+    /// a chunk that has arrived.
+    #[allow(dead_code)]
+    pub fn participants(&self, piece: ValidPieceIndex) -> &[Participant] {
+        self.inflight
+            .get(&piece)
+            .map(|info| info.participants.as_slice())
+            .unwrap_or_default()
     }
 
     /// Mark piece as downloaded after successful hash verification. Moves the per-file
@@ -310,16 +465,20 @@ impl PieceTracker {
     /// connection's pieces too. It goes on asking for their chunks and throws away every
     /// one that arrives, since the piece is no longer reserved to it.
     pub fn release_pieces_owned_by(&mut self, peer: PeerHandle, connection: u64) -> usize {
-        // Collect pieces to release (can't modify while iterating)
-        let pieces_to_release: Vec<_> = self
-            .inflight
-            .iter()
-            .filter(|(_, info)| info.peer == peer && info.connection == connection)
-            .map(|(p, _)| *p)
-            .collect();
-
-        let count = pieces_to_release.len();
-        for piece in pieces_to_release {
+        // A share goes back to the unclaimed pool; the piece itself is only
+        // broken when the last peer on it leaves. Breaking it while others
+        // are still filling it would throw away their chunks too.
+        let mut count = 0;
+        let mut abandoned = Vec::new();
+        for (piece, info) in self.inflight.iter_mut() {
+            if info.release(peer, connection) {
+                count += 1;
+                if info.participants.is_empty() {
+                    abandoned.push(*piece);
+                }
+            }
+        }
+        for piece in abandoned {
             self.inflight.remove(&piece);
             self.chunks.mark_piece_broken_if_not_have(piece);
         }
@@ -520,6 +679,185 @@ mod tests {
         tracker
     }
 
+    /// A tracker whose pieces are big enough to split: 64 chunks each,
+    /// four [`CLAIM_CHUNKS`] claims. Every other fixture here has one or
+    /// four chunks to a piece, which is a single claim, which is why
+    /// nothing else in this file exercises splitting at all.
+    const SPLIT_CHUNKS_PER_PIECE: u32 = 64;
+
+    fn make_split_tracker(num_pieces: u32) -> (PieceTracker, FileInfos, FilePriorities) {
+        let piece_len = CHUNK_SIZE * SPLIT_CHUNKS_PER_PIECE;
+        let total = piece_len as u64 * num_pieces as u64;
+        let file_infos: FileInfos = vec![crate::file_info::FileInfo {
+            relative_filename: "test.dat".into(),
+            offset_in_torrent: 0,
+            len: total,
+            piece_range: 0..num_pieces,
+            attrs: Default::default(),
+        }];
+        let lengths = Lengths::new(total, piece_len).unwrap();
+        let bf_len = lengths.piece_bitfield_bytes();
+        let have = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        let mut selected = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        selected.get_mut(0..num_pieces as usize).unwrap().fill(true);
+        let chunks = ChunkTracker::new(have.into_dyn(), selected, lengths, &file_infos).unwrap();
+        let priorities = make_default_file_priorities(&file_infos);
+        (PieceTracker::new(chunks), file_infos, priorities)
+    }
+
+    /// Acquire as a named peer, with `priority` offered as the stream's
+    /// waiting piece.
+    fn acquire_as(
+        tracker: &mut PieceTracker,
+        file_infos: &FileInfos,
+        file_priorities: &FilePriorities,
+        who: u8,
+        priority: Option<ValidPieceIndex>,
+    ) -> AcquireResult {
+        tracker.acquire_piece(AcquireRequest {
+            peer: peer(who),
+            connection: 0,
+            peer_avg_time: None,
+            priority_pieces: priority.into_iter(),
+            file_priorities,
+            file_infos,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+        })
+    }
+
+    fn claimed(result: AcquireResult) -> Range<u32> {
+        match result {
+            AcquireResult::Reserved { chunks, .. } => chunks,
+            other => panic!("expected a reservation, got {other:?}"),
+        }
+    }
+
+    /// **The piece a stream is parked on is fetched by every peer that has
+    /// it, not by one.**
+    ///
+    /// The field case: a read blocked on one 4 MB piece waited twenty
+    /// seconds while seventeen seeders were connected. The piece was
+    /// reserved to a 209 kB/s peer, and `acquire_piece` turns every other
+    /// peer away from a priority piece already in flight unless it is ten
+    /// times faster. Nothing about that was forced by the protocol -- the
+    /// wire asks for chunks and `chunk_status` records them globally -- so
+    /// here four peers take a quarter of the piece each, and the four
+    /// claims are disjoint and cover it exactly.
+    #[test]
+    fn a_piece_a_stream_waits_on_is_split_between_the_peers_that_have_it() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+        let waited_on = piece(&tracker, 0);
+
+        let shares: Vec<Range<u32>> = (1..=4)
+            .map(|who| {
+                claimed(acquire_as(
+                    &mut tracker,
+                    &file_infos,
+                    &priorities,
+                    who,
+                    Some(waited_on),
+                ))
+            })
+            .collect();
+
+        assert_eq!(
+            shares,
+            vec![0..16, 16..32, 32..48, 48..64],
+            "each peer took the next claim of the piece the stream is waiting on"
+        );
+        assert_eq!(
+            tracker.participants(waited_on).len(),
+            4,
+            "and all four are on it at once"
+        );
+    }
+
+    /// **A peer that finishes its share comes back for the next one.**
+    ///
+    /// Not an optimisation -- the piece cannot complete without it. The
+    /// claims are cut at reservation, because the request loop sends every
+    /// chunk of a claim as soon as it has one, so a piece split four ways
+    /// with only two peers on it has two claims nobody is fetching. The
+    /// same call that hands a new peer a share hands a returning one the
+    /// next, which is what closes that.
+    #[test]
+    fn a_peer_that_finished_its_share_takes_the_next_unclaimed_one() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+        let waited_on = piece(&tracker, 0);
+
+        let mut taken = Vec::new();
+        for _ in 0..4 {
+            taken.push(claimed(acquire_as(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                1,
+                Some(waited_on),
+            )));
+        }
+
+        assert_eq!(
+            taken,
+            vec![0..16, 16..32, 32..48, 48..64],
+            "one peer alone still covers the whole piece, a claim at a time"
+        );
+    }
+
+    /// **A piece nobody is waiting on is still one peer's.**
+    ///
+    /// Splitting buys parallelism on a deadline and costs a lock round-trip
+    /// per claim; a piece no stream is parked on has no deadline to spend
+    /// that on, and single ownership is what lets a failed hash be blamed
+    /// on the peer that sent it.
+    #[test]
+    fn an_ordinary_queued_piece_is_claimed_whole() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+
+        let share = claimed(acquire_as(&mut tracker, &file_infos, &priorities, 1, None));
+
+        assert_eq!(
+            share,
+            0..SPLIT_CHUNKS_PER_PIECE,
+            "no stream is waiting, so the whole piece goes to one peer"
+        );
+    }
+
+    /// **One peer leaving a split piece does not throw away what the others
+    /// fetched.**
+    ///
+    /// A single-owner release breaks the piece, which wipes every chunk of
+    /// it. That is right when the departing peer was the only one on it and
+    /// catastrophic when it was not: the other peers' chunks go too, and
+    /// they are still fetching into it.
+    #[test]
+    fn releasing_one_peer_returns_its_share_and_leaves_the_rest_alone() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+        let waited_on = piece(&tracker, 0);
+        for who in 1..=3 {
+            acquire_as(&mut tracker, &file_infos, &priorities, who, Some(waited_on));
+        }
+
+        assert_eq!(tracker.release_pieces_owned_by(peer(2), 0), 1);
+
+        assert_eq!(
+            tracker.participants(waited_on).len(),
+            2,
+            "the piece is still in flight, with the peers that did not leave"
+        );
+        assert_eq!(
+            claimed(acquire_as(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                4,
+                Some(waited_on)
+            )),
+            16..32,
+            "and the share it abandoned is the next one handed out"
+        );
+    }
+
     fn piece(tracker: &PieceTracker, id: u32) -> ValidPieceIndex {
         tracker
             .chunks()
@@ -563,7 +901,7 @@ mod tests {
         // up on its own, without it ever going through the queue.
         let res = acquire(&mut tracker, &file_infos, &file_priorities, Some(p0));
         assert!(
-            matches!(res, AcquireResult::Reserved(p) if p == p0),
+            matches!(res, AcquireResult::Reserved { piece: p, .. } if p == p0),
             "{res:?}"
         );
 
@@ -617,7 +955,7 @@ mod tests {
         // delivers all of it. It comes out of the in-flight map for the hash check.
         let res = acquire(&mut tracker, &file_infos, &file_priorities, Some(p0));
         assert!(
-            matches!(res, AcquireResult::Reserved(p) if p == p0),
+            matches!(res, AcquireResult::Reserved { piece: p, .. } if p == p0),
             "{res:?}"
         );
         let block = vec![0u8; CHUNK_SIZE as usize];
@@ -679,7 +1017,7 @@ mod tests {
         assert!(!tracker.is_releasing(p0));
         let res = acquire(&mut tracker, &file_infos, &file_priorities, None);
         assert!(
-            matches!(res, AcquireResult::Reserved(p) if p == p0),
+            matches!(res, AcquireResult::Reserved { piece: p, .. } if p == p0),
             "{res:?}"
         );
     }
@@ -713,7 +1051,7 @@ mod tests {
         assert_eq!(tracker.finish_release([p0]), 1);
         let res = acquire(&mut tracker, &file_infos, &file_priorities, None);
         assert!(
-            matches!(res, AcquireResult::Reserved(p) if p == p0),
+            matches!(res, AcquireResult::Reserved { piece: p, .. } if p == p0),
             "{res:?}"
         );
     }
@@ -746,7 +1084,7 @@ mod tests {
 
         // Should reserve piece 0 (first in queue)
         match result {
-            AcquireResult::Reserved(piece) => {
+            AcquireResult::Reserved { piece, .. } => {
                 assert_eq!(piece.get(), 0);
                 assert!(tracker.is_inflight(piece));
                 assert_eq!(tracker.inflight_count(), 1);
@@ -779,7 +1117,7 @@ mod tests {
         });
 
         match result {
-            AcquireResult::Reserved(piece) => {
+            AcquireResult::Reserved { piece, .. } => {
                 // Got piece 4 (first one peer has in iteration order)
                 assert!(piece.get() >= 2, "Should have gotten a piece >= 2");
             }
@@ -808,7 +1146,7 @@ mod tests {
         });
 
         let piece = match result {
-            AcquireResult::Reserved(p) => p,
+            AcquireResult::Reserved { piece: p, .. } => p,
             _ => panic!("Expected Reserved"),
         };
 
@@ -842,7 +1180,7 @@ mod tests {
         });
 
         let piece = match result {
-            AcquireResult::Reserved(p) => p,
+            AcquireResult::Reserved { piece: p, .. } => p,
             _ => panic!("Expected Reserved"),
         };
 
@@ -871,7 +1209,7 @@ mod tests {
         });
 
         match result2 {
-            AcquireResult::Reserved(p) => assert_eq!(p, piece),
+            AcquireResult::Reserved { piece: p, .. } => assert_eq!(p, piece),
             _ => panic!("Expected piece to be re-reservable after fail"),
         }
     }
@@ -894,7 +1232,7 @@ mod tests {
             peer_has_piece: |_| true,
             can_steal: |_| true,
         }) {
-            AcquireResult::Reserved(p) => p,
+            AcquireResult::Reserved { piece: p, .. } => p,
             other => panic!("expected Reserved, got {other:?}"),
         };
         let old = acquire(1);
@@ -952,7 +1290,7 @@ mod tests {
             peer_has_piece: |_| true,
             can_steal: |_| true,
         }) {
-            AcquireResult::Reserved(p) => p,
+            AcquireResult::Reserved { piece: p, .. } => p,
             _ => panic!("Expected Reserved"),
         };
         let piece_a2 = match tracker.acquire_piece(AcquireRequest {
@@ -965,7 +1303,7 @@ mod tests {
             peer_has_piece: |_| true,
             can_steal: |_| true,
         }) {
-            AcquireResult::Reserved(p) => p,
+            AcquireResult::Reserved { piece: p, .. } => p,
             _ => panic!("Expected Reserved"),
         };
 
@@ -980,7 +1318,7 @@ mod tests {
             peer_has_piece: |_| true,
             can_steal: |_| true,
         }) {
-            AcquireResult::Reserved(p) => p,
+            AcquireResult::Reserved { piece: p, .. } => p,
             _ => panic!("Expected Reserved"),
         };
 
@@ -1051,7 +1389,7 @@ mod tests {
 
         // Should get piece 0 again (was requeued)
         match result {
-            AcquireResult::Reserved(p) => assert_eq!(p.get(), 0),
+            AcquireResult::Reserved { piece: p, .. } => assert_eq!(p.get(), 0),
             _ => panic!("Expected to reserve piece 0 after into_chunks"),
         }
     }
@@ -1090,7 +1428,7 @@ mod tests {
 
         // Should get piece 3 (first priority piece)
         match result {
-            AcquireResult::Reserved(p) => assert_eq!(p.get(), 3),
+            AcquireResult::Reserved { piece: p, .. } => assert_eq!(p.get(), 3),
             _ => panic!("Expected Reserved(3), got {:?}", result),
         }
     }
@@ -1150,7 +1488,7 @@ mod tests {
         let file_priorities = make_default_file_priorities(&file_infos);
 
         // The incumbent is sitting on piece 0, and has been for an age by our standards.
-        tracker.reserve_piece(piece(&tracker, 0), peer(1), 0);
+        tracker.reserve_piece(piece(&tracker, 0), peer(1), 0, false);
         tracker
             .inflight
             .get_mut(&piece(&tracker, 0))
@@ -1174,13 +1512,15 @@ mod tests {
         // Four pieces are still queued, so all four come back reserved, not stolen.
         for _ in 0..4 {
             match acquire(&mut tracker) {
-                AcquireResult::Reserved(p) => assert_ne!(p.get(), 0),
+                AcquireResult::Reserved { piece: p, .. } => assert_ne!(p.get(), 0),
                 other => panic!("expected a free piece to be reserved, got {other:?}"),
             }
         }
         // Only now, with nothing left to reserve, is the slow peer's piece taken.
         match acquire(&mut tracker) {
-            AcquireResult::Stolen { piece, from_peer } => {
+            AcquireResult::Stolen {
+                piece, from_peer, ..
+            } => {
                 assert_eq!(piece.get(), 0);
                 assert_eq!(from_peer, peer(1));
             }
@@ -1200,7 +1540,7 @@ mod tests {
         let file_priorities = make_default_file_priorities(&file_infos);
 
         let stream_piece = piece(&tracker, 3);
-        tracker.reserve_piece(stream_piece, peer(1), 0);
+        tracker.reserve_piece(stream_piece, peer(1), 0, true);
         tracker.inflight.get_mut(&stream_piece).unwrap().started =
             Instant::now() - Duration::from_secs(600);
 
@@ -1215,7 +1555,9 @@ mod tests {
             can_steal: |_| true,
         });
         match result {
-            AcquireResult::Stolen { piece, from_peer } => {
+            AcquireResult::Stolen {
+                piece, from_peer, ..
+            } => {
                 assert_eq!(piece.get(), 3);
                 assert_eq!(from_peer, peer(1));
             }
@@ -1250,7 +1592,7 @@ mod tests {
             peer_has_piece: |_| true,
             can_steal: |_| true,
         }) {
-            AcquireResult::Reserved(p) => {
+            AcquireResult::Reserved { piece: p, .. } => {
                 assert_eq!(p.get(), 0);
                 p
             }
@@ -1267,7 +1609,7 @@ mod tests {
             peer_has_piece: |_| true,
             can_steal: |_| true,
         }) {
-            AcquireResult::Reserved(p) => {
+            AcquireResult::Reserved { piece: p, .. } => {
                 assert_eq!(p.get(), 4);
                 p
             }
@@ -1293,11 +1635,13 @@ mod tests {
 
         // Should steal piece 4 (which peer B has), NOT piece 0 (which peer B doesn't have)
         match result {
-            AcquireResult::Stolen { piece, from_peer } => {
+            AcquireResult::Stolen {
+                piece, from_peer, ..
+            } => {
                 assert_eq!(piece, piece_4, "Should steal piece 4 (the one peer B has)");
                 assert_eq!(from_peer, peer_a);
                 // Verify piece 0 is still owned by peer A (wasn't stolen)
-                assert_eq!(tracker.get_inflight(piece_0).unwrap().peer, peer_a);
+                assert_eq!(tracker.participants(piece_0)[0].peer, peer_a);
             }
             _ => panic!("Expected Stolen, got {:?}", result),
         }

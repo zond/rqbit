@@ -85,12 +85,36 @@ QUEUED → IN_FLIGHT → COMPLETED
 1. `PieceTracker::acquire_piece()`:
    - Finds piece in `queue_pieces` (or steals from slow peer)
    - Calls `chunks.reserve_needed_piece(p)` → clears `queue_pieces[p] = false`
-   - Inserts into `inflight[p] = (peer, now)`
-   - Returns `AcquireResult::Reserved(p)` or `AcquireResult::Stolen { piece, from_peer }`
+   - Inserts into `inflight[p]`, whose participants are the peers on it
+   - Returns `AcquireResult::Reserved { piece, chunks }` or
+     `AcquireResult::Stolen { piece, chunks, from_peer }`, where `chunks` is
+     the claim this peer took
 
 2. Chunk requesting:
-   - For each chunk in piece, insert into `inflight_requests`
+   - For each chunk **of the claim**, insert into `inflight_requests`
    - Send Request message to peer
+
+### Split Pieces
+
+A piece a stream is parked on is divided into claims of `CLAIM_CHUNKS`, and
+several peers hold one each: the wire asks for chunks, and `chunk_status`
+records them globally, so two peers filling different chunks of one piece
+was always safe. Only `inflight` made it exclusive.
+
+This changes three of the invariants below:
+
+- **A piece may have several peers.** `inflight[p]` holds a list of
+  participants, and a peer is disqualified from writing to a piece by having
+  no share of it, not by not being *the* owner.
+- **A release is partial.** One connection leaving returns its claim to the
+  unclaimed pool; the piece is only broken -- which wipes every chunk of it
+  -- when the last participant goes.
+- **A split piece is never stolen.** There is no single owner to take it
+  from, and it already has the parallelism a steal would buy.
+
+A piece no stream waits on is still claimed whole by one peer: it has no
+deadline to spend the extra lock round-trips on, and single ownership is
+what lets a failed hash be blamed on the peer that sent it.
 
 3. Data arrival (`on_incoming_piece`):
    - Remove chunk from `inflight_requests`
