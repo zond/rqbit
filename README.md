@@ -80,6 +80,7 @@ The fork's tests are in `crates/librqbit/src/tests/`:
 - `e2e_upload_switch.rs`
 - `e2e_peer_limit.rs`
 - `e2e_pause.rs`
+- `initial_check_pause.rs`
 - `lock_order.rs` and `session_persistence.rs`
 
 There are also unit tests next to the code they cover (`chunk_tracker.rs`, `piece_tracker.rs`, the storage modules). `crates/librqbit/tests/tls_roots.rs` only builds with `rust-tls` and without `default-tls`, on Linux, so a default-feature `cargo test` (which is what CI runs) skips it.
