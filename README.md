@@ -8,7 +8,7 @@ This is zond's fork of [ikatson/rqbit](https://github.com/ikatson/rqbit), kept f
 - `main` is rebased onto `upstream/main` from time to time, which rewrites its commit hashes and needs a force-push. Some earlier tips are kept as tags (`pinned-<short-sha>`, from when this branch was called `pinned`).
 - Single-change branches, cut from `upstream/main`, were there to be offered upstream. Nothing is planned for upstream now, so they are history.
 
-The fork publishes no binaries, crates, Docker images or desktop builds. The Releases, crates.io, docs.rs, Homebrew and Docker links in the upstream README below point at upstream's builds.
+The fork publishes no binaries, crates, Docker images or desktop builds, and upstream's three release workflows are deleted here rather than left to run on every push. The Releases, crates.io, docs.rs, Homebrew and Docker links in the upstream README below point at upstream's builds.
 
 ## What the fork adds
 
