@@ -42,6 +42,18 @@ use crate::{
 /// the field while seventeen seeders were turned away from it.
 const CLAIM_CHUNKS: u32 = 16;
 
+/// How many peers may hold the same claim at once.
+///
+/// Splitting converts "one peer's speed" into "the slowest of N peers'
+/// speed", because the piece is not done until the last claim is. So once
+/// nothing is unclaimed, a peer with no work left doubles up on a claim
+/// somebody else is still fetching, and whichever copy arrives first ends
+/// it. Two is the whole of the trade: one duplicate bounds the waste at the
+/// tail of a piece to what it would have cost to fetch it once more, and a
+/// peer that finds every claim doubled goes and fetches the next piece the
+/// stream needs instead, which is worth more than a third copy of this one.
+const MAX_HOLDERS_PER_CLAIM: usize = 2;
+
 /// One peer's share of a piece: which chunks it claimed, and since when.
 #[derive(Debug, Clone)]
 pub struct Participant {
@@ -50,6 +62,8 @@ pub struct Participant {
     pub connection: u64,
     /// Chunk indices *within the piece* this participant is fetching.
     pub chunks: Range<u32>,
+    /// When this participant took the claim, which orders who is lagging.
+    started: Instant,
 }
 
 /// Tracks a piece currently being downloaded.
@@ -105,6 +119,7 @@ impl InflightPiece {
                     peer,
                     connection,
                     chunks: first.clone(),
+                    started,
                 }],
                 unclaimed,
                 started,
@@ -113,16 +128,53 @@ impl InflightPiece {
         )
     }
 
-    /// Hand this peer the next unclaimed share, or `None` when the piece is
-    /// entirely spoken for.
+    /// Hand this peer the next unclaimed share; failing that, a second copy
+    /// of whichever claim is lagging. `None` when the piece is entirely
+    /// spoken for and every claim already has its duplicate.
     fn claim(&mut self, peer: PeerHandle, connection: u64) -> Option<Range<u32>> {
-        let chunks = self.unclaimed.pop_front()?;
+        let chunks = match self.unclaimed.pop_front() {
+            Some(chunks) => chunks,
+            None => self.lagging_claim(peer)?,
+        };
         self.participants.push(Participant {
             peer,
             connection,
             chunks: chunks.clone(),
+            started: Instant::now(),
         });
         Some(chunks)
+    }
+
+    /// The claim most worth a second peer: the one outstanding longest that
+    /// is not already at [`MAX_HOLDERS_PER_CLAIM`]. `None` when every claim
+    /// is full, or this peer holds the only ones that are not.
+    ///
+    /// It chooses without asking any peer how fast it is. A claim that has
+    /// been outstanding longer than its siblings is the one lagging,
+    /// whatever a peer's average says about it, and the cap is what spreads
+    /// the copies: a claim that already has its second peer is skipped, so
+    /// free peers cover the others before any of this matters.
+    fn lagging_claim(&self, peer: PeerHandle) -> Option<Range<u32>> {
+        let mut best: Option<(Instant, Range<u32>)> = None;
+        for candidate in &self.participants {
+            let (count, mine) = self
+                .participants
+                .iter()
+                .filter(|p| p.chunks == candidate.chunks)
+                .fold((0usize, false), |(count, mine), p| {
+                    (count + 1, mine || p.peer == peer)
+                });
+            if count >= MAX_HOLDERS_PER_CLAIM || mine {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|(best_started, _)| candidate.started < *best_started)
+            {
+                best = Some((candidate.started, candidate.chunks.clone()));
+            }
+        }
+        best.map(|(_, chunks)| chunks)
     }
 
     /// Whether this peer already has a share.
@@ -138,22 +190,31 @@ impl InflightPiece {
     /// costs a duplicate, where wiping the piece -- what a single-owner
     /// release does -- costs everything every *other* peer delivered.
     fn release(&mut self, peer: PeerHandle, connection: u64) -> bool {
-        let mut released = false;
+        let mut freed = Vec::new();
         self.participants.retain(|p| {
             if p.peer == peer && p.connection == connection {
-                self.unclaimed.push_back(p.chunks.clone());
-                released = true;
+                freed.push(p.chunks.clone());
                 false
             } else {
                 true
             }
         });
-        if released {
-            self.unclaimed
-                .make_contiguous()
-                .sort_by_key(|range| range.start);
+        if freed.is_empty() {
+            return false;
         }
-        released
+        // Unconditionally, including a claim another peer still holds a
+        // copy of: the pool then carries one entry per departed holder, so
+        // the claim comes back to exactly the number of peers it lost, and
+        // `MAX_HOLDERS_PER_CLAIM` still binds. Skipping those was a guard
+        // with no case behind it -- every end state reachable with it is
+        // reachable without it.
+        for chunks in freed {
+            self.unclaimed.push_back(chunks);
+        }
+        self.unclaimed
+            .make_contiguous()
+            .sort_by_key(|range| range.start);
+        true
     }
 }
 
@@ -412,6 +473,7 @@ impl PieceTracker {
             peer: req.peer,
             connection: req.connection,
             chunks: chunks.clone(),
+            started: Instant::now(),
         };
         info.started = Instant::now();
 
@@ -434,9 +496,25 @@ impl PieceTracker {
         Some(inflight.started.elapsed())
     }
 
-    /// Every peer with a share of `piece`, for cancelling the duplicates of
-    /// a chunk that has arrived.
-    #[allow(dead_code)]
+    /// The peers left holding requests for `piece` that `winner` just
+    /// finished, and whose outstanding chunks are now bytes we have.
+    ///
+    /// A split piece ends when the last of its claims arrives, and a
+    /// duplicated claim ends when the first of its two copies does -- so
+    /// completion routinely leaves other peers mid-claim, asking for what
+    /// is already on disk. Everyone but the peer that finished it is
+    /// overtaken, including one holding the same claim as the winner, which
+    /// is the copy that lost the race and the whole reason to cancel.
+    pub fn overtaken_by(&self, piece: ValidPieceIndex, winner: PeerHandle) -> Vec<PeerHandle> {
+        self.participants(piece)
+            .iter()
+            .map(|participant| participant.peer)
+            .filter(|peer| *peer != winner)
+            .collect()
+    }
+
+    /// Every peer with a share of `piece`, for cancelling what the others
+    /// still have outstanding once it is complete.
     pub fn participants(&self, piece: ValidPieceIndex) -> &[Participant] {
         self.inflight
             .get(&piece)
@@ -801,6 +879,118 @@ mod tests {
             taken,
             vec![0..16, 16..32, 32..48, 48..64],
             "one peer alone still covers the whole piece, a claim at a time"
+        );
+    }
+
+    /// **Once nothing is unclaimed, a free peer doubles up on the claim
+    /// that is lagging.**
+    ///
+    /// Splitting alone turns "one peer's speed" into "the slowest of four
+    /// peers' speed": the piece is not done until its last claim is, so one
+    /// straggler still gates a read. A peer with no work left takes a
+    /// second copy of the oldest outstanding claim, and whichever arrives
+    /// first ends it.
+    #[test]
+    fn a_free_peer_doubles_up_on_the_claim_that_is_lagging() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+        let waited_on = piece(&tracker, 0);
+        for who in 1..=4 {
+            acquire_as(&mut tracker, &file_infos, &priorities, who, Some(waited_on));
+        }
+
+        // Peer 1 took 0..16 first, so it is the oldest outstanding claim.
+        let second = claimed(acquire_as(
+            &mut tracker,
+            &file_infos,
+            &priorities,
+            5,
+            Some(waited_on),
+        ));
+
+        assert_eq!(
+            second,
+            0..16,
+            "the claim outstanding longest is the one worth a second copy"
+        );
+        assert_eq!(
+            tracker.participants(waited_on).len(),
+            5,
+            "five peers, four claims, one of them doubled"
+        );
+    }
+
+    /// **The duplicates spread, and then they stop.**
+    ///
+    /// The cap is what spreads them: a claim that already has its second
+    /// peer is passed over, so free peers cover every claim once before any
+    /// gets a third copy -- and at
+    /// [`MAX_HOLDERS_PER_CLAIM`] the piece stops taking peers at all, so
+    /// the next one goes and fetches what the stream needs after this,
+    /// which is worth more than a third copy of what it already has twice.
+    #[test]
+    fn duplicates_spread_across_the_claims_and_stop_at_the_cap() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+        let waited_on = piece(&tracker, 0);
+        for who in 1..=4 {
+            acquire_as(&mut tracker, &file_infos, &priorities, who, Some(waited_on));
+        }
+
+        let doubled: Vec<Range<u32>> = (5..=8)
+            .map(|who| {
+                claimed(acquire_as(
+                    &mut tracker,
+                    &file_infos,
+                    &priorities,
+                    who,
+                    Some(waited_on),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            doubled,
+            vec![0..16, 16..32, 32..48, 48..64],
+            "every claim gets its second peer before any gets a third"
+        );
+
+        // A ninth peer finds the piece full and takes a queued one instead.
+        match acquire_as(&mut tracker, &file_infos, &priorities, 9, Some(waited_on)) {
+            AcquireResult::Reserved { piece: other, .. } => assert_ne!(
+                other, waited_on,
+                "the cap sends it to the next piece, not to a third copy"
+            ),
+            other => panic!("expected a different piece, got {other:?}"),
+        }
+    }
+
+    /// **Finishing a piece cancels what everyone else still has out for
+    /// it.**
+    ///
+    /// The point of duplicating a claim is that two peers race it, and the
+    /// loser is then asking a seeder for bytes already on our disk. It is
+    /// not only the loser: a split piece completes on its last claim, so
+    /// every peer still mid-claim is overtaken too, however far along it
+    /// was. Only the peer that finished it is spared.
+    #[test]
+    fn completing_a_piece_overtakes_every_other_peer_on_it() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+        let waited_on = piece(&tracker, 0);
+        for who in 1..=4 {
+            acquire_as(&mut tracker, &file_infos, &priorities, who, Some(waited_on));
+        }
+        // Peer 5 doubles up on peer 1's claim and wins the race.
+        acquire_as(&mut tracker, &file_infos, &priorities, 5, Some(waited_on));
+
+        let mut overtaken = tracker.overtaken_by(waited_on, peer(5));
+        overtaken.sort();
+
+        assert_eq!(
+            overtaken,
+            vec![peer(1), peer(2), peer(3), peer(4)],
+            "the losing copy of the winner's own claim is cancelled with the rest"
+        );
+        assert!(
+            !overtaken.contains(&peer(5)),
+            "and the peer that finished it is not asked to cancel itself"
         );
     }
 
@@ -1554,14 +1744,24 @@ mod tests {
             peer_has_piece: |_| true,
             can_steal: |_| true,
         });
+        // It joins the piece rather than taking it. Duplicating beats
+        // stealing on the thing a stream is blocked on: a steal drops
+        // whatever the robbed peer already has in flight -- its own doc
+        // says so -- where a second copy races it and the first to arrive
+        // ends the piece. What the test is here for is unchanged: the free
+        // pieces elsewhere do not help the stream, and the peer must not go
+        // and fetch one of those instead.
         match result {
-            AcquireResult::Stolen {
-                piece, from_peer, ..
-            } => {
-                assert_eq!(piece.get(), 3);
-                assert_eq!(from_peer, peer(1));
+            AcquireResult::Reserved { piece, chunks } => {
+                assert_eq!(piece.get(), 3, "the piece the stream is waiting on");
+                assert_eq!(chunks, 0..1);
+                assert_eq!(
+                    tracker.participants(stream_piece).len(),
+                    2,
+                    "both peers are on it now, and the dawdler keeps what it fetched"
+                );
             }
-            other => panic!("expected the stream's piece to be stolen, got {other:?}"),
+            other => panic!("expected to join the stream's piece, got {other:?}"),
         }
     }
 

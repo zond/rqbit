@@ -2778,6 +2778,11 @@ impl PeerHandler {
                 };
             }
 
+            // Peers that were fetching a share of this piece when it
+            // completed: everything they still have outstanding is bytes we
+            // now have, and a split piece is finished by whichever copy of
+            // its last claim arrives first, so the losers are cancelled.
+            let mut overtaken: Vec<SocketAddr> = Vec::new();
             let full_piece_download_time = {
                 let mut g = state.lock_write("mark_chunk_downloaded");
                 let chunk_marking_result = g.get_pieces_mut()?.mark_chunk_downloaded(piece);
@@ -2786,6 +2791,7 @@ impl PeerHandler {
                 match chunk_marking_result {
                     Some(ChunkMarkingResult::Completed) => {
                         trace!("piece={} done, will write and checksum", piece.index);
+                        overtaken = g.get_pieces()?.overtaken_by(chunk_info.piece_index, addr);
                         // Remove from inflight to prevent others from stealing it during hash check.
                         g.get_pieces_mut()?.take_inflight(chunk_info.piece_index)
                     }
@@ -2803,6 +2809,15 @@ impl PeerHandler {
                     }
                 }
             };
+
+            // Outside the state lock, as `on_steal` sends its cancellations.
+            for peer in overtaken {
+                state
+                    .peers
+                    .with_live_mut(peer, "cancel_overtaken_requests", |live| {
+                        live.cancel_inflight_requests_for_piece(chunk_info.piece_index)
+                    });
+            }
 
             // We don't care about per piece lock anymore, as it's removed from inflight pieces.
             // It shouldn't impact perf anyway, but dropping just in case.
