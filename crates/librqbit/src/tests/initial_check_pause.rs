@@ -184,6 +184,58 @@ async fn complete_torrent_on_disk(prefix: &str) -> anyhow::Result<(TempDir, Vec<
     Ok((dir, torrent.as_bytes()?.to_vec()))
 }
 
+/// A session holding the whole torrent and listening, with the address to
+/// dial it on: a real peer source, which is what tells "live" apart from
+/// "live and able to fetch".
+async fn seeding_session(
+    prefix: &str,
+) -> anyhow::Result<(TempDir, Vec<u8>, Arc<Session>, std::net::SocketAddr)> {
+    let files = create_default_random_dir_with_torrents(FILES, FILE_SIZE, Some(prefix));
+    let torrent_bytes = create_torrent(
+        files.path(),
+        CreateTorrentOptions {
+            name: None,
+            piece_length: Some(PIECE_LENGTH),
+            ..Default::default()
+        },
+        &BlockingSpawner::new(1),
+    )
+    .await?
+    .as_bytes()?
+    .to_vec();
+    let session = Session::new_with_opts(
+        files.path().into(),
+        SessionOptions {
+            dht: None,
+            persistence: None,
+            listen: Some(crate::listen::ListenerOptions {
+                listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await?;
+    session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent_bytes.clone()),
+            Some(AddTorrentOptions {
+                overwrite: true,
+                output_folder: Some(files.path().to_str().unwrap().to_owned()),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a seeder handle")?
+        .wait_until_completed()
+        .await?;
+    let peer = session
+        .listen_addr()
+        .context("the seeder is not listening")?;
+    Ok((files, torrent_bytes, session, peer))
+}
+
 fn add_opts(dir: &TempDir, paused: bool, gate: &Arc<Gate>) -> AddTorrentOptions {
     AddTorrentOptions {
         paused,
@@ -424,4 +476,88 @@ async fn wait_until_resume_data_is_complete(
         WAIT,
     )
     .await
+}
+
+/// **A torrent unpaused mid-check must go live with a peer stream**, not
+/// merely into `Live`.
+///
+/// `start` takes the peer stream as an argument and hands it to the initial
+/// check's continuation. A torrent added *paused* is given `None` --
+/// `Session::add_torrent` only builds one when it is not pausing -- and the
+/// unpause that arrives while the check is running builds a real one and
+/// then drops it on `start`'s early return, because a check is already
+/// going. The continuation still holds the `None` it captured at add time,
+/// so the torrent reaches `Live` with no peer adder and no announce, and
+/// stays there: `start` on a live torrent bails, so unpausing again cannot
+/// repair it.
+///
+/// `unpause_during_the_initial_check_starts_the_torrent` above does this
+/// exact sequence and passes, because `live().is_some()` is true of a
+/// torrent that can never fetch a byte. So this one gives it a seeder and
+/// an empty directory and asks it to actually download -- which is the bar
+/// the comment in `torrent_state/mod.rs` set for a test of this, and the
+/// reason the attempted fix recorded there was reverted rather than
+/// finished.
+#[tokio::test(flavor = "multi_thread")]
+async fn unpause_during_the_initial_check_keeps_the_peer_stream() -> anyhow::Result<()> {
+    timeout(
+        WAIT,
+        unpause_during_the_initial_check_keeps_the_peer_stream_inner(),
+    )
+    .await?
+}
+
+async fn unpause_during_the_initial_check_keeps_the_peer_stream_inner() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (seeder_dir, torrent_bytes, _seeder, peer) = seeding_session("rqbit_unpause_peers").await?;
+    let gate = Arc::new(Gate::default());
+
+    // An empty directory, so finishing means bytes really arrived from the
+    // seeder rather than the check finding them already there.
+    let dir = TempDir::with_prefix("rqbit_unpause_peers_leecher")?;
+    let session = Session::new_with_opts(dir.path().into(), session_opts(None, None)).await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent_bytes),
+            Some(AddTorrentOptions {
+                initial_peers: Some(vec![peer]),
+                ..add_opts(&dir, true, &gate)
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+
+    gate.wait_until_check_started().await?;
+    session.unpause(&handle).await?;
+    info!("unpaused while the initial check was running");
+    gate.open();
+
+    wait_until(
+        || match handle.stats().state {
+            TorrentStatsState::Live => Ok(()),
+            other => bail!("waiting for the torrent to go live, it is {other:?}"),
+        },
+        WAIT,
+    )
+    .await
+    .context("the unpause was swallowed by the initial check")?;
+
+    wait_until(
+        || {
+            if handle.stats().finished {
+                Ok(())
+            } else {
+                bail!(
+                    "the torrent is live but has fetched nothing: {:?}",
+                    handle.stats()
+                )
+            }
+        },
+        WAIT,
+    )
+    .await
+    .context("live with no peer adder: the unpause's peer stream was dropped")?;
+    drop(seeder_dir);
+    Ok(())
 }

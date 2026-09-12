@@ -65,6 +65,18 @@ pub struct TorrentStateInitializing {
     pause_requested: AtomicBool,
     check_running: AtomicBool,
     previously_errored: bool,
+    /// A peer stream left here by a `start` that found this check already
+    /// running, for the check's continuation to go live with.
+    ///
+    /// `ManagedTorrent::start` takes the peer stream as an argument and
+    /// hands it to the continuation, which runs a whole check later. A
+    /// second `start` in the meantime -- an unpause through the API -- has
+    /// built a *live* stream and would otherwise drop it on its early
+    /// return, leaving the continuation to go live with whatever was
+    /// captured at add time. For a torrent added paused that is `None`, and
+    /// a torrent that reaches `Live` with no peer adder never fetches a
+    /// byte and cannot be repaired: `start` on a live torrent bails.
+    peer_rx: parking_lot::Mutex<Option<crate::type_aliases::PeerStream>>,
 }
 
 impl TorrentStateInitializing {
@@ -76,6 +88,7 @@ impl TorrentStateInitializing {
         previously_errored: bool,
     ) -> Self {
         Self {
+            peer_rx: parking_lot::Mutex::new(None),
             shared,
             metadata,
             only_files,
@@ -106,6 +119,21 @@ impl TorrentStateInitializing {
 
     pub(crate) fn is_check_running(&self) -> bool {
         self.check_running.load(Ordering::Acquire)
+    }
+
+    /// Leave a peer stream for the running check's continuation; see
+    /// [`Self::peer_rx`]. The newest wins: an older one is a stream nothing
+    /// has consumed from, and the live one is the one with an announce
+    /// behind it.
+    pub(crate) fn hand_peer_stream(&self, peer_rx: Option<crate::type_aliases::PeerStream>) {
+        if peer_rx.is_some() {
+            *self.peer_rx.lock() = peer_rx;
+        }
+    }
+
+    /// Take whatever [`Self::hand_peer_stream`] left, for the continuation.
+    pub(crate) fn take_peer_stream(&self) -> Option<crate::type_aliases::PeerStream> {
+        self.peer_rx.lock().take()
     }
 
     pub(crate) fn try_start_check(&self) -> bool {

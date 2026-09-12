@@ -727,40 +727,20 @@ impl ManagedTorrent {
                 ManagedTorrentState::Initializing(init) => {
                     let init = init.clone();
                     init.clear_pause_request();
-                    // KNOWN BUG, not yet fixed. This early return makes both
-                    // `Session::pause` and `Session::unpause` return `Ok(())`
-                    // having done nothing, and the torrent then settles on the
-                    // *add-time* `start_paused` captured by the in-flight
-                    // check's continuation rather than on the intent just
-                    // recorded. So `is_paused()` can disagree with the state in
-                    // BOTH directions:
-                    //
-                    //  * unpause during a running check -> parked in `Paused`
-                    //    with `is_paused() == false`;
-                    //  * pause during a *fastresume* check -> `Live` with
-                    //    `is_paused() == true`, because `validate_fastresume`
-                    //    never reads `pause_requested` the way
-                    //    `FileOps::initial_check` does. Measured downstream as a
-                    //    torrent that kept downloading after being told to stop.
-                    //
-                    // Both are reachable through the HTTP API by hitting
-                    // pause/start during the initial check.
-                    //
-                    // AN ATTEMPTED FIX WAS REVERTED, and the trap is worth
-                    // recording: making the continuation read the live intent is
-                    // necessary but NOT sufficient. It also has to carry the
-                    // *current* peer stream. `start()` builds a peer_rx and
-                    // drops it on this early return, while the continuation
-                    // holds the one captured at add time -- which is `None` for
-                    // any torrent added paused. Honouring the intent without
-                    // fixing that takes the torrent Live with no peers and no
-                    // announce, permanently, because `start()` on a `Live`
-                    // torrent bails. That is strictly worse than the bug: this
-                    // one is recoverable by unpausing again, that one is not.
-                    //
-                    // A test for it needs a real peer source, so that "started"
-                    // means "can actually fetch" and not merely `live().is_some()`.
+                    // A check is already running; the intent this call
+                    // recorded is what its continuation will land on, since
+                    // that reads `g.paused` rather than an argument captured
+                    // a check ago (f21c3a3e). So both `pause` and `unpause`
+                    // during a check are honoured by doing nothing here --
+                    // except for the peer stream, which is this call's to
+                    // hand over and the continuation's to use.
                     if !init.try_start_check() {
+                        // A check is already running and will go live when it
+                        // finishes -- with the peer stream it captured, which
+                        // for a torrent added paused is `None`. This call has
+                        // a live one, so leave it for that continuation
+                        // rather than dropping it on the floor.
+                        init.hand_peer_stream(peer_rx);
                         return Ok(());
                     }
 
@@ -801,6 +781,11 @@ impl ManagedTorrent {
 
                                     g.state = ManagedTorrentState::Paused(paused);
                                     t.state_change_notify.notify_waiters();
+                                    // Whatever a `start` during the check left
+                                    // is newer than what this one captured, and
+                                    // for a torrent added paused it is the only
+                                    // one there has ever been.
+                                    let peer_rx = init.take_peer_stream().or(peer_rx);
                                     _start(&t, peer_rx, session, Some(g), token)
                                 }
                                 Err(err) => {
