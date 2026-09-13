@@ -115,6 +115,12 @@ This changes three of the invariants below:
   back under its holder's feet goes straight out again, over the cap, or
   back to the holder itself, which then finds every chunk of it already in
   flight with itself.
+- **A piece with several writers needs a real lock.** `per_piece_locks[p]`
+  is taken **exclusively** by a chunk write, and before the state lock. A
+  read lock was exclusion enough while one peer owned a piece; with several,
+  it is the only thing between one peer's chunk and another peer finishing
+  the piece and handing it to the storage as complete. See "Piece
+  completion" below.
 - **A split piece is never stolen.** There is no single owner to take it
   from, and it already has the parallelism a steal would buy.
 
@@ -129,8 +135,26 @@ what lets a failed hash be blamed on the peer that sent it.
 
 4. Piece completion:
    - `PieceTracker::take_inflight(piece)` → removes from `inflight`
-   - Hash check passes: `PieceTracker::mark_piece_hash_ok(piece)` → sets `have[p] = true`
+   - every other participant is cancelled (`overtaken_by` →
+     `cancel_inflight_requests_for_piece`), which frees their request slots
+     and wakes them straight into the next step
+   - `per_piece_locks[p]` is released -- and only here, because a chunk
+     queued behind it now reads an `inflight` that no longer has the piece,
+     and goes away without writing
+   - Hash check passes: `TorrentStorage::on_piece_completed(piece)` commits it,
+     then `PieceTracker::mark_piece_hash_ok(piece)` → sets `have[p] = true`
    - Hash check fails: `PieceTracker::mark_piece_hash_failed(piece)` → sets `queue_pieces[p] = true`
+
+**The hash check is a state of its own.** Between `take_inflight()` and
+`mark_piece_hash_ok()` the piece is not `have`, not `queued` (reserving it
+cleared that) and not `inflight`: it is in none of the three sets. Nothing
+may hand it to a peer there, and the one thing that could -- the priority
+loop of `acquire_piece()`, which reserves without asking the queue -- tests
+`is_piece_fully_downloaded()` and passes over it. Reserving it is pure
+damage: the chunks fetched for it come back `PreviouslyCompleted` and are
+dropped, but only after being written over a piece the storage has been told
+is finished, and the piece never leaves `inflight` again because nothing
+reports it complete a second time.
 
 ### Piece Stealing Flow
 

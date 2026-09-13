@@ -635,6 +635,20 @@ impl ChunkTracker {
         self.queue_pieces[id.get() as usize]
     }
 
+    /// Every chunk of the piece has been written to storage.
+    ///
+    /// Not the same as [`Self::is_piece_have`], which also means the hash
+    /// checked out. Between the two is the check itself, during which the
+    /// piece is in no set at all: not have, not queued (reserving it
+    /// cleared that), not in flight ([`PieceTracker::take_inflight`] pulled
+    /// it out so nothing could steal it mid-check). Nothing may hand it to
+    /// a peer in that window, and this is what says so.
+    pub(crate) fn is_piece_fully_downloaded(&self, id: ValidPieceIndex) -> bool {
+        self.chunk_status
+            .get(self.lengths.chunk_range(id))
+            .is_some_and(|chunks| chunks.all())
+    }
+
     pub fn mark_piece_broken_if_not_have(&mut self, index: ValidPieceIndex) {
         if self
             .have

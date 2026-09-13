@@ -349,6 +349,25 @@ impl PieceTracker {
         for piece in &mut req.priority_pieces {
             if self.chunks.is_piece_have(piece)
                 || self.chunks.is_releasing(piece)
+                // Nor one whose chunks are all in, which is a piece being
+                // hash-checked: `take_inflight` drops it from the in-flight
+                // map before the check so nobody can steal it, and until
+                // the check comes back it is not have, not queued and not
+                // in flight. Only this loop can reserve such a piece --
+                // `iter_queued_pieces` cannot, its bit is long gone -- and
+                // reserving it is pure damage: every chunk fetched for it
+                // comes back `PreviouslyCompleted` and is dropped, but only
+                // after being written to storage, over a piece the check
+                // has by then handed to the storage as complete. It cannot
+                // even heal a failed check, because `mark_chunk_downloaded`
+                // short-circuits on a piece whose chunks are already all
+                // marked and never reports the piece complete again.
+                //
+                // A dropped piece is deliberately still reachable here --
+                // that is how a stream re-fetches what the reclaim took --
+                // and its chunks are reset when it goes, so it does not
+                // look like this.
+                || self.chunks.is_piece_fully_downloaded(piece)
                 || !(req.peer_has_piece)(piece)
             {
                 continue;
@@ -1137,6 +1156,55 @@ mod tests {
         ));
         assert_eq!(first, 0..16, "the abandoned claim is the one handed out");
         assert_ne!(second, first, "and it was handed out twice: {first:?}");
+    }
+
+    /// **A piece being hash-checked is not handed to anyone.**
+    ///
+    /// Completion takes the piece out of the in-flight map so nothing can
+    /// steal it while it is checked, and leaves it in no set at all: not
+    /// have, not queued, not in flight. The priority loop is the one place
+    /// that reserves without asking the queue, so it is the one place that
+    /// can hand out a piece that is already entirely on disk -- and every
+    /// peer on the piece is woken into exactly that moment, by the
+    /// cancellations completion sends them.
+    ///
+    /// What it costs: the chunks come back, get written over a piece the
+    /// check has already handed to the storage as complete, and are then
+    /// dropped as `PreviouslyCompleted`. The piece also never leaves the
+    /// in-flight map again, because nothing reports it complete a second
+    /// time.
+    #[test]
+    fn a_piece_in_its_hash_check_is_not_reserved_again() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+        let waited_on = piece(&tracker, 0);
+        for who in 1..=4 {
+            acquire_as(&mut tracker, &file_infos, &priorities, who, Some(waited_on));
+        }
+        // Every chunk arrives, and the piece leaves the map for its check.
+        for chunk in 0..SPLIT_CHUNKS_PER_PIECE {
+            tracker
+                .chunks
+                .mark_chunk_downloaded(&fake_piece(waited_on, chunk));
+        }
+        assert!(tracker.take_inflight(waited_on).is_some());
+
+        // An overtaken peer, woken by the cancellation, asks for work while
+        // the stream is still parked on that piece.
+        match acquire_as(&mut tracker, &file_infos, &priorities, 2, Some(waited_on)) {
+            AcquireResult::Reserved { piece: got, chunks } => assert_ne!(
+                got, waited_on,
+                "the piece being checked was reserved again, chunks {chunks:?}"
+            ),
+            AcquireResult::NoneAvailable => panic!("the other pieces are still free"),
+            other => panic!("expected a reservation elsewhere, got {other:?}"),
+        }
+    }
+
+    /// A chunk-sized `Piece` message for `mark_chunk_downloaded`, whose
+    /// payload it never looks at.
+    fn fake_piece(index: ValidPieceIndex, chunk: u32) -> Piece<ByteBuf<'static>> {
+        const ZEROES: [u8; CHUNK_SIZE as usize] = [0u8; CHUNK_SIZE as usize];
+        Piece::from_data(index.get(), chunk * CHUNK_SIZE, &ZEROES)
     }
 
     fn piece(tracker: &PieceTracker, id: u32) -> ValidPieceIndex {

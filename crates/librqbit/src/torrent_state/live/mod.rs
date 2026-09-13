@@ -2726,13 +2726,30 @@ impl PeerHandler {
             // So that by the time we are done writing AND if it was the last piece,
             // we can actually checksum etc.
             // Otherwise it might get into some weird state.
-            let ppl_guard = {
+            // Exclusive, and taken before the state lock rather than under it.
+            //
+            // A read lock was exclusion enough while one peer owned a piece: the only
+            // other contender was a steal, which takes the same lock with try_write and
+            // so fails while anyone is writing. A split piece has several peers writing
+            // it at once, and this is the only thing standing between a chunk of one of
+            // them and the moment another finishes the piece, hands it to the storage as
+            // complete and lets it be read. A write that lands the wrong side of that is
+            // a write into a piece the storage has already finished: on the piece-per-file
+            // store it opens a fresh staged copy over the complete one and every later
+            // read of the piece is served that copy -- 16 KiB of a 4 MiB piece, and the
+            // read fails or comes back zeros. Held exclusively, a chunk that arrives in
+            // that window waits here and then finds the piece gone from the in-flight map
+            // below, which is what the check underneath has always been for.
+            //
+            // Before the state lock, because the order has to be one way round: the peer
+            // that completes the piece takes the state lock while holding this, so a peer
+            // blocking on this while holding the state lock would deadlock the two.
+            let ppl_guard = state
+                .per_piece_locks
+                .get(piece.index as usize)
+                .map(|l| l.write());
+            {
                 let g = state.lock_read("check_steal");
-
-                let ppl = state
-                    .per_piece_locks
-                    .get(piece.index as usize)
-                    .map(|l| l.read());
 
                 match g.get_pieces()?.get_inflight(chunk_info.piece_index) {
                     // A share, not the piece: several peers may be filling
@@ -2755,9 +2772,7 @@ impl PeerHandler {
                         return Ok(());
                     }
                 };
-
-                ppl
-            };
+            }
 
             // While we hold per piece lock, noone can steal it.
             // So we can proceed writing knowing that the piece is ours now and will still be by the time
@@ -2819,8 +2834,11 @@ impl PeerHandler {
                     });
             }
 
-            // We don't care about per piece lock anymore, as it's removed from inflight pieces.
-            // It shouldn't impact perf anyway, but dropping just in case.
+            // Dropped only here, and only because the piece is out of the in-flight map by
+            // now: a peer queued behind this lock with a chunk of the same piece wakes up,
+            // reads the map, finds nothing of its own there and goes away without writing.
+            // Released any earlier and it would write into a piece the hash check below is
+            // about to hand to the storage as complete.
             drop(ppl_guard);
 
             let full_piece_download_time = match full_piece_download_time {
@@ -3085,22 +3103,34 @@ fn format_peer_client_name(value: &ByteBuf<'_>) -> Option<String> {
 mod connection_tests {
     use std::{
         net::{Ipv4Addr, SocketAddr},
+        ops::Range,
+        sync::{Arc, atomic::AtomicBool},
         time::Duration,
     };
 
     use anyhow::Context;
-    use librqbit_core::{constants::CHUNK_SIZE, hash_id::Id20};
+    use librqbit_core::{
+        constants::CHUNK_SIZE,
+        hash_id::Id20,
+        lengths::{ChunkInfo, ValidPieceIndex},
+    };
+    use peer_binary_protocol::Piece;
     use tempfile::TempDir;
     use tokio::sync::mpsc::unbounded_channel;
     use tokio_util::sync::CancellationToken;
 
-    use super::{BF, PeerHandler};
+    use super::{BF, PeerHandler, TorrentStateLocked};
     use crate::{
-        AddTorrent, CreateTorrentOptions, Session, create_torrent,
+        AddTorrent, CreateTorrentOptions, ManagedTorrentShared, Session, TorrentMetadata,
+        create_torrent,
         spawn_utils::BlockingSpawner,
+        storage::{
+            StorageFactory, StorageFactoryExt, TorrentStorage, filesystem::FilesystemStorageFactory,
+        },
         stream_connect::ConnectionKind,
         tests::test_util::{
             TestPeerMetadata, create_default_random_dir_with_torrents, setup_test_logging,
+            wait_until,
         },
     };
 
@@ -3175,6 +3205,386 @@ mod connection_tests {
             "the old connection's death took the new one's piece with it, or kept its own"
         );
         Ok(())
+    }
+
+    /// **Two peers on one piece must not have one of them still writing
+    /// when the other hands the piece to the storage.**
+    ///
+    /// A storage is told a piece is complete exactly once, and from that
+    /// moment the piece is readable and the bytes are where a restart will
+    /// look for them. A chunk that lands after it is a write into a
+    /// finished piece: the piece-per-file store answers it by opening a
+    /// fresh staged copy over the complete one, and from then on every read
+    /// of that piece is served the staged copy -- sixteen kilobytes of a
+    /// four megabyte piece -- so a read either fails past its end or comes
+    /// back zeros. The field log is full of the first:
+    /// `reading 262144 bytes at 1779199 of piece 834`, seconds after six
+    /// and a half megabytes had been served out of that same piece.
+    ///
+    /// Nothing could produce that while a piece had one peer: the peer that
+    /// wrote it was the peer that completed it. Splitting put several peers
+    /// on one piece, and the per-piece lock that used to make the write
+    /// exclusive by accident -- one writer, and a steal blocked out by
+    /// `try_write` -- had to be made exclusive on purpose.
+    ///
+    /// Here peer 2 is held inside its write of chunk 0 while peer 1 delivers
+    /// the whole piece. Peer 1 must not get as far as the storage's
+    /// `on_piece_completed` until peer 2's write is done.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_chunk_write_cannot_land_after_the_piece_is_handed_to_the_storage()
+    -> anyhow::Result<()> {
+        setup_test_logging();
+        const CHUNKS_PER_PIECE: u32 = 32;
+        const PIECE_LEN: u32 = CHUNK_SIZE * CHUNKS_PER_PIECE;
+        const FILE_SIZE: usize = (PIECE_LEN * 2) as usize;
+
+        let files = create_default_random_dir_with_torrents(1, FILE_SIZE, Some("rqbit_ppl"));
+        let content = std::fs::read(files.path().join("0.data"))?;
+        let torrent = create_torrent(
+            files.path(),
+            CreateTorrentOptions {
+                piece_length: Some(PIECE_LEN),
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await?;
+
+        let recorder = Arc::new(Recorder::default());
+        let out = TempDir::with_prefix("rqbit_ppl_client")?;
+        let session = Session::new_with_opts(
+            out.path().into(),
+            crate::SessionOptions {
+                dht: None,
+                persistence: None,
+                peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.as_bytes()?.to_vec()),
+                Some(crate::AddTorrentOptions {
+                    overwrite: true,
+                    output_folder: Some(out.path().to_str().unwrap().to_owned()),
+                    storage_factory: Some(
+                        RecordingStorageFactory {
+                            recorder: recorder.clone(),
+                            inner: FilesystemStorageFactory::default(),
+                        }
+                        .boxed(),
+                    ),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        tokio::time::timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+        let live = handle.live().context("expected a live torrent")?;
+        let target = live.lengths.validate_piece_index(0).context("piece 0")?;
+
+        // Two peers, both holding the whole torrent.
+        let mut addrs = Vec::new();
+        // Kept alive: the table's send half is what the cancellations go
+        // out on, and it is closed the moment the receiver goes.
+        let mut peer_rxs = Vec::new();
+        for port in 1..=2u16 {
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+            live.peers
+                .add_if_not_seen(addr)
+                .context("a fresh address")?;
+            let (rx, _tx) = live
+                .peers
+                .mark_peer_connecting(addr, CancellationToken::new())?;
+            live.peers.with_peer_mut(addr, "test", |p| {
+                p.connecting_to_live(Id20::new([0u8; 20]), &live.peers, ConnectionKind::Tcp);
+            });
+            live.peers.with_live_mut(addr, "test", |l| {
+                l.bitfield = BF::from_boxed_slice(vec![0xff].into_boxed_slice());
+            });
+            addrs.push(addr);
+            peer_rxs.push(rx);
+        }
+
+        // Peer 1 takes both claims of the piece, so it alone can finish it;
+        // peer 2 doubles up on the first, which is what the tail of every
+        // split piece does.
+        let take = |addr: SocketAddr| -> anyhow::Result<Range<u32>> {
+            let mut g = live.lock_write("test");
+            let TorrentStateLocked {
+                pieces,
+                file_priorities,
+                ..
+            } = &mut **g;
+            let pieces = pieces.as_mut().context("no chunk tracker")?;
+            match pieces.acquire_piece(crate::piece_tracker::AcquireRequest {
+                peer: addr,
+                connection: 0,
+                peer_avg_time: None,
+                priority_pieces: std::iter::once(target),
+                file_priorities,
+                file_infos: &live.metadata.file_infos,
+                peer_has_piece: |_| true,
+                can_steal: |_| true,
+            }) {
+                crate::piece_tracker::AcquireResult::Reserved { piece, chunks } => {
+                    anyhow::ensure!(piece == target, "got piece {piece} instead");
+                    Ok(chunks)
+                }
+                other => anyhow::bail!("expected a reservation, got {other:?}"),
+            }
+        };
+        assert_eq!(take(addrs[0])?, 0..16);
+        assert_eq!(take(addrs[0])?, 16..32);
+        assert_eq!(
+            take(addrs[1])?,
+            0..16,
+            "peer 2 doubles up on the older claim"
+        );
+
+        let chunks: Vec<ChunkInfo> = live.lengths.iter_chunk_infos(target).collect();
+        assert_eq!(chunks.len(), CHUNKS_PER_PIECE as usize);
+        let bytes = |chunk: &ChunkInfo| -> Vec<u8> {
+            let start = chunk.offset as usize;
+            content[start..start + chunk.size as usize].to_vec()
+        };
+
+        // Peer 2 delivers chunk 0 and is held inside the write of it.
+        recorder.arm();
+        let mut peer2 = tokio::spawn({
+            let live = live.clone();
+            let addr = addrs[1];
+            let chunk = chunks[0];
+            let data = bytes(&chunk);
+            async move {
+                let (tx, _rx) = unbounded_channel();
+                let handler = PeerHandler::for_test(live.clone(), addr, tx);
+                live.peers.with_live_mut(addr, "test", |l| {
+                    l.add_inflight_request(chunk);
+                });
+                handler
+                    .on_received_piece(Piece::from_data(target.get(), chunk.offset, &data))
+                    .await
+            }
+        });
+        tokio::select! {
+            finished = &mut peer2 => anyhow::bail!("peer 2 never reached the storage: {finished:?} ops={:?}", recorder.ops()),
+            parked = recorder.wait_until_parked() => parked?,
+        }
+
+        // Peer 1 delivers the whole piece while peer 2 is held there.
+        let peer1 = tokio::spawn({
+            let live = live.clone();
+            let addr = addrs[0];
+            let all: Vec<(ChunkInfo, Vec<u8>)> = chunks.iter().map(|c| (*c, bytes(c))).collect();
+            async move {
+                let (tx, _rx) = unbounded_channel();
+                let handler = PeerHandler::for_test(live.clone(), addr, tx);
+                for (chunk, data) in all {
+                    live.peers.with_live_mut(addr, "test", |l| {
+                        l.add_inflight_request(chunk);
+                    });
+                    handler
+                        .on_received_piece(Piece::from_data(target.get(), chunk.offset, &data))
+                        .await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+        });
+
+        // Give it every chance to get to the storage. It must not.
+        recorder
+            .wait_for_completion_of(0, Duration::from_secs(2))
+            .await;
+        recorder.release();
+        drop(peer_rxs);
+        peer2.await??;
+        peer1.await??;
+
+        let ops = recorder.ops();
+        let completed = ops.iter().position(|op| *op == Op::Completed(0));
+        let completed = completed.context("peer 1 never finished the piece")?;
+        let late = ops
+            .iter()
+            .enumerate()
+            .find(|(index, op)| *index > completed && **op == Op::Wrote(0));
+        assert!(
+            late.is_none(),
+            "a chunk was written into piece 0 after the storage was told it was complete: {ops:?}"
+        );
+        Ok(())
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    enum Op {
+        Wrote(u32),
+        Completed(u32),
+    }
+
+    /// Records what the storage is asked to do, and can hold one write
+    /// inside itself until the test lets it go.
+    #[derive(Default)]
+    struct Recorder {
+        ops: std::sync::Mutex<Vec<Op>>,
+        arm: AtomicBool,
+        parked: AtomicBool,
+        release: std::sync::Mutex<bool>,
+        release_cv: std::sync::Condvar,
+    }
+
+    impl Recorder {
+        fn arm(&self) {
+            self.arm.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn record(&self, op: Op) {
+            self.ops.lock().unwrap().push(op);
+        }
+
+        fn ops(&self) -> Vec<Op> {
+            self.ops.lock().unwrap().clone()
+        }
+
+        /// Called from inside the storage, on a blocking thread.
+        fn maybe_park(&self) {
+            if !self.arm.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            self.parked.store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut released = self.release.lock().unwrap();
+            while !*released {
+                released = self.release_cv.wait(released).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            *self.release.lock().unwrap() = true;
+            self.release_cv.notify_all();
+        }
+
+        async fn wait_until_parked(&self) -> anyhow::Result<()> {
+            wait_until(
+                || match self.parked.load(std::sync::atomic::Ordering::SeqCst) {
+                    true => Ok(()),
+                    false => anyhow::bail!("no write has reached the storage yet"),
+                },
+                Duration::from_secs(10),
+            )
+            .await
+        }
+
+        async fn wait_for_completion_of(&self, piece: u32, within: Duration) {
+            let deadline = tokio::time::Instant::now() + within;
+            while tokio::time::Instant::now() < deadline {
+                if self.ops().contains(&Op::Completed(piece)) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingStorageFactory {
+        recorder: Arc<Recorder>,
+        inner: FilesystemStorageFactory,
+    }
+
+    impl StorageFactory for RecordingStorageFactory {
+        type Storage = RecordingStorage;
+
+        fn create(
+            &self,
+            shared: &ManagedTorrentShared,
+            metadata: &TorrentMetadata,
+        ) -> anyhow::Result<RecordingStorage> {
+            Ok(RecordingStorage {
+                piece_length: metadata.lengths().default_piece_length(),
+                inner: Box::new(self.inner.create(shared, metadata)?),
+                recorder: self.recorder.clone(),
+            })
+        }
+
+        fn is_type_id(&self, type_id: std::any::TypeId) -> bool {
+            self.inner.is_type_id(type_id)
+        }
+
+        fn clone_box(&self) -> crate::storage::BoxStorageFactory {
+            self.clone().boxed()
+        }
+    }
+
+    struct RecordingStorage {
+        inner: Box<dyn TorrentStorage>,
+        recorder: Arc<Recorder>,
+        piece_length: u32,
+    }
+
+    impl RecordingStorage {
+        fn piece_of(&self, offset: u64) -> u32 {
+            u32::try_from(offset / u64::from(self.piece_length)).expect("piece index fits")
+        }
+    }
+
+    impl TorrentStorage for RecordingStorage {
+        fn init(
+            &mut self,
+            shared: &ManagedTorrentShared,
+            metadata: &TorrentMetadata,
+        ) -> anyhow::Result<()> {
+            self.inner.init(shared, metadata)
+        }
+
+        fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+            self.inner.pread_exact(file_id, offset, buf)
+        }
+
+        fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+            self.recorder.maybe_park();
+            self.recorder.record(Op::Wrote(self.piece_of(offset)));
+            self.inner.pwrite_all(file_id, offset, buf)
+        }
+
+        fn pwrite_all_vectored(
+            &self,
+            file_id: usize,
+            offset: u64,
+            bufs: [std::io::IoSlice<'_>; 2],
+        ) -> anyhow::Result<usize> {
+            self.recorder.maybe_park();
+            self.recorder.record(Op::Wrote(self.piece_of(offset)));
+            self.inner.pwrite_all_vectored(file_id, offset, bufs)
+        }
+
+        fn remove_file(&self, file_id: usize, filename: &std::path::Path) -> anyhow::Result<()> {
+            self.inner.remove_file(file_id, filename)
+        }
+
+        fn remove_directory_if_empty(&self, path: &std::path::Path) -> anyhow::Result<()> {
+            self.inner.remove_directory_if_empty(path)
+        }
+
+        fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
+            self.inner.ensure_file_length(file_id, length)
+        }
+
+        /// Wrapping what comes back, unlike the gated storage of the
+        /// initial-check tests: the live torrent runs on what `take` hands
+        /// over, and the live torrent is the whole subject here.
+        fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+            Ok(Box::new(RecordingStorage {
+                inner: self.inner.take()?,
+                recorder: self.recorder.clone(),
+                piece_length: self.piece_length,
+            }))
+        }
+
+        fn on_piece_completed(&self, piece_index: ValidPieceIndex) -> anyhow::Result<()> {
+            self.recorder.record(Op::Completed(piece_index.get()));
+            self.inner.on_piece_completed(piece_index)
+        }
     }
 }
 
