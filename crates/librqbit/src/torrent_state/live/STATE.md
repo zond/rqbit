@@ -114,7 +114,25 @@ This changes three of the invariants below:
   `MAX_HOLDERS_PER_CLAIM` -- only `lagging_claim` does -- so a claim put
   back under its holder's feet goes straight out again, over the cap, or
   back to the holder itself, which then finds every chunk of it already in
-  flight with itself.
+  flight with itself. Nor does a claim whose chunks have **all arrived**:
+  there is nothing left in it to fetch and the piece completes on those
+  marks whoever set them.
+- **A finished claim is over.** `chunk_status` is the only record of which
+  chunks have landed, so `ChunkTracker::chunks_missing()` is what tells
+  `inflight` that a claim is done. A claim with nothing missing is not
+  offered to a second peer, is not put back by `release()`, and is retired
+  from `participants` when its own holder next asks for work. Ranking on
+  `started` over a list nothing retired from meant "outstanding longest"
+  named a claim that had landed minutes ago, and every free peer was sent
+  to fetch it again -- which is also what put several peers on one piece's
+  writes at the tail of every split piece.
+- **The second copy goes where the most is left to fetch.**
+  `lagging_claim()` ranks candidates by chunks still missing, with
+  `started` as the tie-break, because what gates the piece is the work
+  remaining on its slowest claim and not when that claim was handed out --
+  which is milliseconds apart between siblings anyway. Holder count is not
+  consulted: at a cap of two, every claim that is not full has exactly one
+  holder.
 - **A piece with several writers needs a real lock.** `per_piece_locks[p]`
   is taken **exclusively** by a chunk write, and before the state lock. A
   read lock was exclusion enough while one peer owned a piece; with several,
@@ -144,6 +162,11 @@ what lets a failed hash be blamed on the peer that sent it.
    - Hash check passes: `TorrentStorage::on_piece_completed(piece)` commits it,
      then `PieceTracker::mark_piece_hash_ok(piece)` → sets `have[p] = true`
    - Hash check fails: `PieceTracker::mark_piece_hash_failed(piece)` → sets `queue_pieces[p] = true`
+   - Hash check cannot be *run* -- `check_piece()` returns an error, i.e. the
+     read failed -- is treated the same way and then propagated. A piece left
+     in the check's own state is stranded for good: nothing puts it back, and
+     nothing can heal it, because `mark_chunk_downloaded()` short-circuits on
+     a piece whose chunks are all marked and never reports it complete again.
 
 **The hash check is a state of its own.** Between `take_inflight()` and
 `mark_piece_hash_ok()` the piece is not `have`, not `queued` (reserving it

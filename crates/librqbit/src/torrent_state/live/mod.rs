@@ -2846,11 +2846,36 @@ impl PeerHandler {
                 None => return Ok(()),
             };
 
-            match state
-                .file_ops()
-                .check_piece(chunk_info.piece_index)
-                .with_context(|| format!("error checking piece={index}"))?
-            {
+            // A check that cannot be run is not a check that failed, but the
+            // piece cannot be left as it is either. It is in no set at all
+            // here: not have, the check never came back; not queued,
+            // reserving it cleared the bit; not in flight, completion took
+            // it out so nothing could steal it mid-check. Nothing puts it
+            // back, and nothing can heal it from the outside --
+            // `mark_chunk_downloaded` short-circuits on a piece whose chunks
+            // are all marked, and those are all marked, so a re-download
+            // would be written and then dropped and the piece would never be
+            // reported complete again. One failed read and the piece is gone
+            // for the life of the torrent.
+            //
+            // So it is broken exactly as a failed hash is: chunks cleared,
+            // queued again unless it is one the reclaim dropped. Then the
+            // error goes on up. The peer that delivered the last chunk is
+            // not to blame and is not accused of anything -- the caller
+            // decides what a disk error means -- but the piece is left in a
+            // state something can retry.
+            let checked = match state.file_ops().check_piece(chunk_info.piece_index) {
+                Ok(checked) => checked,
+                Err(e) => {
+                    state
+                        .lock_write("mark_piece_broken_after_unreadable_check")
+                        .get_pieces_mut()?
+                        .mark_piece_hash_failed(chunk_info.piece_index);
+                    state.new_pieces_notify.notify_waiters();
+                    return Err(e).with_context(|| format!("error checking piece={index}"));
+                }
+            };
+            match checked {
                 true => {
                     // The storage gets the piece before anyone else hears of it. This is
                     // where a storage that answers has_piece() makes the piece visible -
@@ -3415,6 +3440,238 @@ mod connection_tests {
             "a chunk was written into piece 0 after the storage was told it was complete: {ops:?}"
         );
         Ok(())
+    }
+
+    /// **A piece whose hash check cannot be read is not lost for good.**
+    ///
+    /// Between the last chunk landing and the hash coming back, a piece is
+    /// in none of the three states: not have, not queued -- reserving it
+    /// cleared the bit -- and not in flight, because completion pulls it
+    /// out so nothing can steal it mid-check. Every state that says "fetch
+    /// this" has been given up on the strength of a check that is about to
+    /// answer.
+    ///
+    /// If the read behind that check fails, the answer never comes, the
+    /// error goes up and the piece stays there. Nothing outside can heal
+    /// it: its chunks are all marked, so `mark_chunk_downloaded`
+    /// short-circuits on anything re-delivered and never reports it
+    /// complete a second time, and the priority loop skips a piece that is
+    /// fully downloaded precisely so nothing writes into one mid-check. One
+    /// failed read, and that piece is never downloaded again for the life
+    /// of the torrent -- and if a stream is parked on it, never played.
+    ///
+    /// Here the storage answers every read with an error from the moment
+    /// the peer starts delivering. The piece must come back fetchable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_piece_whose_hash_check_cannot_be_read_is_not_stranded() -> anyhow::Result<()> {
+        setup_test_logging();
+        const CHUNKS_PER_PIECE: u32 = 4;
+        const PIECE_LEN: u32 = CHUNK_SIZE * CHUNKS_PER_PIECE;
+        const FILE_SIZE: usize = (PIECE_LEN * 2) as usize;
+
+        let files = create_default_random_dir_with_torrents(1, FILE_SIZE, Some("rqbit_badread"));
+        let content = std::fs::read(files.path().join("0.data"))?;
+        let torrent = create_torrent(
+            files.path(),
+            CreateTorrentOptions {
+                piece_length: Some(PIECE_LEN),
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await?;
+
+        let fail_reads = Arc::new(AtomicBool::new(false));
+        let out = TempDir::with_prefix("rqbit_badread_client")?;
+        let session = Session::new_with_opts(
+            out.path().into(),
+            crate::SessionOptions {
+                dht: None,
+                persistence: None,
+                peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.as_bytes()?.to_vec()),
+                Some(crate::AddTorrentOptions {
+                    overwrite: true,
+                    output_folder: Some(out.path().to_str().unwrap().to_owned()),
+                    storage_factory: Some(
+                        UnreadableStorageFactory {
+                            fail_reads: fail_reads.clone(),
+                            inner: FilesystemStorageFactory::default(),
+                        }
+                        .boxed(),
+                    ),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        tokio::time::timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+        let live = handle.live().context("expected a live torrent")?;
+        let target = live.lengths.validate_piece_index(0).context("piece 0")?;
+
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1));
+        live.peers
+            .add_if_not_seen(addr)
+            .context("a fresh address")?;
+        let (_rx, _tx) = live
+            .peers
+            .mark_peer_connecting(addr, CancellationToken::new())?;
+        live.peers.with_peer_mut(addr, "test", |p| {
+            p.connecting_to_live(Id20::new([0u8; 20]), &live.peers, ConnectionKind::Tcp);
+        });
+        live.peers.with_live_mut(addr, "test", |l| {
+            l.bitfield = BF::from_boxed_slice(vec![0xff].into_boxed_slice());
+        });
+
+        // The stream is parked on piece 0, so the peer is handed it.
+        let reserve = || -> anyhow::Result<Option<Range<u32>>> {
+            let mut g = live.lock_write("test");
+            let TorrentStateLocked {
+                pieces,
+                file_priorities,
+                ..
+            } = &mut **g;
+            let pieces = pieces.as_mut().context("no chunk tracker")?;
+            Ok(
+                match pieces.acquire_piece(crate::piece_tracker::AcquireRequest {
+                    peer: addr,
+                    connection: 0,
+                    peer_avg_time: None,
+                    priority_pieces: std::iter::once(target),
+                    file_priorities,
+                    file_infos: &live.metadata.file_infos,
+                    peer_has_piece: |_| true,
+                    can_steal: |_| true,
+                }) {
+                    crate::piece_tracker::AcquireResult::Reserved { piece, chunks }
+                        if piece == target =>
+                    {
+                        Some(chunks)
+                    }
+                    _ => None,
+                },
+            )
+        };
+        assert_eq!(reserve()?, Some(0..CHUNKS_PER_PIECE));
+
+        // Every read fails from here on, so the hash check cannot run.
+        fail_reads.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let (tx, _rx) = unbounded_channel();
+        let handler = PeerHandler::for_test(live.clone(), addr, tx);
+        let chunks: Vec<ChunkInfo> = live.lengths.iter_chunk_infos(target).collect();
+        let mut last = Ok(());
+        for chunk in &chunks {
+            live.peers.with_live_mut(addr, "test", |l| {
+                l.add_inflight_request(*chunk);
+            });
+            let start = chunk.offset as usize;
+            let data = content[start..start + chunk.size as usize].to_vec();
+            last = handler
+                .on_received_piece(Piece::from_data(target.get(), chunk.offset, &data))
+                .await;
+        }
+        let err = last
+            .err()
+            .context("the unreadable check must be an error")?;
+        assert!(
+            format!("{err:#}").contains("error checking piece=0"),
+            "unexpected error: {err:#}"
+        );
+
+        // Not have, so something has to be able to fetch it again -- and
+        // the only thing that can is a reservation.
+        assert!(!handle.stats().finished, "the piece cannot have passed");
+        assert_eq!(
+            reserve()?,
+            Some(0..CHUNKS_PER_PIECE),
+            "the piece is in no set at all: not have, not queued, not in flight, and its \
+             chunks are all marked so nothing re-delivered would ever complete it"
+        );
+        Ok(())
+    }
+
+    /// Filesystem storage whose reads can be turned into errors, for the
+    /// hash check that cannot run.
+    #[derive(Clone)]
+    struct UnreadableStorageFactory {
+        fail_reads: Arc<AtomicBool>,
+        inner: FilesystemStorageFactory,
+    }
+
+    impl StorageFactory for UnreadableStorageFactory {
+        type Storage = UnreadableStorage;
+
+        fn create(
+            &self,
+            shared: &ManagedTorrentShared,
+            metadata: &TorrentMetadata,
+        ) -> anyhow::Result<UnreadableStorage> {
+            Ok(UnreadableStorage {
+                inner: Box::new(self.inner.create(shared, metadata)?),
+                fail_reads: self.fail_reads.clone(),
+            })
+        }
+
+        fn is_type_id(&self, type_id: std::any::TypeId) -> bool {
+            self.inner.is_type_id(type_id)
+        }
+
+        fn clone_box(&self) -> crate::storage::BoxStorageFactory {
+            self.clone().boxed()
+        }
+    }
+
+    struct UnreadableStorage {
+        inner: Box<dyn TorrentStorage>,
+        fail_reads: Arc<AtomicBool>,
+    }
+
+    impl TorrentStorage for UnreadableStorage {
+        fn init(
+            &mut self,
+            shared: &ManagedTorrentShared,
+            metadata: &TorrentMetadata,
+        ) -> anyhow::Result<()> {
+            self.inner.init(shared, metadata)
+        }
+
+        fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+            if self.fail_reads.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("the disk is not answering");
+            }
+            self.inner.pread_exact(file_id, offset, buf)
+        }
+
+        fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+            self.inner.pwrite_all(file_id, offset, buf)
+        }
+
+        fn remove_file(&self, file_id: usize, filename: &std::path::Path) -> anyhow::Result<()> {
+            self.inner.remove_file(file_id, filename)
+        }
+
+        fn remove_directory_if_empty(&self, path: &std::path::Path) -> anyhow::Result<()> {
+            self.inner.remove_directory_if_empty(path)
+        }
+
+        fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
+            self.inner.ensure_file_length(file_id, length)
+        }
+
+        fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+            Ok(Box::new(UnreadableStorage {
+                inner: self.inner.take()?,
+                fail_reads: self.fail_reads.clone(),
+            }))
+        }
     }
 
     #[derive(Debug, PartialEq, Eq, Clone, Copy)]

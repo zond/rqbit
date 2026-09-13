@@ -62,7 +62,9 @@ pub struct Participant {
     pub connection: u64,
     /// Chunk indices *within the piece* this participant is fetching.
     pub chunks: Range<u32>,
-    /// When this participant took the claim, which orders who is lagging.
+    /// When this participant took the claim. The tie-break in
+    /// [`InflightPiece::lagging_claim`], which ranks on how much of a claim
+    /// is still missing first.
     started: Instant,
 }
 
@@ -83,6 +85,13 @@ pub struct Participant {
 pub struct InflightPiece {
     /// Every peer fetching part of this piece. Never empty: the piece
     /// leaves the map when the last participant goes.
+    ///
+    /// A peer can hold more than one entry -- the request loop comes back
+    /// for another claim as soon as it has sent the requests for the last,
+    /// not when they have arrived. What it must not hold is an entry for a
+    /// claim that is entirely on disk; [`Self::claim`] retires those, and
+    /// [`Self::lagging_claim`] and [`Self::release`] ignore any it has not
+    /// got to yet.
     participants: Vec<Participant>,
     /// Claims nobody has taken yet, in ascending order.
     unclaimed: VecDeque<Range<u32>>,
@@ -130,11 +139,39 @@ impl InflightPiece {
 
     /// Hand this peer the next unclaimed share; failing that, a second copy
     /// of whichever claim is lagging. `None` when the piece is entirely
-    /// spoken for and every claim already has its duplicate.
-    fn claim(&mut self, peer: PeerHandle, connection: u64) -> Option<Range<u32>> {
+    /// spoken for and every claim still missing chunks already has its
+    /// duplicate.
+    ///
+    /// `missing` answers how many chunks of a claim have not arrived --
+    /// [`ChunkTracker::chunks_missing`], which is the only place that knows.
+    /// Nothing in here records chunk arrival, and nothing should: two peers
+    /// filling different chunks of one piece is safe precisely because
+    /// arrival is recorded once, globally, and not per peer.
+    fn claim(
+        &mut self,
+        peer: PeerHandle,
+        connection: u64,
+        missing: impl Fn(&Range<u32>) -> u32,
+    ) -> Option<Range<u32>> {
+        // This connection's finished shares are over. It is back here
+        // because it has sent every request of them and they have all
+        // landed, so it holds nothing of them on the wire and owes the
+        // piece nothing more for them. Left in, they are what
+        // `lagging_claim` ranks and `release` puts back -- a peer four
+        // claims into a piece carried four entries, of which three were
+        // bytes long since on disk.
+        //
+        // Only this connection's, and only here. A holder that lost a
+        // duplicate race is also sitting on a finished claim, and it is
+        // still on the piece in every way that matters: its requests are
+        // outstanding, and `overtaken_by` has to find it when the piece
+        // completes so they can be cancelled. It retires when it comes back
+        // here itself, or when the piece ends.
+        self.participants
+            .retain(|p| !(p.peer == peer && p.connection == connection && missing(&p.chunks) == 0));
         let chunks = match self.unclaimed.pop_front() {
             Some(chunks) => chunks,
-            None => self.lagging_claim(peer)?,
+            None => self.lagging_claim(peer, missing)?,
         };
         self.participants.push(Participant {
             peer,
@@ -145,18 +182,51 @@ impl InflightPiece {
         Some(chunks)
     }
 
-    /// The claim most worth a second peer: the one outstanding longest that
-    /// is not already at [`MAX_HOLDERS_PER_CLAIM`]. `None` when every claim
-    /// is full, or this peer holds the only ones that are not.
+    /// The claim most worth a second peer: of those that still have chunks
+    /// missing and are not already at [`MAX_HOLDERS_PER_CLAIM`], the one
+    /// with the most left to fetch. `None` when there is no such claim, or
+    /// this peer holds the only ones there are.
     ///
-    /// It chooses without asking any peer how fast it is. A claim that has
-    /// been outstanding longer than its siblings is the one lagging,
-    /// whatever a peer's average says about it, and the cap is what spreads
-    /// the copies: a claim that already has its second peer is skipped, so
-    /// free peers cover the others before any of this matters.
-    fn lagging_claim(&self, peer: PeerHandle) -> Option<Range<u32>> {
-        let mut best: Option<(Instant, Range<u32>)> = None;
+    /// **Only a claim with chunks missing.** A claim whose every chunk is
+    /// on disk is finished, and a second copy of it is bytes fetched for
+    /// nothing -- which is what this did to every free peer, because it
+    /// ranked on `started` over a participant list nothing ever retired
+    /// from, so "outstanding longest" reliably named a claim that had
+    /// landed minutes ago.
+    ///
+    /// **Ranked on what is left, not on when it started.** What gates the
+    /// piece is the work remaining on its slowest claim: a claim missing
+    /// sixteen chunks is a quarter of a megabyte from done and one missing
+    /// two is thirty-two kilobytes, whichever was handed out first. Age
+    /// barely separates them anyway -- a split piece hands its claims out
+    /// within a few milliseconds of each other, to peers all woken by the
+    /// same event -- so `started` ranking was close to a coin toss between
+    /// siblings, and it lost the toss exactly when one of them had nearly
+    /// arrived. It stays as the tie-break, which is what decides the case
+    /// the field starts from: nothing delivered yet, every claim missing
+    /// all of itself, and the oldest wins as it did before.
+    ///
+    /// A claim with nothing delivered *is* offered, and ranks top. It is
+    /// indistinguishable from a peer that has stalled -- that is the whole
+    /// difficulty -- and telling them apart means waiting, which is the
+    /// twenty seconds this all exists to avoid. It is still bounded: one
+    /// duplicate per claim, and only peers with nothing left to take here.
+    ///
+    /// Still nobody is asked how fast they are, and there is no threshold
+    /// to tune. Holder count is not consulted either: with a cap of two
+    /// every claim that is not full has exactly one holder, so it could
+    /// never break a tie.
+    fn lagging_claim(
+        &self,
+        peer: PeerHandle,
+        missing: impl Fn(&Range<u32>) -> u32,
+    ) -> Option<Range<u32>> {
+        let mut best: Option<(u32, Instant, Range<u32>)> = None;
         for candidate in &self.participants {
+            let left = missing(&candidate.chunks);
+            if left == 0 {
+                continue;
+            }
             let (count, mine) = self
                 .participants
                 .iter()
@@ -167,14 +237,17 @@ impl InflightPiece {
             if count >= MAX_HOLDERS_PER_CLAIM || mine {
                 continue;
             }
-            if best
-                .as_ref()
-                .is_none_or(|(best_started, _)| candidate.started < *best_started)
-            {
-                best = Some((candidate.started, candidate.chunks.clone()));
+            let better = match best.as_ref() {
+                None => true,
+                Some((best_left, best_started, _)) => {
+                    left > *best_left || (left == *best_left && candidate.started < *best_started)
+                }
+            };
+            if better {
+                best = Some((left, candidate.started, candidate.chunks.clone()));
             }
         }
-        best.map(|(_, chunks)| chunks)
+        best.map(|(_, _, chunks)| chunks)
     }
 
     /// Whether this peer already has a share.
@@ -185,11 +258,22 @@ impl InflightPiece {
     /// Take one connection's shares back, returning their chunks to the
     /// unclaimed pool. True when it held any.
     ///
-    /// The chunks go back whole, including any the connection had already
+    /// A share goes back whole, including chunks the connection had already
     /// delivered: `chunk_status` knows which those are and re-fetching one
     /// costs a duplicate, where wiping the piece -- what a single-owner
     /// release does -- costs everything every *other* peer delivered.
-    fn release(&mut self, peer: PeerHandle, connection: u64) -> bool {
+    ///
+    /// A share it had delivered *entirely* does not go back at all. There
+    /// is nothing left in it to fetch, so the pool would be handing the
+    /// next peer a quarter of a megabyte that is already on disk; and the
+    /// piece does not need it back to finish, because finishing is every
+    /// chunk marked, which those already are.
+    fn release(
+        &mut self,
+        peer: PeerHandle,
+        connection: u64,
+        missing: impl Fn(&Range<u32>) -> u32,
+    ) -> bool {
         let mut freed = Vec::new();
         self.participants.retain(|p| {
             if p.peer == peer && p.connection == connection {
@@ -215,7 +299,8 @@ impl InflightPiece {
         // requested ChunkInfo { piece_index: 5563, chunk_index: 0 }" and
         // its fifteen siblings: one whole claim, handed to one peer twice.
         for chunks in freed {
-            if self.participants.iter().any(|p| p.chunks == chunks)
+            if missing(&chunks) == 0
+                || self.participants.iter().any(|p| p.chunks == chunks)
                 || self.unclaimed.contains(&chunks)
             {
                 continue;
@@ -378,7 +463,10 @@ impl PieceTracker {
                 // rather than being sent away.
                 None => return self.reserve_piece(piece, req.peer, req.connection, true),
                 Some(inflight) => {
-                    if let Some(chunks) = inflight.claim(req.peer, req.connection) {
+                    let tracker = &self.chunks;
+                    if let Some(chunks) = inflight.claim(req.peer, req.connection, |claim| {
+                        tracker.chunks_missing(piece, claim)
+                    }) {
                         return AcquireResult::Reserved { piece, chunks };
                     }
                     if held_priority_piece.is_none() && !inflight.has_peer(req.peer) {
@@ -578,8 +666,11 @@ impl PieceTracker {
         // are still filling it would throw away their chunks too.
         let mut count = 0;
         let mut abandoned = Vec::new();
+        let chunks = &self.chunks;
         for (piece, info) in self.inflight.iter_mut() {
-            if info.release(peer, connection) {
+            if info.release(peer, connection, |claim| {
+                chunks.chunks_missing(*piece, claim)
+            }) {
                 count += 1;
                 if info.participants.is_empty() {
                     abandoned.push(*piece);
@@ -794,7 +885,16 @@ mod tests {
     const SPLIT_CHUNKS_PER_PIECE: u32 = 64;
 
     fn make_split_tracker(num_pieces: u32) -> (PieceTracker, FileInfos, FilePriorities) {
-        let piece_len = CHUNK_SIZE * SPLIT_CHUNKS_PER_PIECE;
+        make_split_tracker_of(num_pieces, SPLIT_CHUNKS_PER_PIECE)
+    }
+
+    /// The same with the piece size spelled out, for the tests that want a
+    /// piece of exactly two claims.
+    fn make_split_tracker_of(
+        num_pieces: u32,
+        chunks_per_piece: u32,
+    ) -> (PieceTracker, FileInfos, FilePriorities) {
+        let piece_len = CHUNK_SIZE * chunks_per_piece;
         let total = piece_len as u64 * num_pieces as u64;
         let file_infos: FileInfos = vec![crate::file_info::FileInfo {
             relative_filename: "test.dat".into(),
@@ -947,6 +1047,292 @@ mod tests {
             5,
             "five peers, four claims, one of them doubled"
         );
+    }
+
+    /// **A claim already entirely on disk is not handed to anybody.**
+    ///
+    /// This was the defect. A `Participant` was removed when its peer left
+    /// or when the piece ended, never when its claim arrived, so a peer
+    /// that had worked through four claims carried four entries and three
+    /// of them were finished. `lagging_claim` ranked on `started` over that
+    /// list, so "the claim outstanding longest" was, nearly always, one
+    /// whose every chunk had landed long ago -- and every free peer that
+    /// asked was sent to fetch a quarter of a megabyte we already had.
+    ///
+    /// Worse than the waste: it is what put several peers on one piece's
+    /// writes at the tail of every split piece, which is the precondition
+    /// for a chunk landing in a piece the storage has already finished.
+    ///
+    /// Two claims here, and by the time the fourth peer asks the only one
+    /// that is not full is the one that is done. There is nothing left for
+    /// it on this piece, and it must be told so rather than sent after
+    /// bytes on disk.
+    #[test]
+    fn a_claim_already_on_disk_is_not_offered_for_duplication() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker_of(4, CLAIM_CHUNKS * 2);
+        let waited_on = piece(&tracker, 0);
+
+        assert_eq!(
+            claimed(acquire_as(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                1,
+                Some(waited_on)
+            )),
+            0..16
+        );
+        assert_eq!(
+            claimed(acquire_as(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                2,
+                Some(waited_on)
+            )),
+            16..32
+        );
+        // Peer 1 delivers the whole of its claim.
+        deliver(&mut tracker, waited_on, 0..16);
+
+        // Peer 3 doubles up on the claim that still has chunks missing.
+        assert_eq!(
+            claimed(acquire_as(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                3,
+                Some(waited_on)
+            )),
+            16..32
+        );
+
+        // Peer 4 finds 16..32 at the cap and 0..16 finished. The piece has
+        // no work for it, so it goes and fetches the next one the stream
+        // needs.
+        match acquire_as(&mut tracker, &file_infos, &priorities, 4, Some(waited_on)) {
+            AcquireResult::Reserved { piece: got, chunks } => assert_ne!(
+                got, waited_on,
+                "a peer was sent to re-fetch a claim already on disk: {chunks:?}"
+            ),
+            AcquireResult::NoneAvailable => panic!("the other pieces are still free"),
+            other => panic!("expected a reservation elsewhere, got {other:?}"),
+        }
+    }
+
+    /// **The second peer goes to the claim with the most left to fetch, not
+    /// to the oldest.**
+    ///
+    /// What gates a split piece is the work remaining on its slowest claim.
+    /// A claim that is fourteen chunks in and two from done is thirty-two
+    /// kilobytes away; its sibling that has delivered nothing is a quarter
+    /// of a megabyte away. Ranking on `started` picks between them by which
+    /// was handed out first, which is a few milliseconds apart -- every
+    /// peer on a split piece is woken by the same event -- and so picks the
+    /// nearly-finished one about half the time.
+    #[test]
+    fn the_second_peer_goes_to_the_claim_with_the_most_left_to_fetch() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+        let waited_on = piece(&tracker, 0);
+        for who in 1..=4 {
+            acquire_as(&mut tracker, &file_infos, &priorities, who, Some(waited_on));
+        }
+
+        // Ages spelled out rather than slept for, and built by adding to
+        // one instant: `Instant::now() - d` can be None early in a process.
+        let t0 = Instant::now();
+        for (index, age) in [0u64, 1, 2, 3].into_iter().enumerate() {
+            tracker.inflight.get_mut(&waited_on).unwrap().participants[index].started =
+                t0 + Duration::from_secs(age);
+        }
+
+        // The oldest claim, peer 1's, is nearly in: fourteen of sixteen.
+        deliver(&mut tracker, waited_on, 0..14);
+
+        assert_eq!(
+            claimed(acquire_as(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                5,
+                Some(waited_on)
+            )),
+            16..32,
+            "the second copy went to the claim that is nearly done"
+        );
+    }
+
+    /// **A peer that finished a claim stops being one of its holders.**
+    ///
+    /// It has sent every request of that claim and every one has landed, so
+    /// it holds nothing of it on the wire and owes the piece nothing more
+    /// for it. Left in the list it is a ghost: something for
+    /// `lagging_claim` to rank, something for `release` to hand back,
+    /// something counted against `MAX_HOLDERS_PER_CLAIM`, and a second
+    /// cancellation sent to a peer that needs one.
+    #[test]
+    fn a_peer_that_finished_a_claim_stops_holding_it() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+        let waited_on = piece(&tracker, 0);
+
+        assert_eq!(
+            claimed(acquire_as(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                1,
+                Some(waited_on)
+            )),
+            0..16
+        );
+        deliver(&mut tracker, waited_on, 0..16);
+        assert_eq!(
+            claimed(acquire_as(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                1,
+                Some(waited_on)
+            )),
+            16..32,
+            "and it still comes back for the next claim"
+        );
+
+        assert_eq!(
+            tracker.participants(waited_on).len(),
+            1,
+            "one peer, one claim it is actually fetching"
+        );
+        assert_eq!(
+            tracker.overtaken_by(waited_on, peer(9)),
+            vec![peer(1)],
+            "and it is cancelled once, not once per claim it has been through"
+        );
+    }
+
+    /// **A claim its holder delivered whole does not go back to the pool
+    /// when that holder leaves.**
+    ///
+    /// `release` hands a departing connection's shares back so somebody
+    /// else can finish them. There is nothing to finish in a share whose
+    /// every chunk is already marked: the piece completes on those marks
+    /// whoever put them there, so handing the share out again buys the
+    /// piece nothing and costs the next peer the whole of it over the wire.
+    #[test]
+    fn a_claim_its_holder_delivered_whole_does_not_come_back() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+        let waited_on = piece(&tracker, 0);
+
+        assert_eq!(
+            claimed(acquire_as(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                1,
+                Some(waited_on)
+            )),
+            0..16
+        );
+        // A second peer, so the piece is not abandoned when the first goes.
+        assert_eq!(
+            claimed(acquire_as(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                2,
+                Some(waited_on)
+            )),
+            16..32
+        );
+        deliver(&mut tracker, waited_on, 0..16);
+
+        // Peer 1 is choked or dies, having delivered all of its share.
+        assert_eq!(tracker.release_pieces_owned_by(peer(1), 0), 1);
+
+        assert_eq!(
+            claimed(acquire_as(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                3,
+                Some(waited_on)
+            )),
+            32..48,
+            "the next peer was handed back a claim that was already on disk"
+        );
+    }
+
+    /// **A split piece worked down to its last claim is one peer's piece
+    /// again.**
+    ///
+    /// `try_steal` takes a piece off a slower peer only when one peer holds
+    /// it and nothing is unclaimed, and retiring finished claims is what
+    /// makes that true of a piece a single peer has carried: before, its
+    /// four spent entries made it look like four peers sharing, and it was
+    /// passed over. It is not sharing -- three of those claims are on disk
+    /// and one peer is sitting on the fourth.
+    ///
+    /// The thief is handed that claim and nothing else, so what the slow
+    /// peer already delivered still counts. This only ever fires for a
+    /// piece no stream is parked on: while one is, the priority loop offers
+    /// a second copy of that same claim first, which costs the incumbent
+    /// nothing.
+    #[test]
+    fn a_split_piece_down_to_its_last_claim_can_be_taken_off_a_slow_peer() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(1);
+        let waited_on = piece(&tracker, 0);
+
+        // One peer carries the piece claim by claim, delivering each but
+        // the last, which it is still fetching.
+        let mut start = 0;
+        while start < SPLIT_CHUNKS_PER_PIECE {
+            let got = claimed(acquire_as(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                1,
+                Some(waited_on),
+            ));
+            assert_eq!(got, start..start + CLAIM_CHUNKS);
+            start += CLAIM_CHUNKS;
+            if start < SPLIT_CHUNKS_PER_PIECE {
+                deliver(&mut tracker, waited_on, got);
+            }
+        }
+        assert_eq!(
+            tracker.participants(waited_on).len(),
+            1,
+            "one peer, on the one claim that is left"
+        );
+
+        // A second peer, with no stream parked on the piece and nothing
+        // else queued -- the only route to `try_steal`.
+        let result = tracker.acquire_piece(AcquireRequest {
+            peer: peer(2),
+            connection: 0,
+            peer_avg_time: Some(Duration::ZERO),
+            priority_pieces: std::iter::empty(),
+            file_priorities: &priorities,
+            file_infos: &file_infos,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+        });
+        match result {
+            AcquireResult::Stolen {
+                piece: got,
+                chunks,
+                from_peer,
+            } => {
+                assert_eq!(got, waited_on);
+                assert_eq!(from_peer, peer(1));
+                assert_eq!(
+                    chunks,
+                    SPLIT_CHUNKS_PER_PIECE - CLAIM_CHUNKS..SPLIT_CHUNKS_PER_PIECE,
+                    "the thief takes the unfinished claim, not the whole piece"
+                );
+            }
+            other => panic!("expected the last claim to be taken, got {other:?}"),
+        }
     }
 
     /// **The duplicates spread, and then they stop.**
@@ -1197,6 +1583,14 @@ mod tests {
             ),
             AcquireResult::NoneAvailable => panic!("the other pieces are still free"),
             other => panic!("expected a reservation elsewhere, got {other:?}"),
+        }
+    }
+
+    /// Mark every chunk of `claim` as arrived, as the write path does when
+    /// the bytes land.
+    fn deliver(tracker: &mut PieceTracker, piece: ValidPieceIndex, claim: Range<u32>) {
+        for chunk in claim {
+            tracker.mark_chunk_downloaded(&fake_piece(piece, chunk));
         }
     }
 

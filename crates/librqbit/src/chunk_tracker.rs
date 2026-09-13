@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::HashSet};
+use std::{borrow::Cow, collections::HashSet, ops::Range};
 
 use anyhow::Context;
 use buffers::ByteBuf;
@@ -647,6 +647,47 @@ impl ChunkTracker {
         self.chunk_status
             .get(self.lengths.chunk_range(id))
             .is_some_and(|chunks| chunks.all())
+    }
+
+    /// How many chunks of `claim` -- chunk indices *within* `piece`, as a
+    /// [`crate::piece_tracker::Participant`] records them -- have not
+    /// arrived yet.
+    ///
+    /// Zero means every byte of that claim is already on disk, which is
+    /// what tells the in-flight map a claim is finished with. The in-flight
+    /// map has no other way to know: chunk arrival is recorded here, in one
+    /// global bitfield, and deliberately not per peer -- that is what makes
+    /// two peers filling different chunks of one piece safe in the first
+    /// place.
+    ///
+    /// It only ever shrinks while a claim exists, so a finished claim stays
+    /// finished: the one thing that clears chunks is
+    /// [`Self::mark_piece_broken_if_not_have`], and every caller of it
+    /// either takes the piece out of the in-flight map first or is handed a
+    /// predicate that skips in-flight pieces. Not that the caller depends
+    /// on it -- if this ever did grow under a live claim, the claim would
+    /// read as unfinished, which is offered for duplication and handed back
+    /// on release, i.e. exactly what everything did before it could ask.
+    ///
+    /// Out of range answers zero, i.e. "nothing left to fetch": a claim we
+    /// cannot see is one nothing should be sent after.
+    pub(crate) fn chunks_missing(&self, piece: ValidPieceIndex, claim: &Range<u32>) -> u32 {
+        let piece_range = self.lengths.chunk_range(piece);
+        let start = piece_range.start + claim.start as usize;
+        let end = piece_range.start + claim.end as usize;
+        if end > piece_range.end {
+            return 0;
+        }
+        match self.chunk_status.get(start..end) {
+            Some(bits) => {
+                let arrived = u32::try_from(bits.count_ones()).unwrap_or(u32::MAX);
+                claim
+                    .end
+                    .saturating_sub(claim.start)
+                    .saturating_sub(arrived)
+            }
+            None => 0,
+        }
     }
 
     pub fn mark_piece_broken_if_not_have(&mut self, index: ValidPieceIndex) {
