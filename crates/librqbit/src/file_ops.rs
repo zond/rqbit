@@ -84,7 +84,6 @@ impl<'a> FileOps<'a> {
             index: usize,
             fi: &'a FileInfo,
             processed_bytes: u64,
-            is_broken: bool,
         }
         impl CurrentFile<'_> {
             fn remaining(&self) -> u64 {
@@ -102,7 +101,6 @@ impl<'a> FileOps<'a> {
                 index: idx,
                 fi,
                 processed_bytes: 0,
-                is_broken: false,
             });
 
         let mut current_file = file_iterator.next().context("empty input file list")?;
@@ -155,8 +153,9 @@ impl<'a> FileOps<'a> {
                 piece_remaining -= to_read_in_file;
                 current_file.mark_processed_bytes(to_read_in_file as u64);
 
-                if current_file.is_broken || !storage_has_piece {
-                    // no need to read.
+                if !storage_has_piece {
+                    // The storage says it does not hold this piece, so there is nothing
+                    // to read and nothing a read could tell us.
                     continue;
                 }
 
@@ -173,7 +172,14 @@ impl<'a> FileOps<'a> {
                         "error reading from file {} ({:?}) at {}: {:#}",
                         current_file.index, current_file.fi.relative_filename, pos, &err
                     );
-                    current_file.is_broken = true;
+                    // This piece only. A read error used to latch on the file and
+                    // skip every later piece of it without a read, which is right for a
+                    // file that is not there and catastrophic for one blip: a single
+                    // transient failure -- an antivirus holding a freshly written file
+                    // on Windows, a momentary I/O error -- silently wrote off a whole
+                    // film, with nothing above `debug!` to say so and nothing that ever
+                    // re-checks. The cost of dropping it is one failed read per piece of
+                    // a genuinely unreadable file, which is a syscall that fails fast.
                     some_files_broken = true;
                 }
             }
@@ -416,6 +422,10 @@ mod tests {
         // released piece are there until the caller deletes them; in a store with one
         // entry per piece they are gone, and a read of them is an error.
         readable_when_missing: bool,
+        // Pieces the storage says it holds and then fails to read: a transient error,
+        // not a hole. The storage is not lying and the bytes are not gone -- the read
+        // simply did not work this time.
+        unreadable: HashSet<u32>,
     }
 
     impl HoleyStorage {
@@ -424,7 +434,14 @@ mod tests {
                 bytes,
                 missing: missing.into_iter().collect(),
                 readable_when_missing: readable,
+                unreadable: HashSet::new(),
             }
+        }
+
+        // The same storage, with a piece that it holds and cannot read this time.
+        fn with_unreadable(mut self, pieces: impl IntoIterator<Item = u32>) -> Self {
+            self.unreadable = pieces.into_iter().collect();
+            self
         }
     }
 
@@ -441,6 +458,9 @@ mod tests {
             let piece: u32 = (offset / PIECE_LEN as u64).try_into()?;
             if self.missing.contains(&piece) && !self.readable_when_missing {
                 bail!("piece {piece} was released");
+            }
+            if self.unreadable.contains(&piece) {
+                bail!("piece {piece} could not be read this time");
             }
             let offset: usize = offset.try_into()?;
             buf.copy_from_slice(&self.bytes[offset..offset + buf.len()]);
@@ -594,6 +614,19 @@ mod tests {
         assert_eq!(
             initial_check(&metadata, &corrupt).unwrap(),
             vec![0, 1, 2, 4, 6, 7]
+        );
+
+        // **One read that fails is one piece, not the rest of the file.** The read
+        // error used to latch on the file and skip every later piece of it without a
+        // read at all, so a single transient failure -- an antivirus holding a freshly
+        // written file, a momentary I/O error -- wrote off a whole film silently, with
+        // nothing above `debug!` to say so and nothing that ever re-checks it. Here the
+        // storage holds every piece and fails to read exactly one.
+        let blip = HoleyStorage::new(bytes.clone(), [], false).with_unreadable([2]);
+        assert_eq!(
+            initial_check(&metadata, &blip).unwrap(),
+            vec![0, 1, 3, 4, 5, 6, 7],
+            "a read that failed once wrote off every piece after it"
         );
 
         // A storage that can't answer fails the check rather than have it guess: the
