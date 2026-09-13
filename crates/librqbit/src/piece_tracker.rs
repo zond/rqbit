@@ -202,13 +202,24 @@ impl InflightPiece {
         if freed.is_empty() {
             return false;
         }
-        // Unconditionally, including a claim another peer still holds a
-        // copy of: the pool then carries one entry per departed holder, so
-        // the claim comes back to exactly the number of peers it lost, and
-        // `MAX_HOLDERS_PER_CLAIM` still binds. Skipping those was a guard
-        // with no case behind it -- every end state reachable with it is
-        // reachable without it.
+        // Not a claim somebody still holds, and not one the pool already
+        // has. `MAX_HOLDERS_PER_CLAIM` does not make that safe, because it
+        // is only ever consulted by `lagging_claim`: `claim` pops the
+        // unclaimed pool without looking at how many peers hold what, so an
+        // entry in the pool is a hand-out whatever else is going on. A
+        // claim put back while its other holder is still fetching it
+        // therefore goes out again immediately -- to a third peer, over the
+        // cap, or, when the holder is the next to ask, straight back to the
+        // holder, which then finds every chunk of it already in flight with
+        // itself and sends nothing. That is the field log's "we already
+        // requested ChunkInfo { piece_index: 5563, chunk_index: 0 }" and
+        // its fifteen siblings: one whole claim, handed to one peer twice.
         for chunks in freed {
+            if self.participants.iter().any(|p| p.chunks == chunks)
+                || self.unclaimed.contains(&chunks)
+            {
+                continue;
+            }
             self.unclaimed.push_back(chunks);
         }
         self.unclaimed
@@ -1046,6 +1057,86 @@ mod tests {
             16..32,
             "and the share it abandoned is the next one handed out"
         );
+    }
+
+    /// **A claim goes back to the pool only when nobody is fetching it.**
+    ///
+    /// `MAX_HOLDERS_PER_CLAIM` is not what keeps a claim from being handed
+    /// out too often: `claim` pops the unclaimed pool without consulting
+    /// it, so anything in the pool goes out, cap or no cap. Put a claim
+    /// back while its other holder is still on it and the holder itself can
+    /// be the next peer to ask -- it is handed the very chunks it has in
+    /// flight, finds every one of them already requested, and sends
+    /// nothing. That is the field log's whole-claim "we already requested"
+    /// run on piece 5563.
+    #[test]
+    fn a_claim_its_other_holder_left_does_not_come_back_to_the_peer_fetching_it() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+        let waited_on = piece(&tracker, 0);
+        for who in 1..=4 {
+            acquire_as(&mut tracker, &file_infos, &priorities, who, Some(waited_on));
+        }
+        // Peer 5 doubles up on peer 1's claim, which is the oldest.
+        assert_eq!(
+            claimed(acquire_as(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                5,
+                Some(waited_on)
+            )),
+            0..16
+        );
+
+        // Peer 5 is choked or dies. Peer 1 is still fetching 0..16.
+        assert_eq!(tracker.release_pieces_owned_by(peer(5), 0), 1);
+
+        assert_ne!(
+            claimed(acquire_as(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                1,
+                Some(waited_on)
+            )),
+            0..16,
+            "peer 1 was handed back the claim it still has on the wire"
+        );
+    }
+
+    /// **And it comes back once, not once per holder that left.**
+    ///
+    /// Two holders leaving used to push two entries, on the reasoning that
+    /// the cap would bind on the way out. It does not -- see above -- so
+    /// the same sixteen chunks went to the same peer twice in a row.
+    #[test]
+    fn a_claim_both_its_holders_left_comes_back_once() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+        let waited_on = piece(&tracker, 0);
+        for who in 1..=4 {
+            acquire_as(&mut tracker, &file_infos, &priorities, who, Some(waited_on));
+        }
+        acquire_as(&mut tracker, &file_infos, &priorities, 5, Some(waited_on));
+
+        tracker.release_pieces_owned_by(peer(1), 0);
+        tracker.release_pieces_owned_by(peer(5), 0);
+
+        let first = claimed(acquire_as(
+            &mut tracker,
+            &file_infos,
+            &priorities,
+            6,
+            Some(waited_on),
+        ));
+        let second = claimed(acquire_as(
+            &mut tracker,
+            &file_infos,
+            &priorities,
+            6,
+            Some(waited_on),
+        ));
+        assert_eq!(first, 0..16, "the abandoned claim is the one handed out");
+        assert_ne!(second, first, "and it was handed out twice: {first:?}");
     }
 
     fn piece(tracker: &PieceTracker, id: u32) -> ValidPieceIndex {

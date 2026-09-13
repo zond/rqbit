@@ -108,7 +108,13 @@ This changes three of the invariants below:
   no share of it, not by not being *the* owner.
 - **A release is partial.** One connection leaving returns its claim to the
   unclaimed pool; the piece is only broken -- which wipes every chunk of it
-  -- when the last participant goes.
+  -- when the last participant goes. A claim another participant is still
+  fetching does **not** go back: anything in the unclaimed pool is handed
+  out on the next `claim()`, which pops the pool without consulting
+  `MAX_HOLDERS_PER_CLAIM` -- only `lagging_claim` does -- so a claim put
+  back under its holder's feet goes straight out again, over the cap, or
+  back to the holder itself, which then finds every chunk of it already in
+  flight with itself.
 - **A split piece is never stolen.** There is no single owner to take it
   from, and it already has the parallelism a steal would buy.
 
