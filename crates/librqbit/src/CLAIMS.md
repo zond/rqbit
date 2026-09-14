@@ -140,8 +140,25 @@ peer: it waits one chunk arrival, not a timer.
 
 ## Status
 
-Written before the latency rules were built. The tree at the time carried
-the grace-timer version with revert-proven tests; the rebuild deletes
-`proven`, `contested`, `idle` and `SPREAD_GRACE`, adds `last_latency` on
-the live peer and `last_delivery` on `Participant`, and rewrites the tests
-around deliveries and latencies. Update this section when it lands.
+Built 2026-09-14, the same evening it was agreed. `piece_tracker.rs` carries
+the rules; `torrent_state/live/peer/mod.rs` prices a peer on each arrival
+(`inflight_requests` is a map from chunk to `sent_at`); the write path in
+`torrent_state/live/mod.rs` stamps `note_delivery`; `acquire_next_piece`
+hands `last_latency` in. `proven`, `contested`, `idle` and `SPREAD_GRACE`
+are gone.
+
+Every rule has a test that fails without it, checked by mutation, not by
+reading: `outpaces` itself, the wait running from the holder's last
+delivery rather than its start, the `missing_at_start` skip, the own-claim
+skip, the cut gate on `split_whole`, the delivered-since-last-handout gate
+on an over-share, the stamp being written, the latency being computed, and
+the latency being handed in (`a_delivered_chunk_prices_the_peer_and_stamps_its_hold`
+covers the last three end to end, with a stream, two peers and a real
+`on_received_piece`).
+
+Untested in the field as of this writing. What to look for in the next
+log: `unverified` (fetched minus verified) well under the 35% blind
+doubling cost and the 3-4% the grace version measured; the head piece of a
+blocked read being fetched by several peers rather than one; and no
+healthy holder being cut (a cut shows as two holders on a piece whose
+first holder is still delivering).

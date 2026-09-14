@@ -2032,6 +2032,17 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     }
 }
 
+/// What a request loop was handed by `acquire_next_piece`.
+#[derive(Debug, PartialEq, Eq)]
+enum Next {
+    /// A share of a piece to send requests for.
+    Share(ValidPieceIndex, Range<u32>),
+    /// Nothing now, but a piece this peer is over its share of still has
+    /// shares other peers may be coming for: ask again once a chunk of this
+    /// peer's own has landed (`piece_tracker::CLAIMS_PER_PEER`).
+    Crowded,
+}
+
 impl PeerHandler {
     /// A handler for a connection to `addr` that no socket is behind, unchoked. Tests only.
     #[cfg(test)]
@@ -2234,7 +2245,7 @@ impl PeerHandler {
     /// chunks this peer claimed. A piece a stream waits on is split, so the
     /// claim is part of it and the same piece is handed to other peers at
     /// the same time; anything else is claimed whole.
-    fn acquire_next_piece(&self) -> crate::Result<Option<(ValidPieceIndex, Range<u32>)>> {
+    fn acquire_next_piece(&self) -> crate::Result<Option<Next>> {
         if self.is_choked() {
             debug!("we are choked, can't acquire piece");
             return Ok(None);
@@ -2261,6 +2272,8 @@ impl PeerHandler {
                     peer: self.addr,
                     connection: self.connection,
                     peer_avg_time: self.counters.average_piece_download_time(),
+                    last_delivery: live.last_delivery(),
+                    last_latency: live.last_latency(),
                     // The one reading of the clock on this path; see
                     // `AcquireRequest::now`.
                     now: std::time::Instant::now(),
@@ -2278,7 +2291,7 @@ impl PeerHandler {
                 match result {
                     AcquireResult::Reserved { piece, chunks } => {
                         trace!("reserved piece {} chunks {:?}", piece, chunks);
-                        Ok(Some((piece, chunks)))
+                        Ok(Some(Next::Share(piece, chunks)))
                     }
                     AcquireResult::Stolen {
                         piece,
@@ -2288,9 +2301,10 @@ impl PeerHandler {
                         debug!("stole piece {} from {}", piece, from_peer);
                         // Store steal info to process after releasing peer lock to avoid deadlock
                         steal_info = Some((from_peer, piece));
-                        Ok(Some((piece, chunks)))
+                        Ok(Some(Next::Share(piece, chunks)))
                     }
                     AcquireResult::NoneAvailable => Ok(None),
+                    AcquireResult::Crowded => Ok(Some(Next::Crowded)),
                 }
             })
             .transpose()
@@ -2498,8 +2512,28 @@ impl PeerHandler {
 
             // Acquire a piece using the strategy: try steal (10x) → reserve → steal (3x).
             let new_piece_notify = self.state.new_pieces_notify.notified();
+            // Armed before the ask, so a chunk landing between the ask and
+            // the wait is not a wake-up missed.
+            let slots = self.request_slots_changed();
+            let slot_freed = slots.as_ref().map(|notify| notify.notified());
             let (next, claimed) = match self.acquire_next_piece()? {
-                Some(next) => next,
+                Some(Next::Share(next, claimed)) => (next, claimed),
+                Some(Next::Crowded) => {
+                    // Turned away from shares other peers may be coming for,
+                    // with nothing else to do. What would make a share this
+                    // peer's is a chunk of its own landing
+                    // (`piece_tracker::CLAIMS_PER_PEER`), and a landing frees
+                    // a request slot -- so that is what is waited for, with
+                    // the long timeout as the backstop.
+                    match slot_freed {
+                        Some(freed) => {
+                            let _ =
+                                aframe!(tokio::time::timeout(Duration::from_secs(5), freed)).await;
+                        }
+                        None => return Ok(()),
+                    }
+                    continue;
+                }
                 None => {
                     debug!("no pieces to request");
                     match aframe!(tokio::time::timeout(
@@ -2829,6 +2863,13 @@ impl PeerHandler {
             let mut overtaken: Vec<SocketAddr> = Vec::new();
             let full_piece_download_time = {
                 let mut g = state.lock_write("mark_chunk_downloaded");
+                // The holder's half of the takeover comparison: this peer
+                // delivered a chunk of this piece now (`CLAIMS.md`).
+                g.get_pieces_mut()?.note_delivery(
+                    chunk_info.piece_index,
+                    addr,
+                    std::time::Instant::now(),
+                );
                 let chunk_marking_result = g.get_pieces_mut()?.mark_chunk_downloaded(piece);
                 trace!(?piece, chunk_marking_result=?chunk_marking_result);
 
@@ -3173,7 +3214,7 @@ mod connection_tests {
     use tokio::sync::mpsc::unbounded_channel;
     use tokio_util::sync::CancellationToken;
 
-    use super::{BF, PeerHandler, TorrentStateLocked, WriterRequest};
+    use super::{BF, Next, PeerHandler, TorrentStateLocked, WriterRequest};
     use crate::{
         AddTorrent, CreateTorrentOptions, ManagedTorrentShared, Session, TorrentMetadata,
         create_torrent,
@@ -3246,18 +3287,211 @@ mod connection_tests {
         let old = PeerHandler::for_test(live.clone(), addr, old_tx);
         let new = PeerHandler::for_test(live.clone(), addr, new_tx);
 
-        let old_piece = old
-            .acquire_next_piece()?
-            .context("the old one gets a piece")?;
-        let new_piece = new.acquire_next_piece()?.context("so does the new one")?;
+        let piece_of = |next: Next| match next {
+            Next::Share(piece, _) => piece,
+            Next::Crowded => panic!("a fresh piece is nobody's to be over a share of"),
+        };
+        let old_piece = piece_of(
+            old.acquire_next_piece()?
+                .context("the old one gets a piece")?,
+        );
+        let new_piece = piece_of(new.acquire_next_piece()?.context("so does the new one")?);
         assert_ne!(old_piece, new_piece);
 
         old.on_peer_died(None)?;
         assert_eq!(
             live.inflight_piece_owners(),
-            vec![(new_piece.0.get(), addr)],
+            vec![(new_piece.get(), addr)],
             "the old connection's death took the new one's piece with it, or kept its own"
         );
+        Ok(())
+    }
+
+    /// **A delivered chunk prices the peer and stamps the piece it landed
+    /// in.**
+    ///
+    /// The wiring of the one comparison in `CLAIMS.md`. The tracker's
+    /// rules are proven on their own; this is the two places the numbers
+    /// they compare come from. A chunk arriving at `on_received_piece`
+    /// gives its peer a `last_latency` -- the time since the request went
+    /// out -- and stamps the peer's hold on that piece with the moment. And
+    /// `acquire_next_piece` hands the latency in, so a peer that has been
+    /// priced can cut a whole head piece off a holder that has gone silent
+    /// for longer than that.
+    ///
+    /// Peer A takes the head piece whole from the ordinary queue, as the
+    /// swarm does for every piece ahead of a stream's window, and delivers
+    /// one chunk. Peer B delivers a chunk of another piece in about twenty
+    /// milliseconds, then asks half a second later, by which time A has
+    /// been silent for longer than B's latency: B is handed a share of A's
+    /// piece.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delivered_chunk_prices_the_peer_and_stamps_its_hold() -> anyhow::Result<()> {
+        setup_test_logging();
+        const CHUNKS_PER_PIECE: u32 = 32;
+        const PIECE_LEN: u32 = CHUNK_SIZE * CHUNKS_PER_PIECE;
+
+        let files =
+            create_default_random_dir_with_torrents(1, PIECE_LEN as usize * 4, Some("priced_peer"));
+        let torrent = create_torrent(
+            files.path(),
+            CreateTorrentOptions {
+                piece_length: Some(PIECE_LEN),
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await?;
+        let dir = TempDir::with_prefix("priced_peer_client")?;
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            crate::SessionOptions {
+                dht: None,
+                persistence: None,
+                peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.as_bytes()?.to_vec()),
+                Some(crate::AddTorrentOptions {
+                    overwrite: true,
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        tokio::time::timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+        let live = handle.live().context("expected a live torrent")?;
+        let head = live.lengths.validate_piece_index(0).context("piece 0")?;
+        let elsewhere = live.lengths.validate_piece_index(3).context("piece 3")?;
+        // A stream parked at the start of the file: piece 0 is the head of
+        // its lookahead.
+        let _stream = handle.clone().stream(0).await?;
+
+        let mut handlers = Vec::new();
+        let mut peer_rxs = Vec::new();
+        for port in [1u16, 2] {
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+            live.peers
+                .add_if_not_seen(addr)
+                .context("a fresh address")?;
+            let (rx, tx) = live
+                .peers
+                .mark_peer_connecting(addr, CancellationToken::new())?;
+            live.peers.with_peer_mut(addr, "test", |p| {
+                p.connecting_to_live(Id20::new([0u8; 20]), &live.peers, ConnectionKind::Tcp);
+            });
+            live.peers.with_live_mut(addr, "test", |l| {
+                l.bitfield = BF::from_boxed_slice(vec![0xff].into_boxed_slice());
+            });
+            handlers.push(PeerHandler::for_test(live.clone(), addr, tx));
+            peer_rxs.push(rx);
+        }
+        let (a, b) = (&handlers[0], &handlers[1]);
+        let chunk_of = |piece: ValidPieceIndex, index: u32| -> ChunkInfo {
+            live.lengths
+                .chunk_info_from_received_data(piece, index * CHUNK_SIZE, CHUNK_SIZE)
+                .expect("a chunk of the piece")
+        };
+        // What a peer's chunk arriving does: it was asked for `waited`
+        // ago, and now it is here.
+        let deliver = async |handler: &PeerHandler, chunk: ChunkInfo, waited: Duration| {
+            live.peers.with_live_mut(handler.addr, "test", |l| {
+                l.add_inflight_request(chunk);
+            });
+            tokio::time::sleep(waited).await;
+            handler
+                .on_received_piece(Piece::from_data(
+                    chunk.piece_index.get(),
+                    chunk.offset,
+                    &vec![0u8; CHUNK_SIZE as usize],
+                ))
+                .await
+        };
+
+        // A takes the head piece whole off the ordinary queue -- nothing
+        // in its window, as for a peer that arrived before the stream did.
+        {
+            let mut g = live.lock_write("test");
+            let TorrentStateLocked {
+                pieces,
+                file_priorities,
+                ..
+            } = &mut **g;
+            let pieces = pieces.as_mut().context("no chunk tracker")?;
+            match pieces.acquire_piece(crate::piece_tracker::AcquireRequest {
+                peer: a.addr,
+                connection: a.connection,
+                now: std::time::Instant::now(),
+                peer_avg_time: None,
+                last_delivery: None,
+                last_latency: None,
+                priority_pieces: std::iter::empty(),
+                file_priorities,
+                file_infos: &live.metadata.file_infos,
+                peer_has_piece: |_| true,
+                can_steal: |_| true,
+            }) {
+                crate::piece_tracker::AcquireResult::Reserved { piece, chunks } => {
+                    anyhow::ensure!(piece == head, "A got piece {piece} instead");
+                    anyhow::ensure!(chunks == (0..CHUNKS_PER_PIECE), "A got {chunks:?}");
+                }
+                other => anyhow::bail!("expected a reservation, got {other:?}"),
+            }
+        }
+
+        // A delivers one chunk of it, and its hold is stamped.
+        deliver(a, chunk_of(head, 0), Duration::ZERO).await?;
+        let stamped = live
+            .lock_read("test")
+            .get_pieces()?
+            .participants(head)
+            .iter()
+            .find(|p| p.peer == a.addr)
+            .context("A still holds the head piece")?
+            .last_delivery();
+        assert!(
+            stamped.is_some(),
+            "a chunk of the piece landed from A and A's hold on it was not stamped"
+        );
+
+        // B delivers a chunk of another piece, twenty milliseconds after
+        // asking, and is priced by it.
+        let asked = Duration::from_millis(20);
+        deliver(b, chunk_of(elsewhere, 0), asked).await?;
+        let latency = live
+            .peers
+            .with_live(b.addr, |l| l.last_latency())
+            .flatten()
+            .context("B has delivered a chunk and has no latency for it")?;
+        assert!(
+            latency >= asked,
+            "B's chunk took at least {asked:?} and was priced at {latency:?}"
+        );
+
+        // Half a second on, A has been silent for longer than B's chunk
+        // took. B's request loop asks, and is cut into A's piece.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        match b.acquire_next_piece()? {
+            Some(Next::Share(piece, chunks)) => {
+                assert_eq!(
+                    piece, head,
+                    "B was sent past the head piece A has stalled on"
+                );
+                assert_eq!(
+                    chunks,
+                    16..32,
+                    "A keeps the claim it is delivering into; B gets the next"
+                );
+            }
+            other => panic!("expected a share of the head piece, got {other:?}"),
+        }
+        drop(peer_rxs);
         Ok(())
     }
 
@@ -3495,6 +3729,8 @@ mod connection_tests {
                 connection: 0,
                 now: std::time::Instant::now(),
                 peer_avg_time: None,
+                last_delivery: None,
+                last_latency: None,
                 priority_pieces: std::iter::once(target),
                 file_priorities,
                 file_infos: &live.metadata.file_infos,
@@ -3687,6 +3923,8 @@ mod connection_tests {
                     connection: 0,
                     now: std::time::Instant::now(),
                     peer_avg_time: None,
+                    last_delivery: None,
+                    last_latency: None,
                     priority_pieces: std::iter::once(target),
                     file_priorities,
                     file_infos: &live.metadata.file_infos,

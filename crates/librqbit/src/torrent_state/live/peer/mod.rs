@@ -1,6 +1,6 @@
 pub mod stats;
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, atomic::Ordering};
 
@@ -299,7 +299,19 @@ pub(crate) struct LivePeerState {
     pub seeder: bool,
 
     // When the peer sends us data this is used to track if we asked for it.
-    inflight_requests: HashSet<InflightRequest>,
+    // Each request remembers when it was sent, so that its arrival can be
+    // priced (`last_latency`).
+    inflight_requests: HashMap<InflightRequest, std::time::Instant>,
+
+    /// When a chunk this peer was asked for last arrived. What the piece
+    /// tracker reads to tell a peer that is draining its window from one
+    /// that has merely come round its loop again (`AcquireRequest::last_delivery`).
+    last_delivery: Option<std::time::Instant>,
+    /// How long the most recently arrived chunk took, from the request
+    /// going out to the bytes landing. The peer's side of the one
+    /// comparison the piece tracker makes before letting it take over
+    /// another peer's work (`AcquireRequest::last_latency`, `CLAIMS.md`).
+    last_latency: Option<std::time::Duration>,
 
     // Bounded tolerance for chunks that arrive after we cancel requests.
     // This is intentionally approximate: we track a count instead of storing every
@@ -328,6 +340,8 @@ impl LivePeerState {
             bitfield: BF::default(),
             seeder: false,
             inflight_requests: Default::default(),
+            last_delivery: None,
+            last_latency: None,
             late_cancelled_request_tolerance: 0,
             request_slots_changed: Default::default(),
             tx,
@@ -343,16 +357,27 @@ impl LivePeerState {
         self.request_slots_changed.clone()
     }
 
+    /// When a chunk this peer was asked for last arrived, or `None` before
+    /// the first.
+    pub fn last_delivery(&self) -> Option<std::time::Instant> {
+        self.last_delivery
+    }
+
     pub fn requested_inflight_count(&self) -> usize {
         self.inflight_requests.len()
     }
 
     pub fn add_inflight_request(&mut self, chunk: ChunkInfo) -> bool {
-        self.inflight_requests.insert(chunk)
+        self.inflight_requests
+            .insert(chunk, std::time::Instant::now())
+            .is_none()
     }
 
     pub fn remove_inflight_request(&mut self, chunk: &ChunkInfo) -> RemoveInflightRequestResult {
-        if self.inflight_requests.remove(chunk) {
+        if let Some(sent_at) = self.inflight_requests.remove(chunk) {
+            let now = std::time::Instant::now();
+            self.last_delivery = Some(now);
+            self.last_latency = Some(now.saturating_duration_since(sent_at));
             self.request_slots_changed.notify_waiters();
             return RemoveInflightRequestResult::Expected;
         }
@@ -372,7 +397,7 @@ impl LivePeerState {
     /// the request is already gone: a choke's handback may have forgotten it first, and
     /// that is not a chunk arriving.
     pub fn withdraw_unsent_request(&mut self, chunk: &ChunkInfo) {
-        if self.inflight_requests.remove(chunk) {
+        if self.inflight_requests.remove(chunk).is_some() {
             self.request_slots_changed.notify_waiters();
         }
     }
@@ -381,7 +406,7 @@ impl LivePeerState {
         let tx = &self.tx;
         let late_cancelled_request_tolerance = &mut self.late_cancelled_request_tolerance;
         let before = self.inflight_requests.len();
-        self.inflight_requests.retain(|req| {
+        self.inflight_requests.retain(|req, _| {
             if req.piece_index == piece {
                 let _ = tx.send(WriterRequest::Message(Message::Cancel(Request {
                     index: piece.get(),
@@ -417,11 +442,17 @@ impl LivePeerState {
     }
 
     pub fn inflight_requests(&self) -> impl Iterator<Item = &InflightRequest> {
-        self.inflight_requests.iter()
+        self.inflight_requests.keys()
     }
 
-    pub fn inflight_requests_debug(&self) -> &HashSet<InflightRequest> {
-        &self.inflight_requests
+    pub fn inflight_requests_debug(&self) -> Vec<&InflightRequest> {
+        self.inflight_requests.keys().collect()
+    }
+
+    /// How long the most recently arrived chunk took, or `None` before the
+    /// first arrives.
+    pub fn last_latency(&self) -> Option<std::time::Duration> {
+        self.last_latency
     }
 }
 

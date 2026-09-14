@@ -111,7 +111,7 @@ This changes three of the invariants below:
   -- when the last participant goes. A claim another participant is still
   fetching does **not** go back: anything in the unclaimed pool is handed
   out on the next `claim()`, which pops the pool without consulting
-  `MAX_HOLDERS_PER_CLAIM` -- only `lagging_claim` does -- so a claim put
+  `MAX_HOLDERS_PER_CLAIM` -- only `stalled_claim` does -- so a claim put
   back under its holder's feet goes straight out again, over the cap, or
   back to the holder itself, which then finds every chunk of it already in
   flight with itself. Nor does a claim whose chunks have **all arrived**:
@@ -126,13 +126,17 @@ This changes three of the invariants below:
   named a claim that had landed minutes ago, and every free peer was sent
   to fetch it again -- which is also what put several peers on one piece's
   writes at the tail of every split piece.
-- **The second copy goes where the most is left to fetch.**
-  `lagging_claim()` ranks candidates by chunks still missing, with
-  `started` as the tie-break, because what gates the piece is the work
-  remaining on its slowest claim and not when that claim was handed out --
-  which is milliseconds apart between siblings anyway. Holder count is not
-  consulted: at a cap of two, every claim that is not full has exactly one
-  holder.
+- **The second copy goes to a stalled claim, from a peer that outpaces its
+  holder.** `stalled_claim()` considers only claims that have delivered
+  nothing of their own (`missing_at_start`), only where the asker's last
+  chunk took less time than we have waited on the holder
+  (`Activity::outpaces`; the wait runs from the holder's last delivery on
+  the piece, stamped by the write path via `note_delivery`), never the
+  asker's own, and at most two holders; among those it ranks by chunks
+  still missing with `started` as the tie-break, because what gates the
+  piece is the work remaining on its slowest claim. The same comparison
+  lets a peer cut a whole piece at the head of a stream's lookahead
+  (`split_whole`). The whole of it is written up in `CLAIMS.md`.
 - **A piece with several writers needs a real lock.** `per_piece_locks[p]`
   is taken **exclusively** by a chunk write, and before the state lock. A
   read lock was exclusion enough while one peer owned a piece; with several,
