@@ -2513,6 +2513,26 @@ impl PeerHandler {
                 }
             };
 
+            // **And of that share, only the chunks that are not already
+            // on disk.** One claim may have two holders -- which is what
+            // rescues a piece from a peer that has stalled on it -- and the
+            // loser of that race is cancelled only when the whole piece
+            // completes, so without this it re-requests every chunk of the
+            // claim while the winner is delivering them. The bytes arrive,
+            // are counted into `fetched_bytes`, and are dropped at the
+            // write as `PreviouslyCompleted`: 210 MB of 592 MB fetched in
+            // the field log of 2026-09-14.
+            //
+            // One reading, before the loop rather than per chunk: a chunk
+            // that lands while we are walking is one redundant request,
+            // which is what every chunk cost before this.
+            let mut to_request = {
+                let g = self.state.lock_read("chunks already on disk");
+                g.get_chunks()
+                    .map(|chunks| chunks.chunks_to_request(next, &claimed))
+                    .unwrap_or_default()
+                    .into_iter()
+            };
             // Only this peer's share. The rest of the piece is either
             // another peer's claim or still unclaimed, and this peer comes
             // back round for one of those when it is done here.
@@ -2521,6 +2541,12 @@ impl PeerHandler {
                 .lengths
                 .iter_chunk_infos_in(next, claimed.clone())
             {
+                // `true` for a chunk to ask for, and `true` for one this
+                // reading could not answer for, which is how it behaved
+                // before there was a reading.
+                if !to_request.next().unwrap_or(true) {
+                    continue 'chunks;
+                }
                 let request = Request {
                     index: next.get(),
                     begin: chunk.offset,
@@ -3144,7 +3170,7 @@ mod connection_tests {
     use tokio::sync::mpsc::unbounded_channel;
     use tokio_util::sync::CancellationToken;
 
-    use super::{BF, PeerHandler, TorrentStateLocked};
+    use super::{BF, PeerHandler, TorrentStateLocked, WriterRequest};
     use crate::{
         AddTorrent, CreateTorrentOptions, ManagedTorrentShared, Session, TorrentMetadata,
         create_torrent,
@@ -3229,6 +3255,124 @@ mod connection_tests {
             vec![(new_piece.0.get(), addr)],
             "the old connection's death took the new one's piece with it, or kept its own"
         );
+        Ok(())
+    }
+
+    /// **A peer asks for the gaps in its claim, not for the claim.**
+    ///
+    /// The wiring of `ChunkTracker::chunks_to_request` into the request
+    /// loop, which is where the field's bandwidth went. Two peers may hold
+    /// one claim -- that is what rescues a piece from a peer that has
+    /// stalled on it -- and the loser is cancelled only when the whole
+    /// piece completes. Until this, it walked its claim and re-requested
+    /// every chunk of it while the winner delivered them: the bytes
+    /// arrived, were counted into `fetched_bytes`, and were dropped at the
+    /// write. 210 MB of 592 MB fetched in the field log of 2026-09-14.
+    ///
+    /// Here half the piece is already on disk before the peer is let near
+    /// it. Every `Request` it sends must name a chunk that is not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_does_not_request_chunks_that_are_already_on_disk() -> anyhow::Result<()> {
+        setup_test_logging();
+        const CHUNKS_PER_PIECE: u32 = 8;
+        const PIECE_LEN: u32 = CHUNK_SIZE * CHUNKS_PER_PIECE;
+
+        let files =
+            create_default_random_dir_with_torrents(1, PIECE_LEN as usize, Some("request_gaps"));
+        let torrent = create_torrent(
+            files.path(),
+            CreateTorrentOptions {
+                piece_length: Some(PIECE_LEN),
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await?;
+        let dir = TempDir::with_prefix("request_gaps_client")?;
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            crate::SessionOptions {
+                dht: None,
+                persistence: None,
+                peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.as_bytes()?.to_vec()),
+                Some(crate::AddTorrentOptions {
+                    overwrite: true,
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        tokio::time::timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+        let live = handle.live().context("expected a live torrent")?;
+        let target = live.lengths.validate_piece_index(0).context("piece 0")?;
+
+        // The even chunks of the piece are already on disk -- delivered by
+        // somebody else, which is exactly what a duplicate holder finds.
+        let arrived: Vec<u32> = (0..CHUNKS_PER_PIECE).step_by(2).collect();
+        {
+            let mut g = live.lock_write("test: chunks already on disk");
+            let pieces = g.pieces.as_mut().context("chunk tracker")?;
+            for chunk in &arrived {
+                pieces.mark_chunk_downloaded(&Piece::from_data(
+                    target.get(),
+                    chunk * CHUNK_SIZE,
+                    &vec![0u8; CHUNK_SIZE as usize],
+                ));
+            }
+        }
+
+        // A peer holding the whole torrent, let loose on the request loop.
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1));
+        live.peers
+            .add_if_not_seen(addr)
+            .context("a fresh address")?;
+        let (_rx, _tx) = live
+            .peers
+            .mark_peer_connecting(addr, CancellationToken::new())?;
+        live.peers.with_peer_mut(addr, "test", |p| {
+            p.connecting_to_live(Id20::new([0u8; 20]), &live.peers, ConnectionKind::Tcp);
+        });
+        live.peers.with_live_mut(addr, "test", |l| {
+            l.bitfield = BF::from_boxed_slice(vec![0xffu8].into_boxed_slice());
+        });
+
+        let (tx, mut requests) = unbounded_channel();
+        let handler = PeerHandler::for_test(live.clone(), addr, tx);
+        let requester = tokio::spawn(async move { handler.task_peer_chunk_requester().await });
+
+        // Whatever it managed to ask for in the time it had.
+        let mut asked = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(request) = requests.recv().await {
+                if let WriterRequest::Message(peer_binary_protocol::Message::Request(r)) = request
+                    && r.index == target.get()
+                {
+                    asked.push(r.begin / CHUNK_SIZE);
+                }
+            }
+        })
+        .await;
+        requester.abort();
+
+        assert!(
+            !asked.is_empty(),
+            "the peer asked for nothing at all, so this proves nothing"
+        );
+        for chunk in &arrived {
+            assert!(
+                !asked.contains(chunk),
+                "chunk {chunk} was already on disk and was requested anyway; asked for {asked:?}"
+            );
+        }
         Ok(())
     }
 

@@ -33,6 +33,15 @@ struct PieceReclaim {
     releasing: HashSet<ValidPieceIndex>,
 }
 
+/// What a re-queue does with the chunks a piece already has.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Chunks {
+    /// Throw them away: the piece starts again from nothing.
+    Wipe,
+    /// Leave them on disk and in `chunk_status`.
+    Keep,
+}
+
 pub struct ChunkTracker {
     // This forms the basis of a "queue" to pull from.
     // It's set to 1 if we need a piece, but the moment we start requesting a peer,
@@ -690,7 +699,75 @@ impl ChunkTracker {
         }
     }
 
+    /// Which chunks of `claim` within `piece` are still to be fetched, as
+    /// `true` for "ask for this one", in claim order.
+    ///
+    /// **What stops a duplicate holder re-fetching a whole claim.** Two
+    /// peers may hold one claim ([`super::piece_tracker`]'s
+    /// `MAX_HOLDERS_PER_CLAIM`), which is what rescues a piece from a
+    /// stalled peer; without this the loser re-requests every chunk of it,
+    /// because the request loop walks the claim and not the gaps in it, and
+    /// its bytes arrive, are counted, and are dropped at the write. In the
+    /// field log of 2026-09-14 that was 210 MB of 592 MB fetched.
+    ///
+    /// It is a filter and not a guarantee: a chunk can arrive between this
+    /// answer and the request going out, which costs exactly what every
+    /// chunk cost before. Out of range answers "ask for all of it", which
+    /// is what the loop did before this existed.
+    pub(crate) fn chunks_to_request(
+        &self,
+        piece: ValidPieceIndex,
+        claim: &Range<u32>,
+    ) -> Vec<bool> {
+        let want = (claim.end.saturating_sub(claim.start)) as usize;
+        let piece_range = self.lengths.chunk_range(piece);
+        let start = piece_range.start + claim.start as usize;
+        let end = piece_range.start + claim.end as usize;
+        if end > piece_range.end {
+            return vec![true; want];
+        }
+        match self.chunk_status.get(start..end) {
+            Some(bits) => bits.iter().map(|arrived| !*arrived).collect(),
+            None => vec![true; want],
+        }
+    }
+
+    /// Whether any chunk of `index` is on disk.
+    ///
+    /// The question [`Self::mark_piece_broken_if_not_have`] has to be asked
+    /// before it is called on a piece that is leaving the in-flight map:
+    /// wiping is free on a piece nothing has delivered and costs everything
+    /// every peer delivered on one that has. Out of range answers `false`,
+    /// which is the safe way round -- a piece we cannot see holds nothing
+    /// worth keeping.
+    pub(crate) fn any_chunk_arrived(&self, index: ValidPieceIndex) -> bool {
+        self.chunk_status
+            .get(self.lengths.chunk_range(index))
+            .is_some_and(|bits| bits.count_ones() > 0)
+    }
+
     pub fn mark_piece_broken_if_not_have(&mut self, index: ValidPieceIndex) {
+        self.requeue_piece(index, Chunks::Wipe)
+    }
+
+    /// Put `index` back in the queue **and keep what is already on disk**.
+    ///
+    /// For the one caller that can reach a piece several peers were filling:
+    /// the last participant leaving an in-flight piece
+    /// ([`super::piece_tracker::PieceTracker::release_pieces_owned_by`]).
+    /// Wiping there throws away every chunk every *other* peer delivered
+    /// and already paid a peer for -- up to a whole piece per choke -- and
+    /// the participant list stopped being a proxy for "nobody has delivered
+    /// anything" when claims began retiring from it.
+    ///
+    /// Keeping them is only useful because a request is filtered against
+    /// `chunk_status` before it goes out, so the peer that picks the piece
+    /// up asks for what is missing and not for the piece.
+    pub(crate) fn requeue_piece_keeping_chunks(&mut self, index: ValidPieceIndex) {
+        self.requeue_piece(index, Chunks::Keep)
+    }
+
+    fn requeue_piece(&mut self, index: ValidPieceIndex, chunks: Chunks) {
         if self
             .have
             .as_slice()
@@ -709,7 +786,9 @@ impl ChunkTracker {
         if !self.is_piece_dropped(index) {
             self.queue_pieces.set(index.get() as usize, true);
         }
-        if let Some(s) = self.chunk_status.get_mut(self.lengths.chunk_range(index)) {
+        if chunks == Chunks::Wipe
+            && let Some(s) = self.chunk_status.get_mut(self.lengths.chunk_range(index))
+        {
             s.fill(false);
         }
     }
@@ -1307,6 +1386,43 @@ mod tests {
         // Neighbouring pieces are unaffected.
         assert_eq!(ct.piece_chunk_progress(0).unwrap().downloaded_chunks, 0);
         assert_eq!(ct.piece_chunk_progress(2).unwrap().downloaded_chunks, 0);
+    }
+
+    /// **A second holder of a claim asks for the gaps, not for the claim.**
+    ///
+    /// Two peers may hold one claim, which is what rescues a piece from a
+    /// peer that has stalled on it. The loser is cancelled only when the
+    /// whole piece completes, so what it asks for in the meantime is the
+    /// whole cost of the rescue: walking the claim, it re-fetched every
+    /// chunk the winner had already delivered, and those bytes were counted
+    /// into `fetched_bytes` and dropped at the write.
+    #[test]
+    fn a_claim_is_requested_by_its_gaps_and_not_by_its_length() {
+        let (l, mut ct) = tracker_for_chunk_progress_tests();
+        let piece = l.validate_piece_index(1).unwrap();
+        let claim = 0..3;
+
+        assert_eq!(
+            ct.chunks_to_request(piece, &claim),
+            vec![true, true, true],
+            "nothing has arrived, so every chunk is still to ask for"
+        );
+
+        recv_chunk(&mut ct, 1, 0, CHUNK_SIZE as usize);
+        recv_chunk(&mut ct, 1, 2, 1);
+        assert_eq!(
+            ct.chunks_to_request(piece, &claim),
+            vec![false, true, false],
+            "the chunks already on disk were asked for again"
+        );
+
+        // A claim this reading cannot answer for is asked for whole, which
+        // is what the request loop did before there was a reading.
+        assert_eq!(
+            ct.chunks_to_request(piece, &(0..99)),
+            vec![true; 99],
+            "an out-of-range claim must not silence the requests"
+        );
     }
 
     #[test]

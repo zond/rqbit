@@ -679,7 +679,28 @@ impl PieceTracker {
         }
         for piece in abandoned {
             self.inflight.remove(&piece);
-            self.chunks.mark_piece_broken_if_not_have(piece);
+            // **An empty participant list is not an empty piece.** It was
+            // once: every peer on a piece stayed listed until it left, so
+            // the list emptying meant nothing had been delivered by anyone
+            // and the wipe was free. Claims retire from the list now -- a
+            // connection's fully-delivered shares go when it comes back for
+            // more -- so the list can empty over a piece that is most of
+            // the way to disk, and the last live holder merely being choked
+            // is enough to reach here. Wiping then throws away every chunk
+            // every other peer delivered, all of it already paid for, up to
+            // a whole piece an event; and it is a *choke*, not a death, so
+            // the same peers are still there to be asked for it again.
+            //
+            // The piece is re-queued either way. What it keeps is the work:
+            // requests are filtered against `chunk_status`
+            // (`PeerConnection`'s request loop), so whoever picks it up
+            // next asks for the chunks that are missing rather than for the
+            // piece.
+            if self.chunks.any_chunk_arrived(piece) {
+                self.chunks.requeue_piece_keeping_chunks(piece);
+            } else {
+                self.chunks.mark_piece_broken_if_not_have(piece);
+            }
         }
         count
     }
@@ -1507,6 +1528,79 @@ mod tests {
             0..16,
             "peer 1 was handed back the claim it still has on the wire"
         );
+    }
+
+    /// **A choke must not throw away what every other peer delivered.**
+    ///
+    /// The field cost, in the smallest shape that has it. A piece a stream
+    /// waits on is split between peers; most of it lands; the one peer
+    /// still fetching the last claim is choked. `release_pieces_owned_by`
+    /// decided the piece was abandoned from an empty participant list and
+    /// wiped `chunk_status` for the whole piece -- discarding every chunk
+    /// already on disk and already paid a peer for, up to four megabytes an
+    /// event, on a *choke*, with the same seeders still connected.
+    ///
+    /// The list stopped meaning "nobody has delivered anything" when claims
+    /// began retiring from it: a peer whose shares are all on disk is
+    /// retired when it comes back for more, so the piece can be most of the
+    /// way home with one name left on it.
+    #[test]
+    fn a_choke_on_the_last_holder_keeps_what_the_others_delivered() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+        let waited_on = piece(&tracker, 0);
+
+        // Three peers take three claims of the piece and deliver two of
+        // them entirely.
+        let first = claimed(acquire_as(
+            &mut tracker,
+            &file_infos,
+            &priorities,
+            1,
+            Some(waited_on),
+        ));
+        let second = claimed(acquire_as(
+            &mut tracker,
+            &file_infos,
+            &priorities,
+            2,
+            Some(waited_on),
+        ));
+        let third = claimed(acquire_as(
+            &mut tracker,
+            &file_infos,
+            &priorities,
+            3,
+            Some(waited_on),
+        ));
+        deliver(&mut tracker, waited_on, first.clone());
+        deliver(&mut tracker, waited_on, second.clone());
+        assert!(
+            tracker.chunks().any_chunk_arrived(waited_on),
+            "the fixture delivered nothing"
+        );
+
+        // Peers 1 and 2 come back for more work, which retires their
+        // finished claims from the participant list -- so peer 3 is the
+        // only name left on a piece that is two thirds on disk.
+        acquire_as(&mut tracker, &file_infos, &priorities, 1, Some(waited_on));
+        acquire_as(&mut tracker, &file_infos, &priorities, 2, Some(waited_on));
+        tracker.release_pieces_owned_by(peer(1), 0);
+        tracker.release_pieces_owned_by(peer(2), 0);
+
+        // And peer 3 is choked.
+        tracker.release_pieces_owned_by(peer(3), 0);
+
+        assert!(
+            tracker.chunks().any_chunk_arrived(waited_on),
+            "a choke threw away every chunk the other peers had delivered"
+        );
+        for claim in [first, second] {
+            assert_eq!(
+                tracker.chunks().chunks_missing(waited_on, &claim),
+                0,
+                "claim {claim:?} was delivered and is now missing again"
+            );
+        }
     }
 
     /// **And it comes back once, not once per holder that left.**
