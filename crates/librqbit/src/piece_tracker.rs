@@ -780,7 +780,11 @@ impl PieceTracker {
         file_infos: &FileInfos,
         new_only_files: &HashSet<usize>,
     ) -> anyhow::Result<crate::chunk_tracker::HaveNeededSelected> {
-        self.chunks.update_only_files(file_infos, new_only_files)
+        let inflight = &self.inflight;
+        self.chunks
+            .update_only_files(file_infos, new_only_files, |piece| {
+                inflight.contains_key(&piece)
+            })
     }
 
     /// Hold pieces back from what we announce, or stop holding them back: see
@@ -1530,6 +1534,58 @@ mod tests {
         );
     }
 
+    /// **Selecting a file back must not reset the pieces of it that peers
+    /// are already fetching.**
+    ///
+    /// `update_only_files` was the one caller of
+    /// `mark_piece_broken_if_not_have` that neither took the piece out of
+    /// the in-flight map first nor asked whether anybody was on it --
+    /// `drop_pieces` and `reselect_pieces` both take an `is_inflight`
+    /// predicate for exactly this. On a live piece it did two things
+    /// nothing downstream allows for: it grew `chunks_missing` under live
+    /// claims, which that function's own contract says cannot happen, so a
+    /// finished claim read as unfinished and was offered for duplication
+    /// and handed back on release; and it set the queue bit on a piece
+    /// still in the in-flight map, which `acquire_piece` assumes is
+    /// impossible.
+    #[test]
+    fn selecting_a_file_back_leaves_its_in_flight_pieces_alone() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+        let waited_on = piece(&tracker, 0);
+        let claim = claimed(acquire_as(
+            &mut tracker,
+            &file_infos,
+            &priorities,
+            1,
+            Some(waited_on),
+        ));
+        deliver(&mut tracker, waited_on, claim.clone());
+        assert_eq!(
+            tracker.chunks().chunks_missing(waited_on, &claim),
+            0,
+            "the fixture did not deliver the claim"
+        );
+
+        // The user deselects the file and asks for it back, while peer 1 is
+        // still on the piece.
+        tracker
+            .update_only_files(&file_infos, &HashSet::new())
+            .unwrap();
+        tracker
+            .update_only_files(&file_infos, &HashSet::from_iter([0]))
+            .unwrap();
+
+        assert_eq!(
+            tracker.chunks().chunks_missing(waited_on, &claim),
+            0,
+            "a delivered claim became unfinished under its holder"
+        );
+        assert!(
+            !tracker.chunks().is_piece_queued(waited_on),
+            "a piece still in the in-flight map was put back in the queue"
+        );
+    }
+
     /// **A choke must not throw away what every other peer delivered.**
     ///
     /// The field cost, in the smallest shape that has it. A piece a stream
@@ -1565,13 +1621,7 @@ mod tests {
             2,
             Some(waited_on),
         ));
-        let third = claimed(acquire_as(
-            &mut tracker,
-            &file_infos,
-            &priorities,
-            3,
-            Some(waited_on),
-        ));
+        acquire_as(&mut tracker, &file_infos, &priorities, 3, Some(waited_on));
         deliver(&mut tracker, waited_on, first.clone());
         deliver(&mut tracker, waited_on, second.clone());
         assert!(

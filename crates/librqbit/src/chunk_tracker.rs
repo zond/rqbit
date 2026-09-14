@@ -904,10 +904,21 @@ impl ChunkTracker {
         Some(ChunkMarkingResult::NotCompleted)
     }
 
+    /// `is_inflight` says whether a peer already owns the piece, as it does
+    /// for [`Self::drop_pieces`] and [`Self::reselect_pieces`], and for the
+    /// same reason: a newly selected piece that is already being fetched
+    /// must not be re-queued or reset under the peers filling it. Resetting
+    /// it grows `chunks_missing` under live claims -- which
+    /// [`Self::chunks_missing`] states can never happen, and every caller
+    /// of it believes -- so finished claims read as unfinished and are
+    /// offered for duplication and handed back on release; re-queuing it
+    /// puts a piece in the queue that is also in the in-flight map, which
+    /// `acquire_piece` assumes is impossible.
     pub fn update_only_files(
         &mut self,
         file_infos: &FileInfos,
         new_only_files: &HashSet<usize>,
+        is_inflight: impl Fn(ValidPieceIndex) -> bool,
     ) -> anyhow::Result<HaveNeededSelected> {
         let selected = compute_selected_pieces(
             &self.lengths,
@@ -935,8 +946,12 @@ impl ChunkTracker {
                     // The user just asked back for a file we had dropped pieces of. That
                     // outranks the drop, and it has to happen before the requeue below,
                     // which refuses to queue a dropped piece.
+                    // The user asked the file back whether or not a peer
+                    // is on this piece; what a peer is on, it keeps.
                     self.undrop_piece(idx);
-                    self.mark_piece_broken_if_not_have(idx);
+                    if !is_inflight(idx) {
+                        self.mark_piece_broken_if_not_have(idx);
+                    }
                 }
             }
         }
@@ -1173,7 +1188,7 @@ mod tests {
 
         // Select all file, no changes.
         assert_eq!(
-            ct.update_only_files(&all_files, &HashSet::from_iter([0, 1, 2, 3]))
+            ct.update_only_files(&all_files, &HashSet::from_iter([0, 1, 2, 3]), |_| false)
                 .unwrap(),
             HaveNeededSelected {
                 have_bytes: 0,
@@ -1187,7 +1202,7 @@ mod tests {
         // Select only the first file.
         println!("Select only the first file.");
         assert_eq!(
-            ct.update_only_files(&all_files, &HashSet::from_iter([0]))
+            ct.update_only_files(&all_files, &HashSet::from_iter([0]), |_| false)
                 .unwrap(),
             HaveNeededSelected {
                 have_bytes: 0,
@@ -1201,7 +1216,7 @@ mod tests {
 
         // Select only the second file.
         assert_eq!(
-            ct.update_only_files(&all_files, &HashSet::from_iter([1]))
+            ct.update_only_files(&all_files, &HashSet::from_iter([1]), |_| false)
                 .unwrap(),
             HaveNeededSelected {
                 have_bytes: 0,
@@ -1215,7 +1230,7 @@ mod tests {
 
         // Select only the third file (zero sized one!).
         assert_eq!(
-            ct.update_only_files(&all_files, &HashSet::from_iter([2]))
+            ct.update_only_files(&all_files, &HashSet::from_iter([2]), |_| false)
                 .unwrap(),
             HaveNeededSelected {
                 have_bytes: 0,
@@ -1229,7 +1244,7 @@ mod tests {
 
         // Select only the fourth file.
         assert_eq!(
-            ct.update_only_files(&all_files, &HashSet::from_iter([3]))
+            ct.update_only_files(&all_files, &HashSet::from_iter([3]), |_| false)
                 .unwrap(),
             HaveNeededSelected {
                 have_bytes: 0,
@@ -1243,7 +1258,7 @@ mod tests {
 
         // Select first and last file
         assert_eq!(
-            ct.update_only_files(&all_files, &HashSet::from_iter([0, 3]))
+            ct.update_only_files(&all_files, &HashSet::from_iter([0, 3]), |_| false)
                 .unwrap(),
             HaveNeededSelected {
                 have_bytes: 0,
@@ -1257,7 +1272,7 @@ mod tests {
 
         // Select all files
         assert_eq!(
-            ct.update_only_files(&all_files, &HashSet::from_iter([0, 1, 2, 3]))
+            ct.update_only_files(&all_files, &HashSet::from_iter([0, 1, 2, 3]), |_| false)
                 .unwrap(),
             HaveNeededSelected {
                 have_bytes: 0,
@@ -1529,8 +1544,9 @@ mod tests {
         assert!(!ct.is_piece_queued(p0));
 
         // Meanwhile the user deselects the file and selects it again.
-        ct.update_only_files(&files, &HashSet::new()).unwrap();
-        ct.update_only_files(&files, &HashSet::from_iter([0]))
+        ct.update_only_files(&files, &HashSet::new(), |_| false)
+            .unwrap();
+        ct.update_only_files(&files, &HashSet::from_iter([0]), |_| false)
             .unwrap();
         assert!(ct.is_piece_queued(p0));
 
@@ -1686,7 +1702,8 @@ mod piece_reclaim_tests {
         assert_eq!(have(&ct), vec![0]);
 
         // Deselecting a file cancels its pieces, reselecting it requeues them.
-        ct.update_only_files(&fi, &HashSet::from_iter([0])).unwrap();
+        ct.update_only_files(&fi, &HashSet::from_iter([0]), |_| false)
+            .unwrap();
         assert_eq!(queued(&ct), vec![1]);
         assert_eq!(
             *ct.get_hns(),
@@ -1696,7 +1713,7 @@ mod piece_reclaim_tests {
                 selected_bytes: PIECE_LEN as u64 * 2,
             }
         );
-        ct.update_only_files(&fi, &HashSet::from_iter([0, 1]))
+        ct.update_only_files(&fi, &HashSet::from_iter([0, 1]), |_| false)
             .unwrap();
         assert_eq!(queued(&ct), vec![1, 2]);
         assert_eq!(
@@ -1775,7 +1792,7 @@ mod piece_reclaim_tests {
         assert_eq!(queued(&ct), Vec::<usize>::new());
 
         // Neither may a no-op selection change.
-        ct.update_only_files(&fi, &HashSet::from_iter([0, 1]))
+        ct.update_only_files(&fi, &HashSet::from_iter([0, 1]), |_| false)
             .unwrap();
         assert_eq!(queued(&ct), Vec::<usize>::new());
         assert!(ct.is_piece_dropped(piece(&l, 0)));
@@ -1929,7 +1946,8 @@ mod piece_reclaim_tests {
 
         // File 1 deselected: piece 2 is dropped and in no selected file. Piece 1 is in
         // file 0, still selected, and still dropped.
-        ct.update_only_files(&fi, &HashSet::from_iter([0])).unwrap();
+        ct.update_only_files(&fi, &HashSet::from_iter([0]), |_| false)
+            .unwrap();
         assert_eq!(selected(&ct), vec![0, 1]);
         assert!(!ct.has_all_selected_pieces());
 
@@ -1958,7 +1976,8 @@ mod piece_reclaim_tests {
         ct.drop_pieces(&fi, [piece(&l, 2)], |_| false).unwrap();
 
         // Deselect file 1, which is where the dropped piece lives.
-        ct.update_only_files(&fi, &HashSet::from_iter([0])).unwrap();
+        ct.update_only_files(&fi, &HashSet::from_iter([0]), |_| false)
+            .unwrap();
         assert_eq!(selected(&ct), vec![0, 1]);
         assert!(ct.is_piece_dropped(piece(&l, 2)));
 
@@ -1978,7 +1997,7 @@ mod piece_reclaim_tests {
         assert!(ct.is_finished());
 
         // Asking for the file back is what makes it wanted.
-        ct.update_only_files(&fi, &HashSet::from_iter([0, 1]))
+        ct.update_only_files(&fi, &HashSet::from_iter([0, 1]), |_| false)
             .unwrap();
         assert_eq!(queued(&ct), vec![2]);
         assert!(!ct.is_finished());
@@ -1999,11 +2018,12 @@ mod piece_reclaim_tests {
         ct.drop_pieces(&fi, [piece(&l, 2)], |_| false).unwrap();
         assert!(ct.is_piece_dropped(piece(&l, 2)));
 
-        ct.update_only_files(&fi, &HashSet::from_iter([0])).unwrap();
+        ct.update_only_files(&fi, &HashSet::from_iter([0]), |_| false)
+            .unwrap();
         assert!(ct.is_piece_dropped(piece(&l, 2)));
         assert_eq!(queued(&ct), Vec::<usize>::new());
 
-        ct.update_only_files(&fi, &HashSet::from_iter([0, 1]))
+        ct.update_only_files(&fi, &HashSet::from_iter([0, 1]), |_| false)
             .unwrap();
         assert!(!ct.is_piece_dropped(piece(&l, 2)));
         assert_eq!(queued(&ct), vec![2]);
@@ -2022,7 +2042,8 @@ mod piece_reclaim_tests {
         ct.enable_piece_reclaim();
         download(&mut ct, &l, 0);
         download(&mut ct, &l, 1);
-        ct.update_only_files(&fi, &HashSet::from_iter([0])).unwrap();
+        ct.update_only_files(&fi, &HashSet::from_iter([0]), |_| false)
+            .unwrap();
         assert_eq!(selected(&ct), vec![0, 1]);
         let before = snapshot(&ct);
 
@@ -2038,7 +2059,7 @@ mod piece_reclaim_tests {
 
         // Asking for the file back still outranks the drop.
         assert_eq!(ct.finish_release([piece(&l, 2)]), 0);
-        ct.update_only_files(&fi, &HashSet::from_iter([0, 1]))
+        ct.update_only_files(&fi, &HashSet::from_iter([0, 1]), |_| false)
             .unwrap();
         assert!(!ct.is_piece_dropped(piece(&l, 2)));
         assert_eq!(queued(&ct), vec![2]);
@@ -2106,7 +2127,7 @@ mod piece_reclaim_tests {
         // Neither a peer dying nor a no-op selection change bring it back.
         restarted.mark_piece_broken_if_not_have(piece(&l, 0));
         restarted
-            .update_only_files(&fi, &HashSet::from_iter([0, 1]))
+            .update_only_files(&fi, &HashSet::from_iter([0, 1]), |_| false)
             .unwrap();
         assert_eq!(queued(&restarted), Vec::<usize>::new());
         assert!(restarted.is_finished());

@@ -19,8 +19,10 @@ pub struct TorrentStatePaused {
 
 impl TorrentStatePaused {
     pub(crate) fn update_only_files(&mut self, only_files: &HashSet<usize>) -> anyhow::Result<()> {
+        // A paused torrent has no peers, so nothing is in flight and
+        // nothing can be reset under a claim.
         self.chunk_tracker
-            .update_only_files(&self.metadata.file_infos, only_files)?;
+            .update_only_files(&self.metadata.file_infos, only_files, |_| false)?;
         Ok(())
     }
 
