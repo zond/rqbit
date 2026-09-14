@@ -3495,6 +3495,157 @@ mod connection_tests {
         Ok(())
     }
 
+    /// **Finishing a piece cancels what the other peers still have out
+    /// for it.**
+    ///
+    /// The wiring of `overtaken_by` into the write path. A doubled claim is
+    /// two peers racing the same chunks, and the loser is still asking a
+    /// seeder for bytes on our disk when the winner lands the last one:
+    /// those requests are cancelled, its slots freed and its inflight set
+    /// cleared, or the loser sits on a claim's worth of requests until the
+    /// seeder answers them -- bytes counted into `fetched_bytes` and dropped
+    /// at `PreviouslyCompleted`, which was the second half of the field's
+    /// 210 MB of 592 MB.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completing_a_piece_cancels_the_other_holders_requests() -> anyhow::Result<()> {
+        setup_test_logging();
+        const CHUNKS_PER_PIECE: u32 = 32;
+        const PIECE_LEN: u32 = CHUNK_SIZE * CHUNKS_PER_PIECE;
+
+        let files =
+            create_default_random_dir_with_torrents(1, PIECE_LEN as usize * 2, Some("overtaken"));
+        let content = std::fs::read(files.path().join("0.data"))?;
+        let torrent = create_torrent(
+            files.path(),
+            CreateTorrentOptions {
+                piece_length: Some(PIECE_LEN),
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await?;
+        let dir = TempDir::with_prefix("overtaken_client")?;
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            crate::SessionOptions {
+                dht: None,
+                persistence: None,
+                peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.as_bytes()?.to_vec()),
+                Some(crate::AddTorrentOptions {
+                    overwrite: true,
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        tokio::time::timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+        let live = handle.live().context("expected a live torrent")?;
+        let target = live.lengths.validate_piece_index(0).context("piece 0")?;
+
+        let mut handlers = Vec::new();
+        let mut peer_rxs = Vec::new();
+        for port in [1u16, 2] {
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+            live.peers
+                .add_if_not_seen(addr)
+                .context("a fresh address")?;
+            let (rx, tx) = live
+                .peers
+                .mark_peer_connecting(addr, CancellationToken::new())?;
+            live.peers.with_peer_mut(addr, "test", |p| {
+                p.connecting_to_live(Id20::new([0u8; 20]), &live.peers, ConnectionKind::Tcp);
+            });
+            live.peers.with_live_mut(addr, "test", |l| {
+                l.bitfield = BF::from_boxed_slice(vec![0xff].into_boxed_slice());
+            });
+            handlers.push(PeerHandler::for_test(live.clone(), addr, tx));
+            peer_rxs.push(rx);
+        }
+        let (winner, loser) = (&handlers[0], &handlers[1]);
+        let chunks: Vec<ChunkInfo> = live.lengths.iter_chunk_infos(target).collect();
+
+        // Both hold a claim of the piece: the winner the first, the loser the
+        // second -- and the loser has every request of its claim on the wire.
+        for handler in [winner, loser] {
+            let mut g = live.lock_write("test");
+            let TorrentStateLocked {
+                pieces,
+                file_priorities,
+                ..
+            } = &mut **g;
+            let pieces = pieces.as_mut().context("no chunk tracker")?;
+            match pieces.acquire_piece(crate::piece_tracker::AcquireRequest {
+                peer: handler.addr,
+                connection: handler.connection,
+                now: std::time::Instant::now(),
+                peer_avg_time: None,
+                last_delivery: None,
+                last_latency: None,
+                priority_pieces: std::iter::once(target),
+                file_priorities,
+                file_infos: &live.metadata.file_infos,
+                peer_has_piece: |_| true,
+                can_steal: |_| true,
+            }) {
+                crate::piece_tracker::AcquireResult::Reserved { piece, .. } => {
+                    anyhow::ensure!(piece == target, "got piece {piece} instead");
+                }
+                other => anyhow::bail!("expected a reservation, got {other:?}"),
+            }
+        }
+        live.peers.with_live_mut(loser.addr, "test", |l| {
+            for chunk in &chunks[16..32] {
+                l.add_inflight_request(*chunk);
+            }
+        });
+
+        // The winner delivers the whole piece, the loser's claim included.
+        for chunk in &chunks {
+            live.peers.with_live_mut(winner.addr, "test", |l| {
+                l.add_inflight_request(*chunk);
+            });
+            let start = chunk.offset as usize;
+            winner
+                .on_received_piece(Piece::from_data(
+                    target.get(),
+                    chunk.offset,
+                    &content[start..start + chunk.size as usize],
+                ))
+                .await?;
+        }
+
+        let outstanding: Vec<ChunkInfo> = live
+            .peers
+            .with_live(loser.addr, |l| l.inflight_requests().copied().collect())
+            .context("the loser is still live")?;
+        assert!(
+            outstanding.iter().all(|req| req.piece_index != target),
+            "the loser still has requests out for a piece that is done: {outstanding:?}"
+        );
+        let mut cancelled = 0;
+        while let Ok(request) = peer_rxs[1].try_recv() {
+            if let WriterRequest::Message(peer_binary_protocol::Message::Cancel(cancel)) = request
+                && cancel.index == target.get()
+            {
+                cancelled += 1;
+            }
+        }
+        assert_eq!(
+            cancelled, 16,
+            "the loser was not sent a Cancel for each request of its claim"
+        );
+        Ok(())
+    }
+
     /// **A peer asks for the gaps in its claim, not for the claim.**
     ///
     /// The wiring of `ChunkTracker::chunks_to_request` into the request
