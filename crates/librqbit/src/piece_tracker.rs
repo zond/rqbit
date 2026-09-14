@@ -68,6 +68,31 @@ pub struct Participant {
     started: Instant,
 }
 
+/// How far a peer will go for a share of a piece already in flight.
+///
+/// **Double work is worth paying for where a deadline is, and nowhere
+/// else.** A piece is split the moment a stream waits on it, and a peer's
+/// request window is 128 chunks against a 16-chunk claim -- so two peers
+/// can hold every claim of a 4 MiB piece before either has delivered a
+/// byte. A piece at the head of the window is therefore parked on two
+/// peers, and if either is slow the read blocks on it. Further out there
+/// is a whole piece of playback for one copy to arrive in, and the field
+/// measured what fetching the whole lookahead twice costs: 415 MB fetched
+/// against 281 MB verified on 2026-09-14.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Share {
+    /// Only work nobody holds.
+    Unclaimed,
+    /// Failing that, a second copy of a claim that has delivered nothing.
+    OrDuplicate,
+}
+
+/// How many pieces at the head of the lookahead are split, and may have a
+/// claim of theirs fetched twice; see [`Share`]. Two, because the reader is
+/// blocked on the first and about to be blocked on the second, and every
+/// piece after those has a whole piece of playback to arrive in.
+const DEADLINE_PIECES: usize = 2;
+
 /// Tracks a piece currently being downloaded.
 ///
 /// **A piece may have more than one peer on it.** A piece a stream is
@@ -108,6 +133,7 @@ impl InflightPiece {
         connection: u64,
         chunks_in_piece: u32,
         split: bool,
+        now: Instant,
     ) -> (Self, Range<u32>) {
         let mut unclaimed = VecDeque::new();
         let first = if split {
@@ -121,7 +147,7 @@ impl InflightPiece {
         } else {
             0..chunks_in_piece
         };
-        let started = Instant::now();
+        let started = now;
         (
             Self {
                 participants: vec![Participant {
@@ -152,6 +178,8 @@ impl InflightPiece {
         peer: PeerHandle,
         connection: u64,
         missing: impl Fn(&Range<u32>) -> u32,
+        share: Share,
+        now: Instant,
     ) -> Option<Range<u32>> {
         // This connection's finished shares are over. It is back here
         // because it has sent every request of them and they have all
@@ -167,17 +195,33 @@ impl InflightPiece {
         // outstanding, and `overtaken_by` has to find it when the piece
         // completes so they can be cancelled. It retires when it comes back
         // here itself, or when the piece ends.
-        self.participants
-            .retain(|p| !(p.peer == peer && p.connection == connection && missing(&p.chunks) == 0));
+        //
+        // **And retiring one is the proof this peer is fetching.** A claim
+        // entirely on disk was fetched by its holder over a measured
+        // stretch of this piece's life, which is the one honest reading of
+        // a peer's speed there is: the same piece, the same clock, claims
+        // handed out within milliseconds of each other. It is what
+        // [`Self::lagging_claim`] needs, and it was thrown away here until
+        // it was picked up on the way past.
+        let mut proven: Option<Duration> = None;
+        self.participants.retain(|p| {
+            let finished = p.peer == peer && p.connection == connection && missing(&p.chunks) == 0;
+            if finished {
+                let took = now.saturating_duration_since(p.started);
+                proven = Some(proven.map_or(took, |longest: Duration| longest.max(took)));
+            }
+            !finished
+        });
         let chunks = match self.unclaimed.pop_front() {
             Some(chunks) => chunks,
-            None => self.lagging_claim(peer, missing)?,
+            None if share == Share::Unclaimed => return None,
+            None => self.lagging_claim(peer, missing, proven?, now)?,
         };
         self.participants.push(Participant {
             peer,
             connection,
             chunks: chunks.clone(),
-            started: Instant::now(),
+            started: now,
         });
         Some(chunks)
     }
@@ -220,11 +264,28 @@ impl InflightPiece {
         &self,
         peer: PeerHandle,
         missing: impl Fn(&Range<u32>) -> u32,
+        proven: Duration,
+        now: Instant,
     ) -> Option<Range<u32>> {
         let mut best: Option<(u32, Instant, Range<u32>)> = None;
         for candidate in &self.participants {
             let left = missing(&candidate.chunks);
             if left == 0 {
+                continue;
+            }
+            // **Nothing delivered, over at least as long as it took this
+            // peer to deliver a claim of the same piece.** Both halves are
+            // needed and neither is a threshold anybody chose. A claim that
+            // has delivered some of itself is being fetched, and a second
+            // copy of it buys the piece nothing it is not already getting.
+            // A claim younger than `proven` has not yet had the time this
+            // peer has just shown the piece can be fetched in, so calling
+            // it slow would be calling a peer slow for having been asked
+            // late -- which is what a claim re-handed after a release looks
+            // like.
+            if left < candidate.chunks.end.saturating_sub(candidate.chunks.start)
+                || now.saturating_duration_since(candidate.started) < proven
+            {
                 continue;
             }
             let (count, mine) = self
@@ -347,6 +408,12 @@ where
     pub connection: u64,
     /// The peer's average piece download time (for steal calculations).
     pub peer_avg_time: Option<Duration>,
+    /// **Now, handed in rather than read.** What this module decides about
+    /// who is fetching what turns on how long a claim has been outstanding,
+    /// so the clock is a parameter: a test that could not put two claims a
+    /// measured distance apart could not test the rule that one peer has
+    /// out-delivered another.
+    pub now: Instant,
     /// Priority pieces to check first (e.g., for streaming).
     pub priority_pieces: I,
     /// File download priority ordering.
@@ -431,6 +498,13 @@ impl PieceTracker {
         // Reserve the first free one; if every one this peer could take is already being
         // downloaded, remember the first, which is the one a stream reaches soonest.
         let mut held_priority_piece = None;
+        // How far into the lookahead this walk has got. Only the pieces a
+        // read is blocked on or about to block on are split, or worth
+        // fetching twice; see [`Share`] and [`DEADLINE_PIECES`]. Counted
+        // over the pieces this peer could actually take -- one it does not
+        // have, or that is being hash-checked, is not a piece the reader is
+        // waiting on us for.
+        let mut deep = 0usize;
         for piece in &mut req.priority_pieces {
             if self.chunks.is_piece_have(piece)
                 || self.chunks.is_releasing(piece)
@@ -461,12 +535,41 @@ impl PieceTracker {
                 // Split from the first peer on: a stream is waiting on this
                 // one, and every later peer that turns up takes a share
                 // rather than being sent away.
-                None => return self.reserve_piece(piece, req.peer, req.connection, true),
+                // **Split it, or hand it whole to one peer.** The same
+                // depth decides this and whether a claim may be copied,
+                // because they are one question.
+                //
+                // Handing the deeper ones whole is not only about what
+                // they cost. A split piece can never be stolen --
+                // `steal_piece` refuses any piece with more than one
+                // participant -- and it poisons the only per-peer speed
+                // number there is, because `on_piece_completed` credits a
+                // whole piece's bytes and elapsed time to whichever peer
+                // delivered its last chunk. Splitting everything turned
+                // both of those off for the whole lookahead.
+                None => {
+                    return self.reserve_piece(
+                        piece,
+                        req.peer,
+                        req.connection,
+                        deep < DEADLINE_PIECES,
+                        req.now,
+                    );
+                }
                 Some(inflight) => {
                     let tracker = &self.chunks;
-                    if let Some(chunks) = inflight.claim(req.peer, req.connection, |claim| {
-                        tracker.chunks_missing(piece, claim)
-                    }) {
+                    let share = if deep < DEADLINE_PIECES {
+                        Share::OrDuplicate
+                    } else {
+                        Share::Unclaimed
+                    };
+                    if let Some(chunks) = inflight.claim(
+                        req.peer,
+                        req.connection,
+                        |claim| tracker.chunks_missing(piece, claim),
+                        share,
+                        req.now,
+                    ) {
                         return AcquireResult::Reserved { piece, chunks };
                     }
                     if held_priority_piece.is_none() && !inflight.has_peer(req.peer) {
@@ -474,6 +577,7 @@ impl PieceTracker {
                     }
                 }
             }
+            deep += 1;
         }
         if let Some(piece) = held_priority_piece
             && let Some(result) = self.steal_piece(&req, piece, 10.0)
@@ -490,7 +594,7 @@ impl PieceTracker {
 
         for piece in queued {
             if (req.peer_has_piece)(piece) && !self.chunks.is_releasing(piece) {
-                return self.reserve_piece(piece, req.peer, req.connection, false);
+                return self.reserve_piece(piece, req.peer, req.connection, false, req.now);
             }
         }
 
@@ -515,10 +619,11 @@ impl PieceTracker {
         peer: PeerHandle,
         connection: u64,
         split: bool,
+        now: Instant,
     ) -> AcquireResult {
         self.chunks.reserve_needed_piece(piece);
         let chunks_in_piece = self.chunks.get_lengths().chunks_per_piece(piece);
-        let (inflight, chunks) = InflightPiece::new(peer, connection, chunks_in_piece, split);
+        let (inflight, chunks) = InflightPiece::new(peer, connection, chunks_in_piece, split, now);
         self.inflight.insert(piece, inflight);
         AcquireResult::Reserved { piece, chunks }
     }
@@ -947,16 +1052,68 @@ mod tests {
         who: u8,
         priority: Option<ValidPieceIndex>,
     ) -> AcquireResult {
+        acquire_at(
+            tracker,
+            file_infos,
+            file_priorities,
+            who,
+            priority,
+            Instant::now(),
+        )
+    }
+
+    /// [`acquire_as`] with the clock handed in, for the rules that turn on
+    /// how long a claim has been outstanding.
+    fn acquire_at(
+        tracker: &mut PieceTracker,
+        file_infos: &FileInfos,
+        file_priorities: &FilePriorities,
+        who: u8,
+        priority: Option<ValidPieceIndex>,
+        now: Instant,
+    ) -> AcquireResult {
         tracker.acquire_piece(AcquireRequest {
             peer: peer(who),
             connection: 0,
             peer_avg_time: None,
+            now,
             priority_pieces: priority.into_iter(),
             file_priorities,
             file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
         })
+    }
+
+    /// Acquire with a whole lookahead offered in playback order, which is
+    /// what production hands in and the only way to reach anything that
+    /// depends on how deep in the window a piece is.
+    fn acquire_in_window(
+        tracker: &mut PieceTracker,
+        file_infos: &FileInfos,
+        file_priorities: &FilePriorities,
+        who: u8,
+        window: &[ValidPieceIndex],
+        now: Instant,
+    ) -> AcquireResult {
+        tracker.acquire_piece(AcquireRequest {
+            peer: peer(who),
+            connection: 0,
+            peer_avg_time: None,
+            now,
+            priority_pieces: window.iter().copied(),
+            file_priorities,
+            file_infos,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+        })
+    }
+
+    fn reserved_piece(result: AcquireResult) -> ValidPieceIndex {
+        match result {
+            AcquireResult::Reserved { piece, .. } => piece,
+            other => panic!("expected a reservation, got {other:?}"),
+        }
     }
 
     fn claimed(result: AcquireResult) -> Range<u32> {
@@ -1037,40 +1194,147 @@ mod tests {
         );
     }
 
-    /// **Once nothing is unclaimed, a free peer doubles up on the claim
-    /// that is lagging.**
+    /// **A peer that has delivered doubles up on a claim that has not.**
     ///
     /// Splitting alone turns "one peer's speed" into "the slowest of four
     /// peers' speed": the piece is not done until its last claim is, so one
-    /// straggler still gates a read. A peer with no work left takes a
-    /// second copy of the oldest outstanding claim, and whichever arrives
-    /// first ends it.
+    /// straggler still gates a read. A second copy is the rescue -- but
+    /// only from a peer that has shown it can fetch this piece, against a
+    /// claim that has had at least as long and produced nothing.
+    ///
+    /// **Both halves are measured on the one piece.** The claims went out
+    /// within milliseconds of each other, so "I finished mine in T, yours
+    /// has been out for T and is empty" is a comparison over the same
+    /// stretch of the same file -- no global speed metric, and nothing a
+    /// split piece poisons (`on_piece_completed` credits a whole piece to
+    /// whoever delivers its last chunk).
     #[test]
-    fn a_free_peer_doubles_up_on_the_claim_that_is_lagging() {
+    fn a_peer_that_has_delivered_doubles_up_on_a_claim_that_has_not() {
         let (mut tracker, file_infos, priorities) = make_split_tracker(4);
         let waited_on = piece(&tracker, 0);
+        let t0 = Instant::now();
         for who in 1..=4 {
-            acquire_as(&mut tracker, &file_infos, &priorities, who, Some(waited_on));
+            acquire_at(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                who,
+                Some(waited_on),
+                t0,
+            );
         }
 
-        // Peer 1 took 0..16 first, so it is the oldest outstanding claim.
-        let second = claimed(acquire_as(
+        // Peer 1 fetches the whole of its claim in ten seconds.
+        deliver(&mut tracker, waited_on, 0..16);
+        let second = claimed(acquire_at(
             &mut tracker,
             &file_infos,
             &priorities,
-            5,
+            1,
             Some(waited_on),
+            t0 + Duration::from_secs(10),
         ));
 
         assert_eq!(
             second,
-            0..16,
-            "the claim outstanding longest is the one worth a second copy"
+            16..32,
+            "the oldest claim that has delivered nothing is the one worth a second copy"
         );
         assert_eq!(
             tracker.participants(waited_on).len(),
-            5,
-            "five peers, four claims, one of them doubled"
+            4,
+            "peer 1's finished claim retired and its second one took its place"
+        );
+    }
+
+    /// **A peer that has delivered nothing takes no second copy.**
+    ///
+    /// The waste this cost is what the field measured: 415 MB fetched
+    /// against 281 MB verified on 2026-09-14. A peer's request window is
+    /// 128 chunks against a 16-chunk claim, so two peers can hold every
+    /// claim of a piece before either has delivered a byte -- and every
+    /// peer arriving after them used to take a second copy of a claim
+    /// nobody could yet call slow, on a piece nobody could yet call
+    /// stalled. There is no signal there. The peer is better sent to fetch
+    /// the next piece the stream needs.
+    #[test]
+    fn a_peer_with_nothing_to_show_for_itself_takes_no_second_copy() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+        let waited_on = piece(&tracker, 0);
+        let t0 = Instant::now();
+        for who in 1..=4 {
+            acquire_at(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                who,
+                Some(waited_on),
+                t0,
+            );
+        }
+
+        // A fresh peer, an hour later, with every claim still outstanding:
+        // it has still proved nothing about this piece.
+        assert_ne!(
+            reserved_piece(acquire_at(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                5,
+                Some(waited_on),
+                t0 + Duration::from_secs(3600),
+            )),
+            waited_on,
+            "a peer that has delivered none of this piece took a second copy of \
+             somebody else's claim, instead of fetching a piece nobody had"
+        );
+    }
+
+    /// **And a claim younger than the proof is not called slow.**
+    ///
+    /// A claim released by a peer that died is handed out again, and it
+    /// starts empty -- so by "what is missing" alone it is the most lagging
+    /// claim on the piece the instant it is taken, and the next peer to ask
+    /// would double it for having been asked late. The proof is a duration,
+    /// and the claim has to have had it.
+    #[test]
+    fn a_claim_handed_out_after_the_proof_is_not_doubled() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+        let waited_on = piece(&tracker, 0);
+        let t0 = Instant::now();
+        for who in 1..=4 {
+            acquire_at(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                who,
+                Some(waited_on),
+                t0,
+            );
+        }
+        deliver(&mut tracker, waited_on, 0..16);
+
+        // Every other claim is re-taken a moment before peer 1 comes back,
+        // so none of them has had the ten seconds peer 1 just proved.
+        // Everyone but peer 1, whose own claim is the proof.
+        let late = t0 + Duration::from_secs(10);
+        for participant in &mut tracker.inflight.get_mut(&waited_on).unwrap().participants {
+            if participant.peer != peer(1) {
+                participant.started = late - Duration::from_secs(1);
+            }
+        }
+
+        assert_ne!(
+            reserved_piece(acquire_at(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                1,
+                Some(waited_on),
+                late,
+            )),
+            waited_on,
+            "a claim younger than the proof was called slow"
         );
     }
 
@@ -1096,46 +1360,58 @@ mod tests {
     fn a_claim_already_on_disk_is_not_offered_for_duplication() {
         let (mut tracker, file_infos, priorities) = make_split_tracker_of(4, CLAIM_CHUNKS * 2);
         let waited_on = piece(&tracker, 0);
+        let t0 = Instant::now();
 
         assert_eq!(
-            claimed(acquire_as(
+            claimed(acquire_at(
                 &mut tracker,
                 &file_infos,
                 &priorities,
                 1,
-                Some(waited_on)
+                Some(waited_on),
+                t0
             )),
             0..16
         );
         assert_eq!(
-            claimed(acquire_as(
+            claimed(acquire_at(
                 &mut tracker,
                 &file_infos,
                 &priorities,
                 2,
-                Some(waited_on)
+                Some(waited_on),
+                t0
             )),
             16..32
         );
-        // Peer 1 delivers the whole of its claim.
+        // Peer 1 delivers the whole of its claim, in ten seconds, and
+        // comes back: its own claim is finished and retires, and what is
+        // left to double is the one that has delivered nothing.
         deliver(&mut tracker, waited_on, 0..16);
-
-        // Peer 3 doubles up on the claim that still has chunks missing.
         assert_eq!(
-            claimed(acquire_as(
+            claimed(acquire_at(
                 &mut tracker,
                 &file_infos,
                 &priorities,
-                3,
-                Some(waited_on)
+                1,
+                Some(waited_on),
+                t0 + Duration::from_secs(10),
             )),
             16..32
         );
 
-        // Peer 4 finds 16..32 at the cap and 0..16 finished. The piece has
-        // no work for it, so it goes and fetches the next one the stream
-        // needs.
-        match acquire_as(&mut tracker, &file_infos, &priorities, 4, Some(waited_on)) {
+        // And nothing is ever sent after a claim entirely on disk: peer 2
+        // finishes the piece, so there is nothing left of it to fetch and
+        // the next asker is sent elsewhere.
+        deliver(&mut tracker, waited_on, 16..32);
+        match acquire_at(
+            &mut tracker,
+            &file_infos,
+            &priorities,
+            2,
+            Some(waited_on),
+            t0 + Duration::from_secs(20),
+        ) {
             AcquireResult::Reserved { piece: got, chunks } => assert_ne!(
                 got, waited_on,
                 "a peer was sent to re-fetch a claim already on disk: {chunks:?}"
@@ -1145,45 +1421,50 @@ mod tests {
         }
     }
 
-    /// **The second peer goes to the claim with the most left to fetch, not
-    /// to the oldest.**
+    /// **A claim that is being fetched is not doubled, however little is
+    /// left of it.**
     ///
-    /// What gates a split piece is the work remaining on its slowest claim.
-    /// A claim that is fourteen chunks in and two from done is thirty-two
-    /// kilobytes away; its sibling that has delivered nothing is a quarter
-    /// of a megabyte away. Ranking on `started` picks between them by which
-    /// was handed out first, which is a few milliseconds apart -- every
-    /// peer on a split piece is woken by the same event -- and so picks the
-    /// nearly-finished one about half the time.
+    /// The rule is "delivered nothing", not "has the most left", and the
+    /// difference is the whole of what a second copy is for. A claim a
+    /// chunk into itself is a peer that is fetching: the piece is getting
+    /// those chunks either way, and a copy of them is bytes spent to arrive
+    /// at the same time. A claim with nothing on disk is the one that might
+    /// never arrive.
     #[test]
-    fn the_second_peer_goes_to_the_claim_with_the_most_left_to_fetch() {
+    fn a_claim_that_is_being_fetched_is_not_doubled() {
         let (mut tracker, file_infos, priorities) = make_split_tracker(4);
         let waited_on = piece(&tracker, 0);
-        for who in 1..=4 {
-            acquire_as(&mut tracker, &file_infos, &priorities, who, Some(waited_on));
-        }
-
-        // Ages spelled out rather than slept for, and built by adding to
-        // one instant: `Instant::now() - d` can be None early in a process.
         let t0 = Instant::now();
-        for (index, age) in [0u64, 1, 2, 3].into_iter().enumerate() {
-            tracker.inflight.get_mut(&waited_on).unwrap().participants[index].started =
-                t0 + Duration::from_secs(age);
-        }
-
-        // The oldest claim, peer 1's, is nearly in: fourteen of sixteen.
-        deliver(&mut tracker, waited_on, 0..14);
-
-        assert_eq!(
-            claimed(acquire_as(
+        for who in 1..=4 {
+            acquire_at(
                 &mut tracker,
                 &file_infos,
                 &priorities,
-                5,
-                Some(waited_on)
+                who,
+                Some(waited_on),
+                t0,
+            );
+        }
+
+        // Peer 1 finishes its claim, and every other claim on the piece is
+        // being fetched -- one chunk in, fifteen to go, which is the most
+        // left of anything here.
+        deliver(&mut tracker, waited_on, 0..16);
+        deliver(&mut tracker, waited_on, 16..17);
+        deliver(&mut tracker, waited_on, 32..33);
+        deliver(&mut tracker, waited_on, 48..49);
+
+        assert_ne!(
+            reserved_piece(acquire_at(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                1,
+                Some(waited_on),
+                t0 + Duration::from_secs(10),
             )),
-            16..32,
-            "the second copy went to the claim that is nearly done"
+            waited_on,
+            "the second copy went to a claim somebody was already fetching"
         );
     }
 
@@ -1336,6 +1617,7 @@ mod tests {
             peer: peer(2),
             connection: 0,
             peer_avg_time: Some(Duration::ZERO),
+            now: Instant::now(),
             priority_pieces: std::iter::empty(),
             file_priorities: &priorities,
             file_infos: &file_infos,
@@ -1360,45 +1642,82 @@ mod tests {
         }
     }
 
-    /// **The duplicates spread, and then they stop.**
+    /// **A second copy is paid for by a delivery, and the cap still binds.**
     ///
-    /// The cap is what spreads them: a claim that already has its second
-    /// peer is passed over, so free peers cover every claim once before any
-    /// gets a third copy -- and at
-    /// [`MAX_HOLDERS_PER_CLAIM`] the piece stops taking peers at all, so
-    /// the next one goes and fetches what the stream needs after this,
-    /// which is worth more than a third copy of what it already has twice.
+    /// A peer may double a claim only on the strength of a claim of its own
+    /// that it has just finished, and the finish is what retires -- so one
+    /// delivery buys one copy, and a peer cannot keep doubling on the same
+    /// evidence. On top of that [`MAX_HOLDERS_PER_CLAIM`] still binds: a
+    /// claim that already has its second peer is passed over, and a peer
+    /// that finds every candidate at the cap goes and fetches the next
+    /// piece the stream needs, which is worth more than a third copy of
+    /// this one.
     #[test]
-    fn duplicates_spread_across_the_claims_and_stop_at_the_cap() {
+    fn one_delivery_buys_one_copy_and_the_cap_still_binds() {
         let (mut tracker, file_infos, priorities) = make_split_tracker(4);
         let waited_on = piece(&tracker, 0);
+        let t0 = Instant::now();
         for who in 1..=4 {
-            acquire_as(&mut tracker, &file_infos, &priorities, who, Some(waited_on));
+            acquire_at(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                who,
+                Some(waited_on),
+                t0,
+            );
         }
 
-        let doubled: Vec<Range<u32>> = (5..=8)
-            .map(|who| {
-                claimed(acquire_as(
-                    &mut tracker,
-                    &file_infos,
-                    &priorities,
-                    who,
-                    Some(waited_on),
-                ))
-            })
-            .collect();
+        // Peers 1, 2 and 3 finish their claims; peer 4 has delivered
+        // nothing, so its claim is the only candidate.
+        deliver(&mut tracker, waited_on, 0..16);
+        deliver(&mut tracker, waited_on, 16..32);
+        deliver(&mut tracker, waited_on, 32..48);
+        let later = t0 + Duration::from_secs(10);
+
         assert_eq!(
-            doubled,
-            vec![0..16, 16..32, 32..48, 48..64],
-            "every claim gets its second peer before any gets a third"
+            claimed(acquire_at(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                1,
+                Some(waited_on),
+                later
+            )),
+            48..64,
+            "the one claim that has delivered nothing is the one doubled"
         );
 
-        // A ninth peer finds the piece full and takes a queued one instead.
-        match acquire_as(&mut tracker, &file_infos, &priorities, 9, Some(waited_on)) {
+        // Peer 2 has a delivery of its own to spend, and finds that claim
+        // already at the cap.
+        match acquire_at(
+            &mut tracker,
+            &file_infos,
+            &priorities,
+            2,
+            Some(waited_on),
+            later,
+        ) {
             AcquireResult::Reserved { piece: other, .. } => assert_ne!(
                 other, waited_on,
                 "the cap sends it to the next piece, not to a third copy"
             ),
+            other => panic!("expected a different piece, got {other:?}"),
+        }
+
+        // And peer 1 cannot double again: its finished claim retired when
+        // it spent it, and the one it holds now is not delivered.
+        match acquire_at(
+            &mut tracker,
+            &file_infos,
+            &priorities,
+            1,
+            Some(waited_on),
+            later,
+        ) {
+            AcquireResult::Reserved { piece: other, .. } => {
+                assert_ne!(other, waited_on, "a peer doubled twice on one delivery")
+            }
             other => panic!("expected a different piece, got {other:?}"),
         }
     }
@@ -1503,34 +1822,97 @@ mod tests {
     fn a_claim_its_other_holder_left_does_not_come_back_to_the_peer_fetching_it() {
         let (mut tracker, file_infos, priorities) = make_split_tracker(4);
         let waited_on = piece(&tracker, 0);
+        let t0 = Instant::now();
         for who in 1..=4 {
-            acquire_as(&mut tracker, &file_infos, &priorities, who, Some(waited_on));
-        }
-        // Peer 5 doubles up on peer 1's claim, which is the oldest.
-        assert_eq!(
-            claimed(acquire_as(
+            acquire_at(
                 &mut tracker,
                 &file_infos,
                 &priorities,
-                5,
-                Some(waited_on)
+                who,
+                Some(waited_on),
+                t0,
+            );
+        }
+        // Peer 2 finishes its own claim and spends it doubling peer 1's,
+        // which has delivered nothing.
+        deliver(&mut tracker, waited_on, 16..32);
+        let later = t0 + Duration::from_secs(10);
+        assert_eq!(
+            claimed(acquire_at(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                2,
+                Some(waited_on),
+                later
             )),
             0..16
         );
 
-        // Peer 5 is choked or dies. Peer 1 is still fetching 0..16.
-        assert_eq!(tracker.release_pieces_owned_by(peer(5), 0), 1);
+        // Peer 2 is choked or dies. Peer 1 is still fetching 0..16.
+        assert_eq!(tracker.release_pieces_owned_by(peer(2), 0), 1);
 
         assert_ne!(
-            claimed(acquire_as(
+            claimed(acquire_at(
                 &mut tracker,
                 &file_infos,
                 &priorities,
                 1,
-                Some(waited_on)
+                Some(waited_on),
+                later
             )),
             0..16,
             "peer 1 was handed back the claim it still has on the wire"
+        );
+    }
+
+    /// **The head of the lookahead is split; the rest is vanilla.**
+    ///
+    /// One depth decides both halves, because they are one question. A
+    /// piece a read is blocked on -- or about to block on -- is worth
+    /// several peers fetching it at once and worth a second copy of a
+    /// stalled claim. A piece further out has a whole piece of playback to
+    /// arrive in, so it goes to one peer as it did before the fork.
+    ///
+    /// **Handing the deeper ones whole is not only about what they cost.**
+    /// `steal_piece` refuses any piece with more than one participant, and
+    /// `on_piece_completed` credits a whole piece's bytes and elapsed time
+    /// to whichever peer delivered its last chunk -- so splitting every
+    /// piece of the lookahead turned off stealing across the whole of it
+    /// and made the only per-peer speed number there is meaningless exactly
+    /// where it was being used.
+    #[test]
+    fn only_the_head_of_the_lookahead_is_split() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(6);
+        let window: Vec<ValidPieceIndex> = (0..6).map(|id| piece(&tracker, id)).collect();
+        let t0 = Instant::now();
+
+        // One peer walks the window, taking a claim at a time. On a split
+        // piece it comes back for the rest of that piece; on an unsplit one
+        // the single claim is the whole piece and it moves on.
+        let mut reserved = Vec::new();
+        for _ in 0..12 {
+            reserved.push(reserved_piece(acquire_in_window(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                1,
+                &window,
+                t0,
+            )));
+        }
+
+        let claims_of = |id: usize| reserved.iter().filter(|p| **p == window[id]).count();
+        assert_eq!(
+            (claims_of(0), claims_of(1)),
+            (4, 4),
+            "the two pieces at the head are split into claims"
+        );
+        assert_eq!(
+            (claims_of(2), claims_of(3), claims_of(4), claims_of(5)),
+            (1, 1, 1, 1),
+            "a piece further out goes to one peer whole, as it did before there \
+             was any splitting"
         );
     }
 
@@ -1763,6 +2145,7 @@ mod tests {
             peer: peer(1),
             connection: 0,
             peer_avg_time: None,
+            now: Instant::now(),
             priority_pieces: priority.into_iter(),
             file_priorities,
             file_infos,
@@ -1962,6 +2345,7 @@ mod tests {
             peer: peer(1),
             connection: 0,
             peer_avg_time: None,
+            now: Instant::now(),
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
             file_infos: &file_infos,
@@ -1996,6 +2380,7 @@ mod tests {
             peer: peer(1),
             connection: 0,
             peer_avg_time: None,
+            now: Instant::now(),
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
             file_infos: &file_infos,
@@ -2025,6 +2410,7 @@ mod tests {
             peer: peer(1),
             connection: 0,
             peer_avg_time: None,
+            now: Instant::now(),
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
             file_infos: &file_infos,
@@ -2059,6 +2445,7 @@ mod tests {
             peer: peer(1),
             connection: 0,
             peer_avg_time: None,
+            now: Instant::now(),
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
             file_infos: &file_infos,
@@ -2088,6 +2475,7 @@ mod tests {
             peer: peer(2),
             connection: 0,
             peer_avg_time: None,
+            now: Instant::now(),
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
             file_infos: &file_infos,
@@ -2113,6 +2501,7 @@ mod tests {
             peer: peer(1),
             connection,
             peer_avg_time: None,
+            now: Instant::now(),
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
             file_infos: &file_infos,
@@ -2137,6 +2526,7 @@ mod tests {
             peer: peer(2),
             connection: 3,
             peer_avg_time: Some(Duration::ZERO),
+            now: Instant::now(),
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
             file_infos: &file_infos,
@@ -2171,6 +2561,7 @@ mod tests {
             peer: peer_a,
             connection: 0,
             peer_avg_time: None,
+            now: Instant::now(),
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
             file_infos: &file_infos,
@@ -2184,6 +2575,7 @@ mod tests {
             peer: peer_a,
             connection: 0,
             peer_avg_time: None,
+            now: Instant::now(),
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
             file_infos: &file_infos,
@@ -2199,6 +2591,7 @@ mod tests {
             peer: peer_b,
             connection: 0,
             peer_avg_time: None,
+            now: Instant::now(),
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
             file_infos: &file_infos,
@@ -2239,6 +2632,7 @@ mod tests {
             peer: peer(1),
             connection: 0,
             peer_avg_time: None,
+            now: Instant::now(),
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
             file_infos: &file_infos,
@@ -2249,6 +2643,7 @@ mod tests {
             peer: peer(1),
             connection: 0,
             peer_avg_time: None,
+            now: Instant::now(),
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
             file_infos: &file_infos,
@@ -2267,6 +2662,7 @@ mod tests {
             peer: peer(2),
             connection: 0,
             peer_avg_time: None,
+            now: Instant::now(),
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
             file_infos: &file_infos,
@@ -2306,6 +2702,7 @@ mod tests {
             peer: peer(1),
             connection: 0,
             peer_avg_time: None,
+            now: Instant::now(),
             priority_pieces: priority.into_iter(),
             file_priorities: &file_priorities,
             file_infos: &file_infos,
@@ -2333,6 +2730,7 @@ mod tests {
             peer: peer(1),
             connection: 0,
             peer_avg_time: None,
+            now: Instant::now(),
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
             file_infos: &file_infos,
@@ -2375,7 +2773,7 @@ mod tests {
         let file_priorities = make_default_file_priorities(&file_infos);
 
         // The incumbent is sitting on piece 0, and has been for an age by our standards.
-        tracker.reserve_piece(piece(&tracker, 0), peer(1), 0, false);
+        tracker.reserve_piece(piece(&tracker, 0), peer(1), 0, false, Instant::now());
         tracker
             .inflight
             .get_mut(&piece(&tracker, 0))
@@ -2387,6 +2785,7 @@ mod tests {
                 peer: peer(2),
                 connection: 0,
                 // Fast: the incumbent is a thousand times over the 10x bar.
+                now: Instant::now(),
                 peer_avg_time: Some(Duration::from_millis(600)),
                 priority_pieces: std::iter::empty(),
                 file_priorities: &file_priorities,
@@ -2427,13 +2826,14 @@ mod tests {
         let file_priorities = make_default_file_priorities(&file_infos);
 
         let stream_piece = piece(&tracker, 3);
-        tracker.reserve_piece(stream_piece, peer(1), 0, true);
+        tracker.reserve_piece(stream_piece, peer(1), 0, true, Instant::now());
         tracker.inflight.get_mut(&stream_piece).unwrap().started =
             Instant::now() - Duration::from_secs(600);
 
         let result = tracker.acquire_piece(AcquireRequest {
             peer: peer(2),
             connection: 0,
+            now: Instant::now(),
             peer_avg_time: Some(Duration::from_millis(600)),
             priority_pieces: std::iter::once(stream_piece),
             file_priorities: &file_priorities,
@@ -2441,24 +2841,29 @@ mod tests {
             peer_has_piece: |_| true,
             can_steal: |_| true,
         });
-        // It joins the piece rather than taking it. Duplicating beats
-        // stealing on the thing a stream is blocked on: a steal drops
-        // whatever the robbed peer already has in flight -- its own doc
-        // says so -- where a second copy races it and the first to arrive
-        // ends the piece. What the test is here for is unchanged: the free
+        // **It takes the piece rather than joining it**, which is what this
+        // did before there was any splitting. For a while it joined
+        // instead: a second copy races the dawdler where a steal drops
+        // whatever the dawdler has in flight. But joining was available to
+        // any peer that turned up, including one that had proved nothing
+        // about this piece, and that is what fetched the field's lookahead
+        // twice. A second copy is now paid for by a delivery of this very
+        // piece, which an arriving peer has not made -- so what is left for
+        // it is the steal, on the strength of what it has delivered
+        // elsewhere (`peer_avg_time`, ten times faster than the piece has
+        // been sitting there).
+        //
+        // What the test is here for is unchanged either way: the free
         // pieces elsewhere do not help the stream, and the peer must not go
         // and fetch one of those instead.
         match result {
-            AcquireResult::Reserved { piece, chunks } => {
+            AcquireResult::Stolen {
+                piece, from_peer, ..
+            } => {
                 assert_eq!(piece.get(), 3, "the piece the stream is waiting on");
-                assert_eq!(chunks, 0..1);
-                assert_eq!(
-                    tracker.participants(stream_piece).len(),
-                    2,
-                    "both peers are on it now, and the dawdler keeps what it fetched"
-                );
+                assert_eq!(from_peer, peer(1));
             }
-            other => panic!("expected to join the stream's piece, got {other:?}"),
+            other => panic!("expected the stream's piece to be stolen, got {other:?}"),
         }
     }
 
@@ -2483,6 +2888,7 @@ mod tests {
             peer: peer_a,
             connection: 0,
             peer_avg_time: None,
+            now: Instant::now(),
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
             file_infos: &file_infos,
@@ -2500,6 +2906,7 @@ mod tests {
             peer: peer_a,
             connection: 0,
             peer_avg_time: None,
+            now: Instant::now(),
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,
             file_infos: &file_infos,
@@ -2522,6 +2929,7 @@ mod tests {
         let result = tracker.acquire_piece(AcquireRequest {
             peer: peer_b,
             connection: 0,
+            now: Instant::now(),
             peer_avg_time: Some(Duration::from_millis(1)),
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,

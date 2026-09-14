@@ -2261,6 +2261,9 @@ impl PeerHandler {
                     peer: self.addr,
                     connection: self.connection,
                     peer_avg_time: self.counters.average_piece_download_time(),
+                    // The one reading of the clock on this path; see
+                    // `AcquireRequest::now`.
+                    now: std::time::Instant::now(),
                     priority_pieces: self.state.streams.iter_next_pieces(&self.state.lengths),
                     file_priorities,
                     file_infos: &self.state.metadata.file_infos,
@@ -3477,9 +3480,8 @@ mod connection_tests {
             peer_rxs.push(rx);
         }
 
-        // Peer 1 takes both claims of the piece, so it alone can finish it;
-        // peer 2 doubles up on the first, which is what the tail of every
-        // split piece does.
+        // The two peers take a claim each, which is what a split piece is:
+        // two writers on one piece, which is the thing this test is about.
         let take = |addr: SocketAddr| -> anyhow::Result<Range<u32>> {
             let mut g = live.lock_write("test");
             let TorrentStateLocked {
@@ -3491,6 +3493,7 @@ mod connection_tests {
             match pieces.acquire_piece(crate::piece_tracker::AcquireRequest {
                 peer: addr,
                 connection: 0,
+                now: std::time::Instant::now(),
                 peer_avg_time: None,
                 priority_pieces: std::iter::once(target),
                 file_priorities,
@@ -3506,12 +3509,7 @@ mod connection_tests {
             }
         };
         assert_eq!(take(addrs[0])?, 0..16);
-        assert_eq!(take(addrs[0])?, 16..32);
-        assert_eq!(
-            take(addrs[1])?,
-            0..16,
-            "peer 2 doubles up on the older claim"
-        );
+        assert_eq!(take(addrs[1])?, 16..32);
 
         let chunks: Vec<ChunkInfo> = live.lengths.iter_chunk_infos(target).collect();
         assert_eq!(chunks.len(), CHUNKS_PER_PIECE as usize);
@@ -3687,6 +3685,7 @@ mod connection_tests {
                 match pieces.acquire_piece(crate::piece_tracker::AcquireRequest {
                     peer: addr,
                     connection: 0,
+                    now: std::time::Instant::now(),
                     peer_avg_time: None,
                     priority_pieces: std::iter::once(target),
                     file_priorities,
