@@ -224,11 +224,20 @@ pub struct InflightPiece {
 impl InflightPiece {
     /// The first participant, with the rest of the piece left unclaimed
     /// when `split`, or claimed whole when not.
+    ///
+    /// **A claim already on disk is nobody's to take.** A piece put back
+    /// with its chunk marks kept (`Chunks::Keep`: a release that broke
+    /// nothing, a pause) comes here with some of its claims entirely
+    /// landed. Handed out, such a claim costs its holder a trip round the
+    /// request loop to find nothing to ask for; left in the pool, it would
+    /// be that trip for every peer in turn. So claims with nothing
+    /// `missing` are never made.
     fn new(
         peer: PeerHandle,
         connection: u64,
         chunks_in_piece: u32,
         split: bool,
+        missing: impl Fn(&Range<u32>) -> u32,
         now: Instant,
     ) -> (Self, Range<u32>) {
         let mut unclaimed = VecDeque::new();
@@ -236,7 +245,9 @@ impl InflightPiece {
             let mut start = 0;
             while start < chunks_in_piece {
                 let end = (start + CLAIM_CHUNKS).min(chunks_in_piece);
-                unclaimed.push_back(start..end);
+                if missing(&(start..end)) > 0 {
+                    unclaimed.push_back(start..end);
+                }
                 start = end;
             }
             unclaimed.pop_front().unwrap_or(0..chunks_in_piece)
@@ -828,7 +839,15 @@ impl PieceTracker {
     ) -> AcquireResult {
         self.chunks.reserve_needed_piece(piece);
         let chunks_in_piece = self.chunks.get_lengths().chunks_per_piece(piece);
-        let (inflight, chunks) = InflightPiece::new(peer, connection, chunks_in_piece, split, now);
+        let tracker = &self.chunks;
+        let (inflight, chunks) = InflightPiece::new(
+            peer,
+            connection,
+            chunks_in_piece,
+            split,
+            |claim| tracker.chunks_missing(piece, claim),
+            now,
+        );
         self.inflight.insert(piece, inflight);
         AcquireResult::Reserved { piece, chunks }
     }
@@ -1827,6 +1846,45 @@ mod tests {
             AcquireResult::NoneAvailable => panic!("the other pieces are still free"),
             other => panic!("expected a reservation elsewhere, got {other:?}"),
         }
+    }
+
+    /// **A piece that comes back with chunks on disk is not split over
+    /// them.**
+    ///
+    /// A pause, or a release that broke nothing, puts a piece back in the
+    /// queue with its chunk marks kept. Split again at the head, its first
+    /// claims are then entirely landed -- and the first peer to reserve it
+    /// was handed one, requested nothing of it, and came round for another;
+    /// every peer after found the next such claim in the pool. The claims
+    /// made are the ones with something left to fetch.
+    #[test]
+    fn a_piece_that_comes_back_with_chunks_on_disk_is_not_split_over_them() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(1);
+        let waited_on = piece(&tracker, 0);
+        // The first claim and a half landed before the piece went back.
+        deliver(&mut tracker, waited_on, 0..24);
+
+        assert_eq!(
+            claimed(acquire_as(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                1,
+                Some(waited_on)
+            )),
+            16..32,
+            "the first peer was handed a claim entirely on disk"
+        );
+        assert_eq!(
+            claimed(acquire_as(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                2,
+                Some(waited_on)
+            )),
+            32..48
+        );
     }
 
     /// **A claim that is being fetched is not doubled, however little is

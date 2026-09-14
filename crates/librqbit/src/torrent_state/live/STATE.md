@@ -96,10 +96,14 @@ QUEUED → IN_FLIGHT → COMPLETED
 
 ### Split Pieces
 
-A piece a stream is parked on is divided into claims of `CLAIM_CHUNKS`, and
-several peers hold one each: the wire asks for chunks, and `chunk_status`
-records them globally, so two peers filling different chunks of one piece
-was always safe. Only `inflight` made it exclusive.
+The two pieces at the head of a stream's lookahead (`DEADLINE_PIECES`) are
+divided into claims of `CLAIM_CHUNKS`, and several peers hold one each: the
+wire asks for chunks, and `chunk_status` records them globally, so two peers
+filling different chunks of one piece was always safe. Only `inflight` made
+it exclusive. Every deeper piece is reserved whole to one peer, as before,
+and a whole piece the stream reaches is cut at the head (`split_whole`).
+Who may take over whose work -- cutting, doubling, taking a share beyond
+`CLAIMS_PER_PEER` -- is one comparison, written up in `CLAIMS.md`.
 
 This changes three of the invariants below:
 
