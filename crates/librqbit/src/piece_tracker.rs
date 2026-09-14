@@ -42,6 +42,25 @@ use crate::{
 /// the field while seventeen seeders were turned away from it.
 const CLAIM_CHUNKS: u32 = 16;
 
+/// How many claims of one piece a single peer may hold while other peers
+/// could be taking them.
+///
+/// **A peer comes back for another claim when it has *sent* the last one's
+/// requests, not when they have arrived.** Its window is
+/// `DEFAULT_PEER_REQUEST_WINDOW` -- 128 chunks against a 16-chunk claim --
+/// so without this one peer takes eight claims in a few milliseconds and
+/// two peers take all sixteen of a 4 MiB piece. The piece is then "the
+/// slowest of two", which is the thing splitting exists to prevent: the
+/// field of 2026-09-14 blocked 13.4 s on one piece while the swarm was
+/// delivering 12-16 MB/s from seventeen seeders.
+///
+/// **It is a preference and not a limit.** A claim nobody else will take
+/// is worse than a claim taken twice by one peer, so a peer that finds
+/// nothing else in the whole lookahead comes back and takes it anyway
+/// ([`InflightPiece::take_unclaimed`]); a piece held by three peers is
+/// fetched by three peers rather than stalling for want of an eighth.
+const CLAIMS_PER_PEER: usize = 2;
+
 /// How many peers may hold the same claim at once.
 ///
 /// Splitting converts "one peer's speed" into "the slowest of N peers'
@@ -212,8 +231,16 @@ impl InflightPiece {
             }
             !finished
         });
-        let chunks = match self.unclaimed.pop_front() {
-            Some(chunks) => chunks,
+        let chunks = match self.unclaimed.front() {
+            // Room for this peer on this piece, so take the next share.
+            Some(_) if self.held_by(peer) < CLAIMS_PER_PEER => {
+                self.unclaimed.pop_front().expect("front() just answered")
+            }
+            // There is work here, but this peer has its share of it and
+            // other peers could be taking the rest. The caller keeps the
+            // piece in hand and comes back for it if the whole lookahead
+            // turns out to have nothing else; see [`CLAIMS_PER_PEER`].
+            Some(_) => return None,
             None if share == Share::Unclaimed => return None,
             None => self.lagging_claim(peer, missing, proven?, now)?,
         };
@@ -309,6 +336,38 @@ impl InflightPiece {
             }
         }
         best.map(|(_, _, chunks)| chunks)
+    }
+
+    /// How many claims of this piece `peer` holds.
+    fn held_by(&self, peer: PeerHandle) -> usize {
+        self.participants.iter().filter(|p| p.peer == peer).count()
+    }
+
+    /// Whether any share of this piece is unclaimed.
+    fn has_unclaimed(&self) -> bool {
+        !self.unclaimed.is_empty()
+    }
+
+    /// The next unclaimed share, whatever [`CLAIMS_PER_PEER`] says.
+    ///
+    /// The way out of the preference: a peer that walked the whole
+    /// lookahead and found nothing it was allowed to take comes here rather
+    /// than idling, because a claim nobody fetches is worse than a piece
+    /// fetched by fewer peers than it could be.
+    fn take_unclaimed(
+        &mut self,
+        peer: PeerHandle,
+        connection: u64,
+        now: Instant,
+    ) -> Option<Range<u32>> {
+        let chunks = self.unclaimed.pop_front()?;
+        self.participants.push(Participant {
+            peer,
+            connection,
+            chunks: chunks.clone(),
+            started: now,
+        });
+        Some(chunks)
     }
 
     /// Whether this peer already has a share.
@@ -505,6 +564,11 @@ impl PieceTracker {
         // have, or that is being hash-checked, is not a piece the reader is
         // waiting on us for.
         let mut deep = 0usize;
+        // The nearest piece whose remaining shares this peer is over its
+        // share of. Kept in hand rather than taken, because another peer
+        // taking them is worth a round trip -- and taken after all, below,
+        // if the lookahead turns out to hold nothing else.
+        let mut crowded: Option<ValidPieceIndex> = None;
         for piece in &mut req.priority_pieces {
             if self.chunks.is_piece_have(piece)
                 || self.chunks.is_releasing(piece)
@@ -572,6 +636,11 @@ impl PieceTracker {
                     ) {
                         return AcquireResult::Reserved { piece, chunks };
                     }
+                    // Work this peer is allowed to take only if the
+                    // lookahead has nothing else; see [`CLAIMS_PER_PEER`].
+                    if crowded.is_none() && inflight.has_unclaimed() {
+                        crowded = Some(piece);
+                    }
                     if held_priority_piece.is_none() && !inflight.has_peer(req.peer) {
                         held_priority_piece = Some(piece);
                     }
@@ -579,6 +648,17 @@ impl PieceTracker {
             }
             deep += 1;
         }
+        // **Before stealing**: an unclaimed share is free where a steal
+        // drops whatever the robbed peer has in flight. This is the piece
+        // the peer passed over to give other peers a chance at it, and
+        // nothing in the lookahead wanted it instead.
+        if let Some(piece) = crowded
+            && let Some(inflight) = self.inflight.get_mut(&piece)
+            && let Some(chunks) = inflight.take_unclaimed(req.peer, req.connection, req.now)
+        {
+            return AcquireResult::Reserved { piece, chunks };
+        }
+
         if let Some(piece) = held_priority_piece
             && let Some(result) = self.steal_piece(&req, piece, 10.0)
         {
@@ -1863,6 +1943,81 @@ mod tests {
             )),
             0..16,
             "peer 1 was handed back the claim it still has on the wire"
+        );
+    }
+
+    /// **One peer does not take a whole split piece while other peers
+    /// could be helping with it.**
+    ///
+    /// A peer comes back for another claim when it has *sent* the last
+    /// one's requests, not when they have arrived, and its window is eight
+    /// claims wide -- so two peers took all sixteen claims of a 4 MiB piece
+    /// within milliseconds and the piece was back to "the slowest of two".
+    /// The field of 2026-09-14 blocked 13.4 s on one piece while the swarm
+    /// delivered 12-16 MB/s from seventeen seeders; every other blocked
+    /// read in that log was under three seconds.
+    ///
+    /// So a peer takes its share and goes to fetch the next piece the
+    /// stream needs, which is work either way.
+    #[test]
+    fn a_peer_takes_its_share_of_a_piece_and_moves_on() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+        let window: Vec<ValidPieceIndex> = (0..2).map(|id| piece(&tracker, id)).collect();
+        let t0 = Instant::now();
+        let mut take = |tracker: &mut PieceTracker| {
+            reserved_piece(acquire_in_window(
+                tracker,
+                &file_infos,
+                &priorities,
+                1,
+                &window,
+                t0,
+            ))
+        };
+
+        assert_eq!(take(&mut tracker), window[0]);
+        assert_eq!(
+            take(&mut tracker),
+            window[0],
+            "its share is more than one claim"
+        );
+        assert_eq!(
+            take(&mut tracker),
+            window[1],
+            "one peer took a third claim of a piece other peers could be helping with"
+        );
+    }
+
+    /// **And takes the rest anyway when there is nothing else to do.**
+    ///
+    /// The spreading above is a preference, not a limit. A claim nobody
+    /// fetches is worse than a claim taken by a peer that already has two
+    /// of them: a piece three peers have must be fetched by three peers
+    /// rather than stalling for want of an eighth. So the shares a peer
+    /// passed over are what it comes back to when the whole lookahead --
+    /// and the steal after it -- has turned up nothing.
+    #[test]
+    fn the_shares_it_passed_over_are_what_it_comes_back_to() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+        let alone = [piece(&tracker, 0)];
+        let t0 = Instant::now();
+
+        let mut taken = Vec::new();
+        for _ in 0..4 {
+            taken.push(claimed(acquire_in_window(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                1,
+                &alone,
+                t0,
+            )));
+        }
+
+        assert_eq!(
+            taken,
+            vec![0..16, 16..32, 32..48, 48..64],
+            "a peer with nowhere else to go left shares of this piece unfetched"
         );
     }
 
