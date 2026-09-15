@@ -69,38 +69,32 @@ const CLAIM_CHUNKS: u32 = 16;
 /// never does, so the first visitor took every share within a millisecond.
 const CLAIMS_PER_PEER: usize = 2;
 
-/// What a peer has been doing lately, beside what it asks for. Read off the
-/// live peer by the request loop and handed in with the request
-/// ([`AcquireRequest::last_delivery`], [`AcquireRequest::last_latency`]).
-/// The asker's half of the one comparison in `CLAIMS.md`.
+/// What a peer has to show for itself: the latency of its own last
+/// chunk, read off the live peer by the request loop and handed in with
+/// the request ([`AcquireRequest::last_latency`]). The asker's half of the
+/// one comparison in `CLAIMS.md`.
 #[derive(Debug, Clone, Copy)]
 struct Activity {
-    /// When a chunk this peer asked for last arrived; `None` before the
-    /// first.
-    last_delivery: Option<Instant>,
-    /// How long that chunk took, request to arrival; `None` before the
-    /// first.
+    /// How long this peer's most recent chunk took, request to arrival;
+    /// `None` before the first.
     last_latency: Option<Duration>,
 }
 
 impl Activity {
-    /// Whether this peer has delivered a chunk since `since` -- what says a
-    /// peer is draining its window rather than merely coming round its
-    /// request loop again.
-    fn delivered_since(&self, since: Instant) -> bool {
-        self.last_delivery.is_some_and(|at| at > since)
-    }
-
-    /// **The one comparison.** Whether this peer may take over work
-    /// `holder` holds: its last chunk took less time than we have now been
-    /// waiting on the holder -- since the holder last delivered on this
-    /// piece, or since it was asked if it never has. *Had I been asked when
-    /// they were, I would have delivered by now, and they have not.* A
-    /// holder that delivered a moment ago is untouchable; one silent for
-    /// seconds loses to any live peer; a peer that has never delivered
-    /// outpaces nobody.
-    fn outpaces(&self, holder: &Participant, now: Instant) -> bool {
-        let waited = now.saturating_duration_since(holder.last_delivery.unwrap_or(holder.started));
+    /// **The one comparison.** Whether this peer may take over work on a
+    /// piece the swarm has been at since `since`: its last chunk took less
+    /// time than the piece has been in flight. *Had I been asked when this
+    /// piece was, I would have delivered by now, and it is not done.* A
+    /// piece reserved a moment ago is nobody's to cut, double or share
+    /// beyond one's own; one that has been in flight for seconds loses to
+    /// any live peer; a peer that has never delivered outpaces nothing.
+    ///
+    /// The piece's age and not the holder's last delivery: a holder with
+    /// seconds of latency and a hundred requests in flight lands a chunk
+    /// every few milliseconds and never looked quiet, while its piece took
+    /// ten seconds. What the reader waits on is the piece.
+    fn outpaces(&self, since: Instant, now: Instant) -> bool {
+        let waited = now.saturating_duration_since(since);
         self.last_latency.is_some_and(|latency| latency < waited)
     }
 }
@@ -220,13 +214,10 @@ pub struct InflightPiece {
     participants: Vec<Participant>,
     /// Claims nobody has taken yet, in ascending order.
     unclaimed: VecDeque<Range<u32>>,
-    /// When the first participant started, which is how long the piece has
-    /// been in flight for the steal rule.
+    /// When the first participant started: how long the piece has been in
+    /// flight, which is what every takeover on it is measured against
+    /// ([`Activity::outpaces`]) and what the steal rule reads.
     started: Instant,
-    /// When a share of this piece was last handed to anyone. A peer over
-    /// its share takes another only if it has delivered a chunk since --
-    /// see [`CLAIMS_PER_PEER`].
-    last_handout: Instant,
 }
 
 impl InflightPiece {
@@ -274,7 +265,6 @@ impl InflightPiece {
                 }],
                 unclaimed,
                 started,
-                last_handout: now,
             },
             first,
         )
@@ -321,13 +311,15 @@ impl InflightPiece {
                 self.unclaimed.pop_front().expect("front() just answered")
             }
             // **Over its share, and somebody else may be coming for the
-            // rest.** The share is this peer's if it has delivered a chunk
-            // since the last one went out -- it is draining its window and
-            // nobody else has turned up. Otherwise it is round its loop
-            // again and nothing more, and it is sent to look elsewhere; see
-            // [`CLAIMS_PER_PEER`].
+            // rest.** The share is this peer's if the piece has been in
+            // flight longer than its own last chunk took: had the others
+            // been coming they would have taken it by now. Twenty peers
+            // arriving within milliseconds find a piece younger than any
+            // of their round trips and spread it; three peers leave shares
+            // in the pool, and whoever returns half a second later takes
+            // them. See [`CLAIMS_PER_PEER`].
             Some(_) => {
-                if !activity.delivered_since(self.last_handout) {
+                if !activity.outpaces(self.started, now) {
                     return Err(Crowded);
                 }
                 self.unclaimed.pop_front().expect("front() just answered")
@@ -338,7 +330,6 @@ impl InflightPiece {
                 None => return Ok(None),
             },
         };
-        self.last_handout = now;
         self.participants.push(Participant {
             peer,
             connection,
@@ -388,12 +379,13 @@ impl InflightPiece {
         activity: Activity,
         now: Instant,
     ) -> bool {
+        let since = self.started;
         let [holder] = self.participants.as_mut_slice() else {
             return false;
         };
         if !self.unclaimed.is_empty()
             || holder.chunks.end.saturating_sub(holder.chunks.start) <= CLAIM_CHUNKS
-            || !activity.outpaces(holder, now)
+            || !activity.outpaces(since, now)
         {
             return false;
         }
@@ -445,7 +437,7 @@ impl InflightPiece {
         let mut best: Option<(u32, Instant, Range<u32>)> = None;
         for candidate in &self.participants {
             let left = missing(&candidate.chunks);
-            if left == 0 || !activity.outpaces(candidate, now) {
+            if left == 0 || !activity.outpaces(self.started, now) {
                 continue;
             }
             let (count, mine) = self
@@ -579,10 +571,6 @@ where
     pub connection: u64,
     /// The peer's average piece download time (for steal calculations).
     pub peer_avg_time: Option<Duration>,
-    /// When a chunk this peer asked for last arrived, or `None` before the
-    /// first: what says a peer is delivering rather than merely asking. See
-    /// [`CLAIMS_PER_PEER`] and [`InflightPiece::split_whole`].
-    pub last_delivery: Option<Instant>,
     /// How long this peer's most recently arrived chunk took, request to
     /// arrival, or `None` before the first: its side of the one comparison
     /// that lets it take over another peer's work (`CLAIMS.md`).
@@ -707,7 +695,6 @@ impl PieceTracker {
         // asking again if nothing else turns up; see [`CLAIMS_PER_PEER`].
         let mut crowded = false;
         let activity = Activity {
-            last_delivery: req.last_delivery,
             last_latency: req.last_latency,
         };
         for piece in &mut req.priority_pieces {
@@ -934,7 +921,6 @@ impl PieceTracker {
             last_delivery: None,
         };
         info.started = req.now;
-        info.last_handout = req.now;
 
         Some(AcquireResult::Stolen {
             piece,
@@ -1345,7 +1331,6 @@ mod tests {
             &window,
             now,
             None,
-            None,
         )
     }
 
@@ -1369,15 +1354,12 @@ mod tests {
             who,
             &window,
             now,
-            None,
             Some(latency),
         )
     }
 
-    /// The general form: a peer that last had a chunk land at
-    /// `last_delivery`, `last_latency` after asking for it, asking with
-    /// `window` as the stream's lookahead at `now`.
-    #[allow(clippy::too_many_arguments)]
+    /// The general form: a peer whose last chunk took `last_latency`,
+    /// asking with `window` as the stream's lookahead at `now`.
     fn acquire_with(
         tracker: &mut PieceTracker,
         file_infos: &FileInfos,
@@ -1385,14 +1367,12 @@ mod tests {
         who: u8,
         window: &[ValidPieceIndex],
         now: Instant,
-        last_delivery: Option<Instant>,
         last_latency: Option<Duration>,
     ) -> AcquireResult {
         tracker.acquire_piece(AcquireRequest {
             peer: peer(who),
             connection: 0,
             peer_avg_time: None,
-            last_delivery,
             last_latency,
             now,
             priority_pieces: window.iter().copied(),
@@ -1414,16 +1394,7 @@ mod tests {
         window: &[ValidPieceIndex],
         now: Instant,
     ) -> AcquireResult {
-        acquire_with(
-            tracker,
-            file_infos,
-            file_priorities,
-            who,
-            window,
-            now,
-            None,
-            None,
-        )
+        acquire_with(tracker, file_infos, file_priorities, who, window, now, None)
     }
 
     fn reserved_piece(result: AcquireResult) -> ValidPieceIndex {
@@ -1488,22 +1459,23 @@ mod tests {
         );
     }
 
-    /// **A peer alone on a piece covers all of it, a delivery at a time.**
+    /// **A peer alone covers the piece, a share at a time, once the piece is
+    /// older than its own round trip.**
     ///
-    /// The piece cannot complete otherwise: claims are cut at reservation,
-    /// and the request loop sends every chunk of a claim as soon as it has
-    /// one, so a piece split four ways with one peer on it has three claims
-    /// nobody is fetching. What that peer is asked for, beyond its own
-    /// share, is a chunk landed since the last share went out -- proof it
-    /// is draining its window, and the moment at which nobody else having
-    /// come means nobody else is coming.
+    /// Two shares come freely. Beyond that a share is this peer's only if
+    /// the piece has been in flight longer than its last chunk took: had
+    /// other peers been coming for the pool, they would have taken it by
+    /// then. So a peer coming straight round its loop on a fresh piece is
+    /// sent to look elsewhere, and the same peer half a second later takes
+    /// the rest, share by share.
     #[test]
-    fn a_peer_alone_covers_the_piece_a_delivery_at_a_time() {
+    fn a_peer_alone_covers_the_piece_a_share_at_a_time() {
         let (mut tracker, file_infos, priorities) = make_split_tracker(1);
         let waited_on = piece(&tracker, 0);
         let t0 = Instant::now();
         let ms = |n: u64| t0 + Duration::from_millis(n);
-        let ask = |tracker: &mut PieceTracker, now: Instant, delivered: Option<Instant>| {
+        let latency = Some(Duration::from_millis(300));
+        let ask = |tracker: &mut PieceTracker, now: Instant| {
             acquire_with(
                 tracker,
                 &file_infos,
@@ -1511,30 +1483,23 @@ mod tests {
                 1,
                 &[waited_on],
                 now,
-                delivered,
-                None,
+                latency,
             )
         };
 
-        assert_eq!(claimed(ask(&mut tracker, t0, None)), 0..16);
-        assert_eq!(claimed(ask(&mut tracker, t0, None)), 16..32);
+        assert_eq!(claimed(ask(&mut tracker, t0)), 0..16);
+        assert_eq!(claimed(ask(&mut tracker, t0)), 16..32);
         assert!(
-            matches!(ask(&mut tracker, ms(1), None), AcquireResult::Crowded),
-            "over its share and nothing landed since: round its loop again, no more"
+            matches!(ask(&mut tracker, ms(100)), AcquireResult::Crowded),
+            "over its share on a piece younger than its own round trip: others may be coming"
         );
         assert_eq!(
-            claimed(ask(&mut tracker, ms(2), Some(ms(1)))),
+            claimed(ask(&mut tracker, ms(400))),
             32..48,
-            "a chunk landed since the last share went out, and nobody else came"
+            "the piece has now been in flight longer than this peer's last chunk took, \
+             and nobody else came"
         );
-        assert!(
-            matches!(
-                ask(&mut tracker, ms(3), Some(ms(1))),
-                AcquireResult::Crowded
-            ),
-            "that delivery was spent on the share it bought"
-        );
-        assert_eq!(claimed(ask(&mut tracker, ms(4), Some(ms(3)))), 48..64);
+        assert_eq!(claimed(ask(&mut tracker, ms(500))), 48..64);
     }
 
     /// **A peer that outpaces a holder doubles up on its claim.**
@@ -1637,19 +1602,14 @@ mod tests {
         );
     }
 
-    /// **A holder we have waited on for less than the asker's own latency
-    /// is left alone.**
+    /// **A piece younger than the asker's own latency is left alone.**
     ///
-    /// The comparison is *latency < waited*, and the second half of it is
-    /// what keeps a claim from being doubled for having been asked late. A
-    /// claim released by a peer that died is handed out again and starts
-    /// empty -- by "what is missing" alone it is the most stalled claim on
-    /// the piece the instant it is taken. But we have waited on its new
-    /// holder for a moment, and the asker's last chunk took longer than
-    /// that: had the asker been asked instead, it would not have delivered
-    /// yet either.
+    /// The comparison is *latency < the piece's age*, and the second half
+    /// is what keeps a fresh piece from being doubled, cut or over-shared
+    /// by a peer that has merely come round its loop. Had the asker been
+    /// asked when the piece was, it would not have delivered yet either.
     #[test]
-    fn a_holder_not_yet_waited_on_for_the_askers_latency_is_left_alone() {
+    fn a_piece_younger_than_the_askers_latency_is_left_alone() {
         let (mut tracker, file_infos, priorities) = make_split_tracker(4);
         let waited_on = piece(&tracker, 0);
         let t0 = Instant::now();
@@ -1665,15 +1625,8 @@ mod tests {
         }
         deliver(&mut tracker, waited_on, 0..16);
 
-        // Every other claim is re-taken fifty milliseconds before peer 1
-        // comes back, and peer 1's chunks take a hundred.
-        let late = t0 + Duration::from_secs(10);
-        for participant in &mut tracker.inflight.get_mut(&waited_on).unwrap().participants {
-            if participant.peer != peer(1) {
-                participant.started = late - Duration::from_millis(50);
-            }
-        }
-
+        // Fifty milliseconds in, peer 1's chunks take a hundred: the other
+        // claims are nobody's to double yet, and peer 1 goes elsewhere.
         assert_ne!(
             reserved_piece(acquire_fast(
                 &mut tracker,
@@ -1681,32 +1634,30 @@ mod tests {
                 &priorities,
                 1,
                 Some(waited_on),
-                late,
+                t0 + Duration::from_millis(50),
                 Duration::from_millis(100),
             )),
             waited_on,
-            "a holder asked more recently than the asker's own latency was doubled"
+            "a claim on a fifty-millisecond-old piece was doubled by a peer whose \
+             chunks take a hundred"
         );
     }
 
-    /// **A holder busy delivering its earlier claim is not stalled on its
-    /// next.**
+    /// **A holder's own deliveries do not shield its claims.**
     ///
-    /// The wait is measured from the holder's last delivery *on this
-    /// piece*, not from when the claim was handed out. A peer with two
-    /// claims requests them in order, so its second claim has nothing on
-    /// disk while the first is landing -- but a chunk of the first landed
-    /// a moment ago, and that is the holder delivering, not stalling. Read
-    /// from the claim's own start it would be doubled the instant a faster
-    /// peer came by, and every peer two claims into a piece would be
-    /// doubled on its second.
+    /// The piece's age is what a takeover is measured against, not how
+    /// recently the holder landed a chunk. A holder with seconds of latency
+    /// and a hundred requests in flight lands a chunk every few
+    /// milliseconds and would never have looked quiet, while its piece
+    /// took ten seconds -- the field's 24 and 30 seconds on a head piece
+    /// with a fast swarm. On a ten-second-old piece, a claim that still has
+    /// chunks missing is doubled whatever its holder did fifty milliseconds
+    /// ago.
     #[test]
-    fn a_holder_busy_delivering_its_earlier_claim_is_not_stalled_on_its_next() {
+    fn a_holders_own_deliveries_do_not_shield_its_claims() {
         let (mut tracker, file_infos, priorities) = make_split_tracker(4);
         let waited_on = piece(&tracker, 0);
         let t0 = Instant::now();
-        // Peer 1 takes two claims; peers 2 and 3 take the other two and
-        // finish them fast, so nothing of the piece is free.
         for who in [1u8, 1, 2, 3] {
             acquire_at(
                 &mut tracker,
@@ -1718,10 +1669,6 @@ mod tests {
             );
         }
         deliver(&mut tracker, waited_on, 32..64);
-
-        // Ten seconds in, peer 1 is still landing its first claim: its
-        // latest chunk arrived fifty milliseconds ago. Its second claim is
-        // empty and was handed out ten seconds ago.
         let later = t0 + Duration::from_secs(10);
         delivered_by(
             &mut tracker,
@@ -1731,8 +1678,8 @@ mod tests {
             later - Duration::from_millis(50),
         );
 
-        assert_ne!(
-            reserved_or_none(acquire_fast(
+        assert_eq!(
+            claimed(acquire_fast(
                 &mut tracker,
                 &file_infos,
                 &priorities,
@@ -1741,8 +1688,9 @@ mod tests {
                 later,
                 Duration::from_millis(100),
             )),
-            Some(waited_on),
-            "peer 1's second claim was doubled while peer 1 was delivering its first"
+            16..32,
+            "on a ten-second-old piece the claim with the most missing is doubled, \
+             whatever its holder landed a moment ago"
         );
     }
 
@@ -1911,19 +1859,15 @@ mod tests {
         );
     }
 
-    /// **A claim whose holder delivered a moment ago is not doubled; the
-    /// same claim gone quiet is, whatever it has delivered.**
+    /// **A claim on a piece older than the asker's latency is doubled,
+    /// whatever it has delivered.**
     ///
-    /// The rule is the one rule: the asker's last chunk took less time
-    /// than we have waited on the holder's last delivery. A holder with a
-    /// window of requests out lands a chunk every few milliseconds and is
-    /// never outpaced; a holder trickling a chunk a second is, between its
-    /// chunks, and gets a second copy however many it has landed. A first
-    /// version refused any claim with a chunk on disk as "being fetched",
-    /// and the field's 24- and 30-second blocked reads were tricklers
-    /// nobody was allowed to rescue.
+    /// The one rule: the asker's last chunk took less time than the piece
+    /// has been in flight. A first version refused any claim with a chunk
+    /// on disk as "being fetched", and the field's 24- and 30-second
+    /// blocked reads were slow holders nobody was allowed to rescue.
     #[test]
-    fn a_claim_is_doubled_when_its_holder_is_outpaced_whatever_it_has_delivered() {
+    fn a_claim_on_an_old_piece_is_doubled_whatever_it_has_delivered() {
         let (mut tracker, file_infos, priorities) = make_split_tracker(4);
         let waited_on = piece(&tracker, 0);
         let t0 = Instant::now();
@@ -1938,35 +1882,10 @@ mod tests {
             );
         }
         deliver(&mut tracker, waited_on, 0..16);
-        // Every other holder landed a chunk fifty milliseconds ago.
-        let ten = t0 + Duration::from_secs(10);
-        for (who, chunk) in [(2u8, 16..17), (3, 32..33), (4, 48..49)] {
-            delivered_by(
-                &mut tracker,
-                waited_on,
-                chunk,
-                who,
-                ten - Duration::from_millis(50),
-            );
-        }
-        assert_ne!(
-            reserved_piece(acquire_fast(
-                &mut tracker,
-                &file_infos,
-                &priorities,
-                1,
-                Some(waited_on),
-                ten,
-                Duration::from_millis(100),
-            )),
-            waited_on,
-            "a holder that delivered fifty milliseconds ago was doubled by a peer \
-             whose chunks take a hundred"
-        );
+        deliver(&mut tracker, waited_on, 16..17);
+        deliver(&mut tracker, waited_on, 32..33);
+        deliver(&mut tracker, waited_on, 48..49);
 
-        // Two seconds of silence from all three, and the one with the most
-        // left is doubled -- a chunk on disk is no defence.
-        let later = ten + Duration::from_secs(2);
         assert_eq!(
             claimed(acquire_fast(
                 &mut tracker,
@@ -1974,12 +1893,12 @@ mod tests {
                 &priorities,
                 1,
                 Some(waited_on),
-                later,
+                t0 + Duration::from_secs(10),
                 Duration::from_millis(100),
             )),
             16..32,
-            "a claim gone quiet for two seconds was left to its holder because it \
-             had a chunk on disk"
+            "a claim on a ten-second-old piece was left to its holder because it had \
+             a chunk on disk"
         );
     }
 
@@ -2132,7 +2051,6 @@ mod tests {
             peer: peer(2),
             connection: 0,
             peer_avg_time: Some(Duration::ZERO),
-            last_delivery: None,
             last_latency: None,
             now: Instant::now(),
             priority_pieces: std::iter::empty(),
@@ -2429,52 +2347,41 @@ mod tests {
         );
     }
 
-    /// **A share taken by someone else resets what a peer over its share
-    /// has to show, and a finished claim of the piece excuses it.**
-    ///
-    /// "Other peers could be taking the rest" cannot be read off a piece --
-    /// a peer that has not come round its loop is nobody's participant --
-    /// so what is asked is whether this peer has delivered since the last
-    /// share went to anyone. Another peer taking a share moves that mark,
-    /// and the first peer has to deliver again to earn the next. It used to
-    /// be lifted by whether the rest of the lookahead held anything for the
-    /// peer, which in steady state it never does, so the first visitor took
-    /// every share of a freshly split piece within a millisecond.
+    /// **A peer over its share yields on a fresh piece and takes on an old
+    /// one, and a fresh peer takes its share whatever the piece's age.**
     #[test]
-    fn a_peer_over_its_share_yields_to_others_who_are_taking() {
+    fn a_peer_over_its_share_yields_on_a_fresh_piece() {
         let (mut tracker, file_infos, priorities) = make_split_tracker(1);
         let waited_on = piece(&tracker, 0);
         let t0 = Instant::now();
         let ms = |n: u64| t0 + Duration::from_millis(n);
-        let ask =
-            |tracker: &mut PieceTracker, who: u8, now: Instant, delivered: Option<Instant>| {
-                acquire_with(
-                    tracker,
-                    &file_infos,
-                    &priorities,
-                    who,
-                    &[waited_on],
-                    now,
-                    delivered,
-                    None,
-                )
-            };
+        let ask = |tracker: &mut PieceTracker, who: u8, now: Instant, latency: u64| {
+            acquire_with(
+                tracker,
+                &file_infos,
+                &priorities,
+                who,
+                &[waited_on],
+                now,
+                Some(Duration::from_millis(latency)),
+            )
+        };
 
-        assert_eq!(claimed(ask(&mut tracker, 1, t0, None)), 0..16);
-        assert_eq!(claimed(ask(&mut tracker, 1, t0, None)), 16..32);
-        // Peer 1 lands a chunk; peer 2 arrives and takes its share after.
-        assert_eq!(claimed(ask(&mut tracker, 2, ms(2), None)), 32..48);
+        assert_eq!(claimed(ask(&mut tracker, 1, t0, 300)), 0..16);
+        assert_eq!(claimed(ask(&mut tracker, 1, t0, 300)), 16..32);
         assert!(
-            matches!(
-                ask(&mut tracker, 1, ms(3), Some(ms(1))),
-                AcquireResult::Crowded
-            ),
-            "somebody took a share after this peer's last delivery: others are coming"
+            matches!(ask(&mut tracker, 1, ms(50), 300), AcquireResult::Crowded),
+            "fifty milliseconds into the piece, a peer with a 300 ms round trip waits"
         );
         assert_eq!(
-            claimed(ask(&mut tracker, 1, ms(5), Some(ms(4)))),
+            claimed(ask(&mut tracker, 2, ms(60), 300)),
+            32..48,
+            "a peer under its share takes freely, whatever the piece's age"
+        );
+        assert_eq!(
+            claimed(ask(&mut tracker, 1, ms(350), 300)),
             48..64,
-            "and a delivery after that share went out earns the next one"
+            "and past its own round trip the first peer takes the shares nobody came for"
         );
 
         // A peer whose claim has finished holds nothing of the piece any
@@ -2502,7 +2409,7 @@ mod tests {
                 t0
             )),
             48..64,
-            "a peer that has just delivered a claim of this piece is not asked to wait"
+            "a peer whose claim of this piece is done is not over its share"
         );
     }
 
@@ -2609,7 +2516,6 @@ mod tests {
                 who,
                 &window,
                 secs(10),
-                None,
                 latency,
             )
         };
@@ -2659,20 +2565,37 @@ mod tests {
         );
     }
 
-    /// **A holder that delivered a moment ago is not cut.**
+    /// **A whole piece is cut by the piece's age, not the holder's last
+    /// delivery.**
     ///
-    /// The wait is from the holder's last delivery on the piece, not from
-    /// when it was asked. A peer that reserved a piece whole ten seconds
-    /// ago and is landing chunks now is the healthy case, and cutting it
-    /// costs a window of duplicate tail: the head piece here has been
-    /// delivering fifty milliseconds ago, and no peer with a real latency
-    /// outpaces that.
+    /// A piece reserved whole fifty milliseconds ago is nobody's to cut; one
+    /// reserved ten seconds ago is cut for any peer whose chunks take less,
+    /// however steadily its holder has been landing chunks -- a steady
+    /// trickle is exactly what a slow pipelined holder looks like.
     #[test]
-    fn a_holder_that_delivered_a_moment_ago_is_not_cut() {
+    fn a_whole_piece_is_cut_by_its_age_not_its_holders_last_delivery() {
         let (mut tracker, file_infos, priorities) = make_split_tracker(6);
         let t0 = Instant::now();
         let deep = piece(&tracker, 2);
         tracker.reserve_piece(deep, peer(1), 0, false, t0);
+        let window: Vec<ValidPieceIndex> = (2..6).map(|id| piece(&tracker, id)).collect();
+        let ask = |tracker: &mut PieceTracker, who: u8, now: Instant| {
+            acquire_with(
+                tracker,
+                &file_infos,
+                &priorities,
+                who,
+                &window,
+                now,
+                Some(Duration::from_millis(100)),
+            )
+        };
+
+        assert_ne!(
+            reserved_or_none(ask(&mut tracker, 2, t0 + Duration::from_millis(50))),
+            Some(deep),
+            "a fifty-millisecond-old piece was cut by a peer whose chunks take a hundred"
+        );
         let later = t0 + Duration::from_secs(10);
         delivered_by(
             &mut tracker,
@@ -2681,27 +2604,11 @@ mod tests {
             1,
             later - Duration::from_millis(50),
         );
-
-        let window: Vec<ValidPieceIndex> = (2..6).map(|id| piece(&tracker, id)).collect();
         assert_eq!(
-            reserved_or_none(acquire_with(
-                &mut tracker,
-                &file_infos,
-                &priorities,
-                2,
-                &window,
-                later,
-                None,
-                Some(Duration::from_millis(100)),
-            )),
-            Some(window[1]),
-            "a holder that delivered fifty milliseconds ago was cut by a peer whose \
-             chunks take a hundred"
-        );
-        assert_eq!(
-            tracker.participants(deep).len(),
-            1,
-            "the holder is alone on its piece, uncut"
+            reserved_or_none(ask(&mut tracker, 3, later)),
+            Some(deep),
+            "a ten-second-old piece was not cut because its holder landed a chunk \
+             fifty milliseconds ago"
         );
     }
 
@@ -3093,7 +3000,6 @@ mod tests {
             peer: peer(1),
             connection: 0,
             peer_avg_time: None,
-            last_delivery: None,
             last_latency: None,
             now: Instant::now(),
             priority_pieces: priority.into_iter(),
@@ -3295,7 +3201,6 @@ mod tests {
             peer: peer(1),
             connection: 0,
             peer_avg_time: None,
-            last_delivery: None,
             last_latency: None,
             now: Instant::now(),
             priority_pieces: std::iter::empty(),
@@ -3332,7 +3237,6 @@ mod tests {
             peer: peer(1),
             connection: 0,
             peer_avg_time: None,
-            last_delivery: None,
             last_latency: None,
             now: Instant::now(),
             priority_pieces: std::iter::empty(),
@@ -3364,7 +3268,6 @@ mod tests {
             peer: peer(1),
             connection: 0,
             peer_avg_time: None,
-            last_delivery: None,
             last_latency: None,
             now: Instant::now(),
             priority_pieces: std::iter::empty(),
@@ -3401,7 +3304,6 @@ mod tests {
             peer: peer(1),
             connection: 0,
             peer_avg_time: None,
-            last_delivery: None,
             last_latency: None,
             now: Instant::now(),
             priority_pieces: std::iter::empty(),
@@ -3433,7 +3335,6 @@ mod tests {
             peer: peer(2),
             connection: 0,
             peer_avg_time: None,
-            last_delivery: None,
             last_latency: None,
             now: Instant::now(),
             priority_pieces: std::iter::empty(),
@@ -3461,7 +3362,6 @@ mod tests {
             peer: peer(1),
             connection,
             peer_avg_time: None,
-            last_delivery: None,
             last_latency: None,
             now: Instant::now(),
             priority_pieces: std::iter::empty(),
@@ -3488,7 +3388,6 @@ mod tests {
             peer: peer(2),
             connection: 3,
             peer_avg_time: Some(Duration::ZERO),
-            last_delivery: None,
             last_latency: None,
             now: Instant::now(),
             priority_pieces: std::iter::empty(),
@@ -3525,7 +3424,6 @@ mod tests {
             peer: peer_a,
             connection: 0,
             peer_avg_time: None,
-            last_delivery: None,
             last_latency: None,
             now: Instant::now(),
             priority_pieces: std::iter::empty(),
@@ -3541,7 +3439,6 @@ mod tests {
             peer: peer_a,
             connection: 0,
             peer_avg_time: None,
-            last_delivery: None,
             last_latency: None,
             now: Instant::now(),
             priority_pieces: std::iter::empty(),
@@ -3559,7 +3456,6 @@ mod tests {
             peer: peer_b,
             connection: 0,
             peer_avg_time: None,
-            last_delivery: None,
             last_latency: None,
             now: Instant::now(),
             priority_pieces: std::iter::empty(),
@@ -3602,7 +3498,6 @@ mod tests {
             peer: peer(1),
             connection: 0,
             peer_avg_time: None,
-            last_delivery: None,
             last_latency: None,
             now: Instant::now(),
             priority_pieces: std::iter::empty(),
@@ -3615,7 +3510,6 @@ mod tests {
             peer: peer(1),
             connection: 0,
             peer_avg_time: None,
-            last_delivery: None,
             last_latency: None,
             now: Instant::now(),
             priority_pieces: std::iter::empty(),
@@ -3636,7 +3530,6 @@ mod tests {
             peer: peer(2),
             connection: 0,
             peer_avg_time: None,
-            last_delivery: None,
             last_latency: None,
             now: Instant::now(),
             priority_pieces: std::iter::empty(),
@@ -3678,7 +3571,6 @@ mod tests {
             peer: peer(1),
             connection: 0,
             peer_avg_time: None,
-            last_delivery: None,
             last_latency: None,
             now: Instant::now(),
             priority_pieces: priority.into_iter(),
@@ -3708,7 +3600,6 @@ mod tests {
             peer: peer(1),
             connection: 0,
             peer_avg_time: None,
-            last_delivery: None,
             last_latency: None,
             now: Instant::now(),
             priority_pieces: std::iter::empty(),
@@ -3767,7 +3658,6 @@ mod tests {
                 // Fast: the incumbent is a thousand times over the 10x bar.
                 now: Instant::now(),
                 peer_avg_time: Some(Duration::from_millis(600)),
-                last_delivery: None,
                 last_latency: None,
                 priority_pieces: std::iter::empty(),
                 file_priorities: &file_priorities,
@@ -3817,7 +3707,6 @@ mod tests {
             connection: 0,
             now: Instant::now(),
             peer_avg_time: Some(Duration::from_millis(600)),
-            last_delivery: None,
             last_latency: None,
             priority_pieces: std::iter::once(stream_piece),
             file_priorities: &file_priorities,
@@ -3872,7 +3761,6 @@ mod tests {
             peer: peer_a,
             connection: 0,
             peer_avg_time: None,
-            last_delivery: None,
             last_latency: None,
             now: Instant::now(),
             priority_pieces: std::iter::empty(),
@@ -3892,7 +3780,6 @@ mod tests {
             peer: peer_a,
             connection: 0,
             peer_avg_time: None,
-            last_delivery: None,
             last_latency: None,
             now: Instant::now(),
             priority_pieces: std::iter::empty(),
@@ -3919,7 +3806,6 @@ mod tests {
             connection: 0,
             now: Instant::now(),
             peer_avg_time: Some(Duration::from_millis(1)),
-            last_delivery: None,
             last_latency: None,
             priority_pieces: std::iter::empty(),
             file_priorities: &file_priorities,

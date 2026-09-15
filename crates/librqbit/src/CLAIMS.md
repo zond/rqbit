@@ -26,34 +26,28 @@ the first one's mistake again.
 
 ## The one measurement
 
-Every takeover -- cutting a whole head piece, doubling a claim -- is
-justified by one comparison, and it is a comparison of two durations:
+Every takeover -- cutting a whole head piece, doubling a claim, taking a
+share of the pool beyond one's own -- is justified by one comparison of two
+durations:
 
-> **A peer may take over work another peer holds iff the latency of its
-> last delivered chunk is shorter than the time we have been waiting on
-> that holder.**
+> **A peer may take over work on a piece iff the latency of its last
+> delivered chunk is shorter than the time the piece has been in flight.**
 
 - **The asker's side**: `last_latency`, the time from sending the request
   for its most recent chunk to that chunk arriving. Recorded on the live
-  peer (`inflight_requests` is a map from chunk to `sent_at` so the
-  difference can be taken on arrival). A peer that has never delivered has
-  none, and outpaces nobody.
-- **The holder's side**: `waited`, now minus the holder's last delivery *on
-  this piece* (a `Participant` field stamped by the write path), or now
-  minus when it was asked (`Participant::started`) if it has delivered
-  nothing here. Per piece and not global, because a holder busy delivering
-  earlier claims of the same piece is not stalled on this one -- it is
-  queued behind itself, and it requests in order.
+  peer (`inflight_requests` is a map from chunk to `sent_at`). A peer that
+  has never delivered has none, and outpaces nothing.
+- **The piece's side**: its age, now minus when it was first reserved
+  (`InflightPiece::started`). **Not the holder's last delivery** (an
+  earlier version): a holder with seconds of latency and a hundred
+  requests in flight lands a chunk every few milliseconds and never looks
+  quiet, while its piece takes ten seconds. What the reader waits on is the
+  piece, so the piece is what is measured.
 
-`outpaces(holder) = last_latency < waited`. Read: *had I been asked when
-they were, I would have delivered by now -- and they have not.* A holder
-that delivered 3 ms ago is untouchable; one silent for seconds loses to any
-live peer. No threshold and no constant.
-
-The reference points differ on purpose. Cutting compares against the
-*holder's* silence (am I doing more than the peer I am taking from);
-taking an unclaimed share, below, compares against the *piece's* last
-handout (has anyone else shown up since I last did something).
+`outpaces(piece) = last_latency < age(piece)`. Read: *had I been asked when
+this piece was, I would have delivered by now -- and it is not done.* A
+piece reserved a moment ago is nobody's to cut, double or over-share; one
+in flight for seconds loses to any live peer. No threshold and no constant.
 
 ## The rules, in the order a peer meets them in `acquire_piece`
 
@@ -61,7 +55,7 @@ The walk goes over the lookahead in playback order, `deep` counting the
 pieces this peer could actually take.
 
 1. **Cut a whole piece at the head** (`InflightPiece::split_whole`). At
-   depth < 2, a piece held whole is cut if the asker outpaces its holder:
+   depth < 2, a piece held whole is cut if the asker outpaces the piece:
    the holder keeps the claim it is currently delivering into (the first
    with anything missing), claims already on disk need nobody, and every
    claim after goes to the pool. Without this, splitting never engaged in
@@ -73,22 +67,22 @@ pieces this peer could actually take.
    is why it is not cut for just anyone.
 
 2. **Take an unclaimed share.** Up to `CLAIMS_PER_PEER` (2) freely. Beyond
-   that, only if the asker **has delivered a chunk since the last share of
-   this piece went to anyone**: it is draining its window and nobody else
-   has shown up. Another peer taking a share resets that mark. This is the
-   one event-based rule, because there is no holder to be faster than; the
-   question is whether others are arriving. It replaced "take the rest if
-   the lookahead holds nothing else", which in steady state it never does,
-   so the first visitor took every share within a millisecond and nothing
-   was spread.
+   that, only if the asker outpaces the piece: had the other peers been
+   coming for the pool, they would have taken it by now. Twenty peers
+   arriving within milliseconds find a piece younger than any of their
+   round trips and spread it; three peers leave shares in the pool and
+   whoever returns half a second later takes them. The first field log
+   (2026-09-15) had ten of sixteen shares of piece 0 untaken for ten
+   seconds under the rule this replaced -- "take beyond your share only if
+   you delivered since the last handout" -- because each peer took two and
+   went to fetch whole pieces deeper in the window instead.
 
 3. **Double a claim** (`stalled_claim`). Any claim with chunks still
-   missing, if the asker outpaces its holder -- the one rule, nothing
-   else -- up to two holders, never the asker's own. Whatever the claim
-   has delivered so far: a holder with a window of requests out lands a
-   chunk every few milliseconds and is never outpaced, so two healthy
-   peers never double each other; a holder trickling a chunk a second is
-   outpaced between its chunks and rescued.
+   missing, if the asker outpaces the piece -- the one rule, nothing else
+   -- up to two holders, never the asker's own, the one with the most left
+   first. A healthy piece is done before anyone's round trip elapses; one
+   that is not is worth a second copy of whatever is left, whoever holds it
+   and whatever they have delivered.
 
 4. **Refused everywhere: `Crowded`.** Returned only after the whole
    lookahead, a steal attempt and the ordinary queue have all yielded
@@ -97,7 +91,7 @@ pieces this peer could actually take.
    as backstop. A peer over its share always has claims in flight to wait
    on, so this cannot deadlock.
 
-5. **A fresh peer** outpaces nobody: two free shares if any, otherwise a
+5. **A fresh peer** outpaces nothing: two free shares if any, otherwise a
    whole piece from the ordinary queue. It proves itself there.
 
 6. **Steal** stays as vanilla for whole pieces deeper in the window. At the
@@ -125,6 +119,16 @@ pieces this peer could actually take.
 - **The `idle` escape** (a peer with nothing in flight could take anything):
   unnecessary, since a peer over its share has claims to wait on, and a
   fresh peer belongs on the vanilla queue.
+- **The holder's last delivery as the clock** (`Activity::outpaces(holder)`,
+  with `Participant::last_delivery` stamped by the write path): a slow
+  holder with a deep pipeline delivers steadily and was never outpaced,
+  and a healthy piece's holders reset the clock every few milliseconds,
+  which was the point -- but the reader waits on the piece, not on any
+  holder, so the piece's age is the honest clock. The stamp stays, for the
+  diagnostic line.
+- **"Delivered since the last handout"** as the over-share gate: with any
+  other work in the window a peer over its share went there instead, and
+  the pool sat.
 - **"Only a claim that has delivered nothing"** as the doubling gate, with
   `missing_at_start` to judge a re-handed claim on its own work. The first
   field log on the latency rules (2026-09-15) showed why not: a holder
@@ -143,13 +147,14 @@ peer: it waits one chunk arrival, not a timer.
 
 ## Status
 
-Built 2026-09-14 (`a31258c0`); every rule and the three wiring points are
-proven by a test that fails under mutation. First field log 2026-09-15
-(xtremio `a58f5f0`): the rules engaged and nothing was fetched twice at
-scale, but two head-piece reads still blocked for 24 and 30 seconds with a
-fast swarm. The doubling gate was the cause as far as the log can say, and
-it was widened to the one rule the same day (rule 3 above). A diagnostic
-line now dumps the head piece's claims -- holder, chunks missing, wait since
-its last delivery, its latency -- when a read has waited two seconds
-(`ManagedTorrent::piece_claims`), so the next log answers rather than
-suggests.
+Built 2026-09-14 (`a31258c0`), rebuilt on the piece's age 2026-09-15 after
+two field logs. Every rule and the three wiring points are proven by a test
+that fails under mutation. The first log on the latency rules (xtremio
+`a58f5f0`) had 24- and 30-second head-piece blocks; the second (`ef6ac8c`,
+with the claims probe) showed why: ten of sixteen shares of piece 0 sitting
+in the pool while three peers each held two, and whole pieces held by
+high-latency pipelined peers that the holder's-last-delivery clock could
+not see. Both are what the piece's age measures. Read the next log's
+`blocked_read_claims` lines for pieces older than a second with shares
+still unclaimed or single holders with seconds of latency: there should be
+none.

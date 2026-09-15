@@ -303,10 +303,6 @@ pub(crate) struct LivePeerState {
     // priced (`last_latency`).
     inflight_requests: HashMap<InflightRequest, std::time::Instant>,
 
-    /// When a chunk this peer was asked for last arrived. What the piece
-    /// tracker reads to tell a peer that is draining its window from one
-    /// that has merely come round its loop again (`AcquireRequest::last_delivery`).
-    last_delivery: Option<std::time::Instant>,
     /// How long the most recently arrived chunk took, from the request
     /// going out to the bytes landing. The peer's side of the one
     /// comparison the piece tracker makes before letting it take over
@@ -340,7 +336,6 @@ impl LivePeerState {
             bitfield: BF::default(),
             seeder: false,
             inflight_requests: Default::default(),
-            last_delivery: None,
             last_latency: None,
             late_cancelled_request_tolerance: 0,
             request_slots_changed: Default::default(),
@@ -357,12 +352,6 @@ impl LivePeerState {
         self.request_slots_changed.clone()
     }
 
-    /// When a chunk this peer was asked for last arrived, or `None` before
-    /// the first.
-    pub fn last_delivery(&self) -> Option<std::time::Instant> {
-        self.last_delivery
-    }
-
     pub fn requested_inflight_count(&self) -> usize {
         self.inflight_requests.len()
     }
@@ -376,7 +365,6 @@ impl LivePeerState {
     pub fn remove_inflight_request(&mut self, chunk: &ChunkInfo) -> RemoveInflightRequestResult {
         if let Some(sent_at) = self.inflight_requests.remove(chunk) {
             let now = std::time::Instant::now();
-            self.last_delivery = Some(now);
             self.last_latency = Some(now.saturating_duration_since(sent_at));
             self.request_slots_changed.notify_waiters();
             return RemoveInflightRequestResult::Expected;
