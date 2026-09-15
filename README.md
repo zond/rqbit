@@ -12,7 +12,7 @@ The fork publishes no binaries, crates, Docker images or desktop builds, and ups
 
 ## What the fork adds
 
-All of the code is in `librqbit`, apart from the TLS change, which also covers `librqbit-upnp` and `upnp-serve`, and the CI change. The fork adds nothing to the `rqbit` CLI or the Web UI. The HTTP API gains two things: the stream route's `lookahead_bytes` query parameter and a `live_seeders` stats field.
+All of the code is in `librqbit`, apart from one helper in `librqbit-core` (`Lengths::iter_chunk_infos_in`, which the claims below use), the TLS change, which also covers `librqbit-upnp` and `upnp-serve`, and the CI change. The fork adds nothing to the `rqbit` CLI or the Web UI. The HTTP API gains two things: the stream route's `lookahead_bytes` query parameter and a `live_seeders` stats field.
 
 **Piece reclaim: dropping pieces.** For keeping a bounded cache of a torrent larger than the disk.
 
@@ -22,17 +22,19 @@ All of the code is in `librqbit`, apart from the TLS change, which also covers `
 - The flag is persisted with the torrent. The set of dropped pieces is not. A restored reclaim torrent always starts paused, so the caller can drop what it doesn't want before it unpauses.
 - `TorrentStorage::has_piece` lets a storage say at startup which pieces it still holds. A piece counts as ours only if the resume data (or the full check) and the storage both say so.
 
-**Holding pieces back from announcements.** `ManagedTorrent::set_pieces_advertised(range, false)` leaves pieces out of the handshake bitfield and sends no Have for them. They are still downloaded, readable by streams, and served to a peer that asks for them. `set_pieces_advertised(range, true)` puts them back and sends connected peers a Have for each one we have — on each peer's own channel, so putting back more than 128 pieces at once reaches every connected peer rather than what fits in a shared broadcast. It works on a live or a paused torrent and needs no option. The set is not persisted. It survives a pause but not a re-check.
+**Holding pieces back from announcements.** `ManagedTorrent::set_pieces_advertised(range, false)` leaves pieces out of the handshake bitfield and sends no Have for them. They are still downloaded, readable by streams, and served to a peer that asks for them. `set_pieces_advertised(range, true)` puts them back and sends connected peers a Have for each one we have -- on each peer's own channel, so putting back more than 128 pieces at once reaches every connected peer rather than what fits in a shared broadcast. It works on a live or a paused torrent and needs no option. The set is not persisted. It survives a pause but not a re-check.
 
 **Session upload switch.** `Session::set_upload_enabled(false)` chokes every peer of every torrent, including peers that connect later, and keeps them choked. Downloading carries on, and the bitfield and Haves still say what we have. `set_upload_enabled(true)` unchokes them again, and `Session::upload_enabled()` reads the switch. This is not the same as the `disable-upload` build feature, which hangs up on a peer that asks for data.
 
-**Choke handback.** When a peer chokes us, the requests the choke discarded are forgotten and their pieces go back into the queue. Upstream left them reserved to that peer until a steal or a disconnect freed them. The requester also asks about the choke once more after it marks a request in flight, so a request inserted just as the handback ran is taken back rather than sent to a peer that drops it and never asked for again.
+**Choke handback.** When a peer chokes us, the requests the choke discarded are forgotten and their pieces go back into the queue. Upstream left them reserved to that peer until a steal or a disconnect freed them. A choke can also land between the requester's check and the moment it marks a request in flight, after the handback has already run. So the requester asks about the choke once more after marking the request, and a request caught that way waits for the unchoke instead of going to a peer that drops it and is then never asked for again.
 
 **Runtime peer cap.** `ManagedTorrent::set_peer_limit(n)` changes a torrent's live-peer cap while it runs. Lowering it disconnects the surplus, least useful first: peers still connecting, then peers with nothing to exchange in either direction, then peers that moved the fewest bytes lately (sent and received count the same). Raising it re-dials the peers it parked that have an address we can dial, ahead of newly discovered addresses. `ManagedTorrentShared::peer_limit()` reads the cap. `TorrentStateLive::forget_disconnected_peers()` removes dead and parked entries from the peer table. `DEFAULT_PEER_LIMIT` is 128, upstream's default, and applies when neither the torrent nor the session sets a limit.
 
 **Per-piece chunk progress and live-seeder stats.** `ManagedTorrent::piece_chunk_progress(piece)` returns a `PieceChunkProgress`: `downloaded_chunks` and `total_chunks` (16 KiB chunks), plus `verified`. The chunk count is downloaded, not verified, so it goes back to zero if the piece fails its hash check. The aggregate peer stats gain `live_seeders`, the number of connected peers that have the whole torrent. The HTTP API shows it per torrent in `GET /torrents/{id_or_infohash}/stats/v1`, and summed over the session in `GET /stats`.
 
 **Stream lookahead.** `FileStreamOptions { lookahead_bytes }`, passed to `ManagedTorrent::stream_with_options` or `Api::api_stream_with_options`, sets how far ahead of the reader pieces are prioritized. The default, `DEFAULT_STREAM_LOOKAHEAD_BYTES`, is upstream's 32 MiB. Over HTTP it is `GET /torrents/{id_or_infohash}/stream/{file_idx}?lookahead_bytes=N`. The server refuses 0 and anything over 1 GiB (1073741824) with 400.
+
+**Pieces a stream waits on are shared between peers.** The two pieces at the head of a stream's lookahead (`DEADLINE_PIECES`) are split into claims of `CLAIM_CHUNKS` (16) chunks, so several peers fetch one piece at once; every other piece still belongs to one peer, as upstream. A peer takes up to `CLAIMS_PER_PEER` (2) claims of a piece freely, and every takeover beyond that is decided by one comparison: the taking peer's last chunk took less time than the work in question has been waiting. Measured against the piece's age, it decides cutting a whole head piece into claims and taking a share beyond one's own. Measured against the time since a claim's newest holder was handed it, it decides joining that claim, with no cap on how many peers hold one; the first copy to land finishes it, and the other holders' outstanding requests are cancelled when the piece completes. A peer busy with a whole piece deeper in the window offers itself to the two head pieces before every chunk it sends, so the comparison is asked each time a chunk lands rather than once per piece. `crates/librqbit/src/CLAIMS.md` has the design, and what each rule replaced and why.
 
 **Storage.**
 
@@ -45,7 +47,7 @@ All of the code is in `librqbit`, apart from the TLS change, which also covers `
 
 **TLS roots.** With `rust-tls` and without `default-tls`, every HTTP client that `librqbit` and `librqbit-upnp` build trusts only Mozilla's root certificates compiled into the binary (`webpki-root-certs`), not the platform store. `librqbit::http_client_builder()` returns a client builder with that policy, for embedders.
 
-**CI.** `.github/workflows/test.yml` runs on pushes to `main`, which is the fork itself, and one failing matrix entry no longer cancels the others (`fail-fast: false`). Upstream ran it on `main` and `dev`, and this fork's own branch was tested by nobody until then.
+**CI.** In `.github/workflows/test.yml`, one failing matrix entry no longer cancels the others (`fail-fast: false`).
 
 ## Behaviour if you don't opt in
 
@@ -56,7 +58,7 @@ These changes apply to every user, opted in or not:
 - **Chokes:** a choke hands back the requests it discarded (see above).
 - **Not interested:** a peer's `NotInterested` now clears its interested flag. Upstream logged it and ignored it. So a finished torrent with no stream open now disconnects a peer that has the whole torrent once that peer says it is no longer interested. Upstream kept such a peer, because the flag never went back to false.
 - **Haves:** we send Haves to a peer that hasn't sent us a bitfield. Upstream read the empty bitfield as "already has it" and sent that peer none.
-- **Piece picking:** a peer reserves a free piece before stealing one. The only steal ahead of the queue is for a stream: when every piece of its lookahead window that this peer could take is already in flight, it takes the first of them, and only from a peer 10x slower. Upstream tried a steal from any 10x slower peer before it looked for a free piece. The two pieces at the head of a stream's lookahead (`DEADLINE_PIECES`) are fetched by several peers at once: split into claims of `CLAIM_CHUNKS` chunks, up to `CLAIMS_PER_PEER` per peer at a time, with a whole piece the stream reaches cut the same way and a stalled claim fetched twice -- each justified by one comparison, that the taking peer's last chunk took less time than we have waited on the holder. `crates/librqbit/src/CLAIMS.md` has the design.
+- **Piece picking:** a peer reserves a free piece before stealing one. The only steal ahead of the queue is for a stream: when every piece of its lookahead window that this peer could take is already in flight, it takes the first of them, and only from a peer 10x slower. Upstream tried a steal from any 10x slower peer before it looked for a free piece. The two pieces at the head of a stream's lookahead are shared between several peers (see "Pieces a stream waits on are shared between peers" above).
 - **Peer deaths and reconnects:** in-flight pieces are reserved to a connection, not just an address. They are handed back whatever state the peer's table entry is in. A dying connection no longer overwrites a newer connection's entry for the same address. Peers we have already talked to are re-dialled ahead of newly discovered addresses.
 - **Writes:** a chunk that arrives in two parts of the peer's read buffer now reaches the filesystem storage's vectored write: one `pwritev` on Unix, and one write of the joined parts on other platforms. Upstream wrote the two parts with two separate writes, because `Box<dyn TorrentStorage>` did not forward the vectored call.
 - **Streams:** a read that has to wait for a piece re-queues peers that were sent away and wakes connected peers that had nothing to request.
@@ -83,7 +85,7 @@ The fork's tests are in `crates/librqbit/src/tests/`:
 - `initial_check_pause.rs`
 - `lock_order.rs` and `session_persistence.rs`
 
-There are also unit tests next to the code they cover (`chunk_tracker.rs`, `piece_tracker.rs`, the storage modules). `crates/librqbit/tests/tls_roots.rs` only builds with `rust-tls` and without `default-tls`, on Linux, so a default-feature `cargo test` (which is what CI runs) skips it.
+There are also unit tests next to the code they cover. `crates/librqbit/tests/tls_roots.rs` only builds with `rust-tls` and without `default-tls`, on Linux, so a default-feature `cargo test` (which is what CI runs) skips it.
 
 ---
 

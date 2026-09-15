@@ -2283,7 +2283,11 @@ impl PeerHandler {
         Ok(())
     }
 
-    /// Acquire a piece for this peer: try steal (10x) → reserve → steal (3x).
+    /// Acquire a piece for this peer. [`Ask::Anything`] tries, in order: the
+    /// stream lookahead (a free piece, or a share of one in flight), a steal of
+    /// the first lookahead piece it could not join from a peer 10x slower, the
+    /// ordinary queue, and a steal from a peer 3x slower. [`Ask::Head`] tries
+    /// only the two head pieces of the lookahead.
     ///
     /// Returns the piece index to download, or None if no pieces are available.
     /// The next share of a piece to fetch: the piece, and which of its
@@ -2558,7 +2562,7 @@ impl PeerHandler {
             update_interest(self, true)?;
             aframe!(self.wait_for_request_slot()).await;
 
-            // Acquire a piece using the strategy: try steal (10x) → reserve → steal (3x).
+            // The lookahead, a 10x steal, the queue, a 3x steal: see `acquire_next_piece`.
             let new_piece_notify = self.state.new_pieces_notify.notified();
             // Armed before the ask, so a chunk landing between the ask and
             // the wait is not a wake-up missed.

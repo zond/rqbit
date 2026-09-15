@@ -962,21 +962,20 @@ impl ManagedTorrent {
     }
 
     #[inline(never)]
-    /// # Known hang
+    /// # A paused initial check
     ///
-    /// This never returns for a torrent whose initial check was *paused*:
     /// `pause()` on an `Initializing` torrent sets `pause_requested`, the check
-    /// bails, and the `Err` arm leaves the state `Initializing` with
-    /// `check_running == false`. Nothing will move that state, so the loop below
-    /// polls forever and callers have to bound it themselves.
+    /// bails, and the torrent is left `Initializing` with `check_running ==
+    /// false`. Nothing moves that state on its own -- only an unpause starts a
+    /// new check -- so the loop below recognises that pair and fails the wait
+    /// with a message saying so, rather than polling forever (f498d4a6, which
+    /// also moved `finish_check` under the state lock this loop reads).
     ///
-    /// An attempted fix -- bail when `is_pause_requested() && !is_check_running()`
-    /// -- was reverted, because that pair is ALSO true in a healthy state: in
-    /// `Session::add_torrent` the handle is published and awaited on before
-    /// `start()` runs, so a `pause()` landing in that window sets exactly those
-    /// two conditions on a torrent whose check then completes normally. A correct
-    /// fix has to distinguish "the check stalled" from "the check has not started
-    /// yet", which the current state does not express.
+    /// An earlier attempt at the same bail was reverted because the pair is
+    /// also true while `Session::add_torrent` has published the handle and not
+    /// yet run `start()`: a `pause()` in that window looks the same. Whether
+    /// that window can still fail a wait on a torrent whose check then runs
+    /// normally has not been re-examined since.
     pub fn wait_until_initialized(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         async move {
             // TODO: rewrite, this polling is horrible
