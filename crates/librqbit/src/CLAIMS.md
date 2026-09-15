@@ -17,12 +17,12 @@ the first one's mistake again.
   unclaimed claims in a pool. Only the two head pieces are ever split. The
   work is disjoint, so splitting costs nothing in duplication. What it costs
   is that the piece is done when its *slowest* claim is done.
-- **Doubled.** One claim of a split piece with two holders
-  (`MAX_HOLDERS_PER_CLAIM`). The rescue for a stalled claim: whichever copy
-  lands first finishes it, and the loser's outstanding requests are
-  cancelled when the piece completes (`overtaken_by`). It spends bandwidth
-  by design, which is why it needs a justification and the other two do
-  not.
+- **Doubled.** One claim of a split piece with more than one holder. The
+  rescue for a stalled claim: whichever copy lands first finishes it, and
+  the losers' outstanding requests are cancelled when the piece completes
+  (`overtaken_by`). It spends bandwidth by design, which is why it needs a
+  justification and the other two do not -- and the justification is what
+  bounds it, not a count.
 
 ## The one measurement
 
@@ -48,6 +48,26 @@ durations:
 this piece was, I would have delivered by now -- and it is not done.* A
 piece reserved a moment ago is nobody's to cut, double or over-share; one
 in flight for seconds loses to any live peer. No threshold and no constant.
+
+For joining a claim somebody already holds, the clock is the claim's
+**newest hand-out** rather than the piece's start: *had I been handed this
+claim when its latest holder was, I would have delivered it by now.* It is
+the same comparison one level down, and it implies the piece's, since no
+hand-out predates the piece.
+
+**And when it is asked.** The comparison is only as good as the moments it
+is made at. A peer asks whenever it has a request slot free, and a slot
+frees when a chunk lands -- which is exactly when its latency was
+re-measured. So before every chunk it sends for work it took from deeper
+in the window, a peer offers itself to the two head pieces first
+(`acquire_head_share`): the same rules over the same two pieces, and
+nothing past them. What the head gives it, it sends first, then resumes
+what it was on. Without this, a peer turned away from a head piece a few
+milliseconds old was handed a whole piece and sent all 256 of its chunks
+before asking again -- two request windows -- and by the time the head
+piece was old enough to share out, everyone who could share it was
+committed elsewhere (the fourth field log, 2026-09-15: ten of sixteen
+shares of the head piece in the pool for two seconds, a 5.4 s read).
 
 ## The rules, in the order a peer meets them in `acquire_piece`
 
@@ -77,12 +97,16 @@ pieces this peer could actually take.
    you delivered since the last handout" -- because each peer took two and
    went to fetch whole pieces deeper in the window instead.
 
-3. **Double a claim** (`stalled_claim`). Any claim with chunks still
-   missing, if the asker outpaces the piece -- the one rule, nothing else
-   -- up to two holders, never the asker's own, the one with the most left
-   first. A healthy piece is done before anyone's round trip elapses; one
-   that is not is worth a second copy of whatever is left, whoever holds it
-   and whatever they have delivered.
+3. **Join a claim** (`stalled_claim`). Any claim with chunks still missing
+   whose newest holder the asker outpaces -- its latency is shorter than
+   the time since that holder was handed the claim -- never the asker's
+   own, the one with the most left first. A healthy holder finishes
+   sixteen chunks within one of its round trips, so a claim still open
+   that long is joined only by somebody faster than its newest holder, and
+   a silent one is joined by anyone live. There is no count of holders: the
+   fourth field log had a claim held by a peer that delivered nothing in
+   fourteen seconds and a doubler with five seconds of latency, and a cap
+   of two kept every faster peer off it for six seconds.
 
 4. **Refused everywhere: `Crowded`.** Returned only after the whole
    lookahead, a steal attempt and the ordinary queue have all yielded
@@ -129,6 +153,15 @@ pieces this peer could actually take.
 - **"Delivered since the last handout"** as the over-share gate: with any
   other work in the window a peer over its share went there instead, and
   the pool sat.
+- **A cap of two holders per claim** (`MAX_HOLDERS_PER_CLAIM`): a constant
+  standing in for the judgment "a third copy is not worth it", which is
+  true of a claim whose holders are delivering and false of one whose
+  holders are dead weight. The newest hand-out comparison tells them apart;
+  the cap could not.
+- **Asking only at piece boundaries.** The request loop acquired a share,
+  sent every chunk of it, and only then asked again. Right for a 16-chunk
+  claim, wrong for a 256-chunk whole piece: the rules above were correct
+  and were not consulted for seconds at a time.
 - **"Only a claim that has delivered nothing"** as the doubling gate, with
   `missing_at_start` to judge a re-handed claim on its own work. The first
   field log on the latency rules (2026-09-15) showed why not: a holder
@@ -148,13 +181,16 @@ peer: it waits one chunk arrival, not a timer.
 ## Status
 
 Built 2026-09-14 (`a31258c0`), rebuilt on the piece's age 2026-09-15 after
-two field logs. Every rule and the three wiring points are proven by a test
+two field logs; the head-at-every-slot ask and the newest-holder rule for
+joining a claim added the same day after the fourth log. Every rule and the three wiring points are proven by a test
 that fails under mutation. The first log on the latency rules (xtremio
 `a58f5f0`) had 24- and 30-second head-piece blocks; the second (`ef6ac8c`,
 with the claims probe) showed why: ten of sixteen shares of piece 0 sitting
 in the pool while three peers each held two, and whole pieces held by
 high-latency pipelined peers that the holder's-last-delivery clock could
-not see. Both are what the piece's age measures. Read the next log's
-`blocked_read_claims` lines for pieces older than a second with shares
-still unclaimed or single holders with seconds of latency: there should be
-none.
+not see. Both are what the piece's age measures. The fourth log (`2272a51`) then
+showed the comparison right and unasked: fast peers away on whole pieces
+while the head pool sat, and a claim at the holder cap with two dead-weight
+holders. Read the next log's `blocked_read_claims` lines for pieces older
+than a second with shares still unclaimed, or claims open longer than any
+connected peer's latency with only slow holders: there should be none.

@@ -45,7 +45,7 @@ pub mod stats;
 
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
     num::NonZeroU32,
     ops::{Deref, DerefMut, Range},
@@ -2067,6 +2067,27 @@ enum Next {
     Crowded,
 }
 
+/// How much of the tracker a request loop is asking for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    /// Anything: the lookahead, the ordinary queue, a steal.
+    Anything,
+    /// A share of the two pieces at the head of the lookahead, or nothing
+    /// (`PieceTracker::acquire_head_share`). Asked before every chunk of
+    /// work taken from deeper in.
+    Head,
+}
+
+/// One share a request loop is sending requests for: the chunks of it
+/// still to ask for, and whether the head of the lookahead is offered
+/// before each. It is for the share the loop was handed by the full ask;
+/// a share the head handed over is sent as it is, or the loop would ask
+/// the head about the head.
+struct ShareWork {
+    chunks: VecDeque<ChunkInfo>,
+    ask_head: bool,
+}
+
 impl PeerHandler {
     /// A handler for a connection to `addr` that no socket is behind, unchoked. Tests only.
     #[cfg(test)]
@@ -2269,7 +2290,7 @@ impl PeerHandler {
     /// chunks this peer claimed. A piece a stream waits on is split, so the
     /// claim is part of it and the same piece is handed to other peers at
     /// the same time; anything else is claimed whole.
-    fn acquire_next_piece(&self) -> crate::Result<Option<Next>> {
+    fn acquire_next_piece(&self, ask: Ask) -> crate::Result<Option<Next>> {
         if self.is_choked() {
             debug!("we are choked, can't acquire piece");
             return Ok(None);
@@ -2292,7 +2313,7 @@ impl PeerHandler {
                     ..
                 } = &mut **g;
                 let pieces = pieces.as_mut().ok_or(Error::ChunkTrackerEmpty)?;
-                let result = pieces.acquire_piece(AcquireRequest {
+                let request = AcquireRequest {
                     peer: self.addr,
                     connection: self.connection,
                     peer_avg_time: self.counters.average_piece_download_time(),
@@ -2309,7 +2330,11 @@ impl PeerHandler {
                             .try_write()
                             .is_some()
                     },
-                });
+                };
+                let result = match ask {
+                    Ask::Anything => pieces.acquire_piece(request),
+                    Ask::Head => pieces.acquire_head_share(request),
+                };
 
                 match result {
                     AcquireResult::Reserved { piece, chunks } => {
@@ -2539,7 +2564,7 @@ impl PeerHandler {
             // the wait is not a wake-up missed.
             let slots = self.request_slots_changed();
             let slot_freed = slots.as_ref().map(|notify| notify.notified());
-            let (next, claimed) = match self.acquire_next_piece()? {
+            let (next, claimed) = match self.acquire_next_piece(Ask::Anything)? {
                 Some(Next::Share(next, claimed)) => (next, claimed),
                 Some(Next::Crowded) => {
                     // Turned away from shares other peers may be coming for,
@@ -2573,47 +2598,53 @@ impl PeerHandler {
                 }
             };
 
-            // **And of that share, only the chunks that are not already
-            // on disk.** One claim may have two holders -- which is what
-            // rescues a piece from a peer that has stalled on it -- and the
-            // loser of that race is cancelled only when the whole piece
-            // completes, so without this it re-requests every chunk of the
-            // claim while the winner is delivering them. The bytes arrive,
-            // are counted into `fetched_bytes`, and are dropped at the
-            // write as `PreviouslyCompleted`: 210 MB of 592 MB fetched in
-            // the field log of 2026-09-14.
-            //
-            // One reading, before the loop rather than per chunk: a chunk
-            // that lands while we are walking is one redundant request,
-            // which is what every chunk cost before this.
-            let mut to_request = {
-                let g = self.state.lock_read("chunks already on disk");
-                g.get_chunks()
-                    .map(|chunks| chunks.chunks_to_request(next, &claimed))
-                    .unwrap_or_default()
-                    .into_iter()
-            };
-            // Only this peer's share. The rest of the piece is either
-            // another peer's claim or still unclaimed, and this peer comes
-            // back round for one of those when it is done here.
-            'chunks: for chunk in self
-                .state
-                .lengths
-                .iter_chunk_infos_in(next, claimed.clone())
-            {
-                // `true` for a chunk to ask for, and `true` for one this
-                // reading could not answer for, which is how it behaved
-                // before there was a reading.
-                if !to_request.next().unwrap_or(true) {
-                    continue 'chunks;
+            // Work this peer is sending requests for: the share it was just
+            // handed at the bottom, and on top of it whatever the head of the
+            // lookahead gives it on the way.
+            let mut work = vec![ShareWork {
+                chunks: self.chunks_to_send(next, claimed),
+                ask_head: true,
+            }];
+            'chunks: while let Some(share) = work.last_mut() {
+                let Some(chunk) = share.chunks.front().copied() else {
+                    work.pop();
+                    continue;
+                };
+                let ask_head = share.ask_head;
+
+                aframe!(self.wait_for_request_slot()).await;
+
+                // **The head of the lookahead first, at every slot.** A slot
+                // frees when a chunk lands, which is when this peer's latency
+                // was re-measured -- the event the one comparison
+                // (`CLAIMS.md`) is about -- so this is the moment to ask
+                // whether the two pieces the reader is waiting on have a share
+                // for it: a pool share now that the piece is older than its
+                // round trip, or a lagging claim to copy. What it is given it
+                // sends first, and comes back to this share after. Before
+                // this, a peer turned away from a head piece a few
+                // milliseconds old was handed a whole piece deeper in and sent
+                // all 256 chunks of it before asking again: the field of
+                // 2026-09-15 had ten of sixteen shares of the head piece
+                // unclaimed for two seconds with the peers that outpaced it
+                // all committed elsewhere, and a 5.4 s read.
+                if ask_head
+                    && let Some(Next::Share(piece, chunks)) = self.acquire_next_piece(Ask::Head)?
+                {
+                    let head = ShareWork {
+                        chunks: self.chunks_to_send(piece, chunks),
+                        ask_head: false,
+                    };
+                    work.push(head);
+                    continue;
                 }
+                share.chunks.pop_front();
+
                 let request = Request {
-                    index: next.get(),
+                    index: chunk.piece_index.get(),
                     begin: chunk.offset,
                     length: chunk.size,
                 };
-
-                aframe!(self.wait_for_request_slot()).await;
 
                 self.state
                     .ratelimits
@@ -2688,6 +2719,39 @@ impl PeerHandler {
                 }
             }
         }
+    }
+
+    /// The chunks of this peer's share of `piece` to ask for: **only the
+    /// ones that are not already on disk.** One claim may have several
+    /// holders -- which is what rescues a piece from a peer that has
+    /// stalled on it -- and the losers of that race are cancelled only when
+    /// the whole piece completes, so without this a holder re-requests
+    /// every chunk of the claim while the winner is delivering them. The
+    /// bytes arrive, are counted into `fetched_bytes`, and are dropped at
+    /// the write as `PreviouslyCompleted`: 210 MB of 592 MB fetched in the
+    /// field log of 2026-09-14.
+    ///
+    /// One reading, before the loop rather than per chunk: a chunk that
+    /// lands while we are sending is one redundant request, which is what
+    /// every chunk cost before this. The rest of the piece is either
+    /// another peer's claim or still unclaimed, and this peer comes back
+    /// round for one of those when it is done here.
+    fn chunks_to_send(&self, piece: ValidPieceIndex, claimed: Range<u32>) -> VecDeque<ChunkInfo> {
+        let mut to_request = {
+            let g = self.state.lock_read("chunks already on disk");
+            g.get_chunks()
+                .map(|chunks| chunks.chunks_to_request(piece, &claimed))
+                .unwrap_or_default()
+                .into_iter()
+        };
+        self.state
+            .lengths
+            .iter_chunk_infos_in(piece, claimed)
+            // `true` for a chunk to ask for, and `true` for one this reading
+            // could not answer for, which is how it behaved before there was
+            // a reading.
+            .filter(|_| to_request.next().unwrap_or(true))
+            .collect()
     }
 
     fn on_i_am_choked(&self) {
@@ -3237,10 +3301,10 @@ mod connection_tests {
     };
     use peer_binary_protocol::Piece;
     use tempfile::TempDir;
-    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
     use tokio_util::sync::CancellationToken;
 
-    use super::{BF, Next, PeerHandler, TorrentStateLocked, WriterRequest};
+    use super::{Ask, BF, Next, PeerHandler, TorrentStateLocked, WriterRequest};
     use crate::{
         AddTorrent, CreateTorrentOptions, ManagedTorrentShared, Session, TorrentMetadata,
         create_torrent,
@@ -3318,10 +3382,13 @@ mod connection_tests {
             Next::Crowded => panic!("a fresh piece is nobody's to be over a share of"),
         };
         let old_piece = piece_of(
-            old.acquire_next_piece()?
+            old.acquire_next_piece(Ask::Anything)?
                 .context("the old one gets a piece")?,
         );
-        let new_piece = piece_of(new.acquire_next_piece()?.context("so does the new one")?);
+        let new_piece = piece_of(
+            new.acquire_next_piece(Ask::Anything)?
+                .context("so does the new one")?,
+        );
         assert_ne!(old_piece, new_piece);
 
         old.on_peer_died(None)?;
@@ -3502,7 +3569,7 @@ mod connection_tests {
         // Half a second on, A has been silent for longer than B's chunk
         // took. B's request loop asks, and is cut into A's piece.
         tokio::time::sleep(Duration::from_millis(500)).await;
-        match b.acquire_next_piece()? {
+        match b.acquire_next_piece(Ask::Anything)? {
             Some(Next::Share(piece, chunks)) => {
                 assert_eq!(
                     piece, head,
@@ -3785,6 +3852,166 @@ mod connection_tests {
                 "chunk {chunk} was already on disk and was requested anyway; asked for {asked:?}"
             );
         }
+        Ok(())
+    }
+
+    /// **A peer on a whole piece gives its next slot to the head.**
+    ///
+    /// Fresh, it outpaces nothing: the head pieces are spoken for by
+    /// holders handed their claims a moment ago, so it is given work
+    /// deeper in and fills its window with it. Then its first chunk lands.
+    /// It has a latency now, shorter than the head's claims have been out,
+    /// and a slot -- and the slot goes to the head piece, not to the next
+    /// chunk of the piece it was on. Before this the loop sent every chunk
+    /// of the deeper piece first, and a peer that could rescue the head
+    /// piece was gone for two request windows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_on_a_whole_piece_gives_its_next_slot_to_the_head() -> anyhow::Result<()> {
+        setup_test_logging();
+        const CHUNKS_PER_PIECE: u32 = 32;
+        const PIECE_LEN: u32 = CHUNK_SIZE * CHUNKS_PER_PIECE;
+
+        let files =
+            create_default_random_dir_with_torrents(1, PIECE_LEN as usize * 4, Some("head_first"));
+        let torrent = create_torrent(
+            files.path(),
+            CreateTorrentOptions {
+                piece_length: Some(PIECE_LEN),
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await?;
+        let dir = TempDir::with_prefix("head_first_client")?;
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            crate::SessionOptions {
+                dht: None,
+                persistence: None,
+                peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.as_bytes()?.to_vec()),
+                Some(crate::AddTorrentOptions {
+                    overwrite: true,
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        tokio::time::timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+        let live = handle.live().context("expected a live torrent")?;
+        let head = live.lengths.validate_piece_index(0).context("piece 0")?;
+        let second = live.lengths.validate_piece_index(1).context("piece 1")?;
+        let deeper = live.lengths.validate_piece_index(2).context("piece 2")?;
+        // A stream parked at the start of the file: pieces 0 and 1 are the
+        // head of its lookahead, and piece 2 is the first handed out whole.
+        let _stream = handle.clone().stream(0).await?;
+
+        // Another peer holds both head pieces, every claim of them, handed
+        // out just now.
+        let other = SocketAddr::from((Ipv4Addr::LOCALHOST, 1));
+        {
+            let mut g = live.lock_write("test");
+            let TorrentStateLocked {
+                pieces,
+                file_priorities,
+                ..
+            } = &mut **g;
+            let pieces = pieces.as_mut().context("no chunk tracker")?;
+            for expected in [head, head, second, second] {
+                match pieces.acquire_piece(crate::piece_tracker::AcquireRequest {
+                    peer: other,
+                    connection: 0,
+                    now: std::time::Instant::now(),
+                    peer_avg_time: None,
+                    last_latency: None,
+                    priority_pieces: [head, second].into_iter(),
+                    file_priorities,
+                    file_infos: &live.metadata.file_infos,
+                    peer_has_piece: |_| true,
+                    can_steal: |_| true,
+                }) {
+                    crate::piece_tracker::AcquireResult::Reserved { piece, .. } => {
+                        anyhow::ensure!(piece == expected, "the other peer got {piece}");
+                    }
+                    other => anyhow::bail!("expected a reservation, got {other:?}"),
+                }
+            }
+        }
+
+        // Our peer, fresh, with a window of four requests, let loose on the
+        // request loop.
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 2));
+        live.peers
+            .add_if_not_seen(addr)
+            .context("a fresh address")?;
+        let (_rx, _tx) = live
+            .peers
+            .mark_peer_connecting(addr, CancellationToken::new())?;
+        live.peers.with_peer_mut(addr, "test", |p| {
+            p.connecting_to_live(Id20::new([0u8; 20]), &live.peers, ConnectionKind::Tcp);
+        });
+        live.peers.with_live_mut(addr, "test", |l| {
+            l.bitfield = BF::from_boxed_slice(vec![0xffu8].into_boxed_slice());
+        });
+        let (tx, mut requests) = unbounded_channel();
+        let handler = PeerHandler::for_test(live.clone(), addr, tx);
+        handler.lock_flow_control("test").request_window = 4;
+        let requester = tokio::spawn(async move { handler.task_peer_chunk_requester().await });
+
+        let next_request = async |requests: &mut UnboundedReceiver<WriterRequest>| {
+            loop {
+                let sent = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+                    .await
+                    .context("the peer sent nothing")?
+                    .context("the requester hung up")?;
+                if let WriterRequest::Message(peer_binary_protocol::Message::Request(r)) = sent {
+                    return anyhow::Ok(r);
+                }
+            }
+        };
+
+        // Nothing at the head for a peer with no latency: it is on the
+        // deeper piece, and fills its window with it.
+        let mut first = Vec::new();
+        for _ in 0..4 {
+            first.push(next_request(&mut requests).await?);
+        }
+        anyhow::ensure!(
+            first.iter().all(|r| r.index == deeper.get()),
+            "expected four requests for piece {deeper}, got {first:?}"
+        );
+        anyhow::ensure!(
+            tokio::time::timeout(Duration::from_millis(200), requests.recv())
+                .await
+                .is_err(),
+            "a fifth request went out past a window of four"
+        );
+
+        // Its first chunk lands: a latency, shorter than the head's claims
+        // have been out, and a slot.
+        let landed = live
+            .lengths
+            .chunk_info_from_received_data(deeper, first[0].begin, CHUNK_SIZE)
+            .context("a chunk of the deeper piece")?;
+        live.peers.with_live_mut(addr, "test", |l| {
+            l.remove_inflight_request(&landed);
+        });
+        let next = next_request(&mut requests).await?;
+        requester.abort();
+        anyhow::ensure!(
+            next.index == head.get(),
+            "the freed slot went to piece {} at {}, not to the head piece {head}",
+            next.index,
+            next.begin
+        );
         Ok(())
     }
 
