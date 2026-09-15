@@ -82,10 +82,13 @@ pieces this peer could actually take.
    so the first visitor took every share within a millisecond and nothing
    was spread.
 
-3. **Double a claim** (`stalled_claim`). Only a claim that has **delivered
-   nothing of its own** (`left == missing_at_start`), only if the asker
-   outpaces its holder, only up to two holders, never the asker's own. Two
-   healthy peers therefore never double each other.
+3. **Double a claim** (`stalled_claim`). Any claim with chunks still
+   missing, if the asker outpaces its holder -- the one rule, nothing
+   else -- up to two holders, never the asker's own. Whatever the claim
+   has delivered so far: a holder with a window of requests out lands a
+   chunk every few milliseconds and is never outpaced, so two healthy
+   peers never double each other; a holder trickling a chunk a second is
+   outpaced between its chunks and rescued.
 
 4. **Refused everywhere: `Crowded`.** Returned only after the whole
    lookahead, a steal attempt and the ordinary queue have all yielded
@@ -105,14 +108,6 @@ pieces this peer could actually take.
    was in none of the three sets and would otherwise never be fetched
    again.
 
-## Judged on its own work
-
-`Participant::missing_at_start` records how many chunks of the claim were
-missing when it was handed out. A claim put back by a peer that left comes
-back with that peer's chunks on disk, and the next holder is not credited
-with them: they are not its progress, so a stalled re-handed claim can
-still be doubled.
-
 ## What this replaced, so nobody rebuilds it
 
 - **Blind doubling** (any arriving peer could double any claim with the
@@ -130,6 +125,14 @@ still be doubled.
 - **The `idle` escape** (a peer with nothing in flight could take anything):
   unnecessary, since a peer over its share has claims to wait on, and a
   fresh peer belongs on the vanilla queue.
+- **"Only a claim that has delivered nothing"** as the doubling gate, with
+  `missing_at_start` to judge a re-handed claim on its own work. The first
+  field log on the latency rules (2026-09-15) showed why not: a holder
+  trickling a chunk a second is "being fetched" and never rescued, and the
+  piece completes when it finishes its sixteen chunks -- a 24-second block
+  on the head piece with fifteen seeders, a 30-second one with twenty-two.
+  The outpacing rule alone already spares a healthy holder, since its
+  deliveries are milliseconds apart.
 
 ## Cost of being wrong
 
@@ -140,25 +143,13 @@ peer: it waits one chunk arrival, not a timer.
 
 ## Status
 
-Built 2026-09-14, the same evening it was agreed. `piece_tracker.rs` carries
-the rules; `torrent_state/live/peer/mod.rs` prices a peer on each arrival
-(`inflight_requests` is a map from chunk to `sent_at`); the write path in
-`torrent_state/live/mod.rs` stamps `note_delivery`; `acquire_next_piece`
-hands `last_latency` in. `proven`, `contested`, `idle` and `SPREAD_GRACE`
-are gone.
-
-Every rule has a test that fails without it, checked by mutation, not by
-reading: `outpaces` itself, the wait running from the holder's last
-delivery rather than its start, the `missing_at_start` skip, the own-claim
-skip, the cut gate on `split_whole`, the delivered-since-last-handout gate
-on an over-share, the stamp being written, the latency being computed, and
-the latency being handed in (`a_delivered_chunk_prices_the_peer_and_stamps_its_hold`
-covers the last three end to end, with a stream, two peers and a real
-`on_received_piece`).
-
-Untested in the field as of this writing. What to look for in the next
-log: `unverified` (fetched minus verified) well under the 35% blind
-doubling cost and the 3-4% the grace version measured; the head piece of a
-blocked read being fetched by several peers rather than one; and no
-healthy holder being cut (a cut shows as two holders on a piece whose
-first holder is still delivering).
+Built 2026-09-14 (`a31258c0`); every rule and the three wiring points are
+proven by a test that fails under mutation. First field log 2026-09-15
+(xtremio `a58f5f0`): the rules engaged and nothing was fetched twice at
+scale, but two head-piece reads still blocked for 24 and 30 seconds with a
+fast swarm. The doubling gate was the cause as far as the log can say, and
+it was widened to the one rule the same day (rule 3 above). A diagnostic
+line now dumps the head piece's claims -- holder, chunks missing, wait since
+its last delivery, its latency -- when a read has waited two seconds
+(`ManagedTorrent::piece_claims`), so the next log answers rather than
+suggests.

@@ -641,6 +641,16 @@ impl ManagedTorrent {
         }
     }
 
+    /// The holders of piece `index` and how each is doing, or nothing for a
+    /// torrent that is not live or a piece nobody holds. For a diagnostic
+    /// line about a read waiting on that piece; see
+    /// `TorrentStateLive::piece_claims`.
+    pub fn piece_claims(&self, index: u32) -> Vec<crate::piece_tracker::ClaimSnapshot> {
+        self.live()
+            .map(|live| live.piece_claims(index))
+            .unwrap_or_default()
+    }
+
     /// Get the live state if the torrent is live.
     pub fn live(&self) -> Option<Arc<TorrentStateLive>> {
         let g = self.locked.read();

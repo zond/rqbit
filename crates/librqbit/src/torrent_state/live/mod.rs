@@ -92,7 +92,7 @@ use crate::{
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
     },
-    piece_tracker::{AcquireRequest, AcquireResult, PieceTracker},
+    piece_tracker::{AcquireRequest, AcquireResult, ClaimSnapshot, PieceTracker},
     session::CheckedIncomingConnection,
     session_stats::SessionStats,
     stream_connect::ConnectionKind,
@@ -867,6 +867,30 @@ impl TorrentStateLive {
     }
     pub(crate) fn file_ops(&self) -> FileOps<'_> {
         FileOps::new(&self.metadata.info, &*self.files, &self.metadata.file_infos)
+    }
+
+    /// Every holder of `piece` and how it is doing, for a diagnostic line
+    /// about a read that is waiting on it: who holds which chunks, how many
+    /// are missing, how long we have waited on its last delivery, and the
+    /// latency of its own last chunk -- the two halves of the takeover rule
+    /// (`CLAIMS.md`), so a blocked read's log says why nobody took the
+    /// claim over. Empty for a piece nobody holds.
+    pub fn piece_claims(&self, index: u32) -> Vec<ClaimSnapshot> {
+        let Some(piece) = self.lengths.validate_piece_index(index) else {
+            return Vec::new();
+        };
+        let now = std::time::Instant::now();
+        let mut claims = match self.lock_read("piece_claims").get_pieces() {
+            Ok(pieces) => pieces.claims(piece, now),
+            Err(_) => return Vec::new(),
+        };
+        for claim in &mut claims {
+            claim.latency = self
+                .peers
+                .with_live(claim.peer, |live| live.last_latency())
+                .flatten();
+        }
+        claims
     }
 
     pub(crate) fn lock_read(
@@ -2624,17 +2648,20 @@ impl PeerHandler {
                         }) {
                         Some(true) => {}
                         Some(false) => {
-                            // This request was already in-flight for this peer for this chunk.
-                            // This might happen in theory, but not very likely.
-                            //
-                            // Example:
-                            // someone stole a piece from us, and then died, the piece became "needed" again, and we reserved it
-                            // all before the piece request was processed by us.
-                            warn!(
+                            // Already in flight with this peer: the ordinary
+                            // case is a piece this peer held whole that was
+                            // cut at the head of a stream's lookahead
+                            // (`split_whole`) -- its requests for the tail are
+                            // still out, and it has now been handed a pool
+                            // claim covering some of them. Nothing to send;
+                            // the chunk arrives once. Debug, because the
+                            // field's 400-line diagnostics ring took eighty of
+                            // these in ten milliseconds as a warning.
+                            debug!(
                                 id = self.state.shared.id,
                                 info_hash = ?self.state.shared.info_hash,
                                 addr = ?self.addr,
-                                "we already requested {:?} previously",
+                                "chunk {:?} is already in flight with this peer; not asking again",
                                 chunk
                             );
                             continue 'chunks;
