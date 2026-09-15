@@ -10,7 +10,7 @@ use anyhow::Context;
 
 use rand::{RngExt, seq::IteratorRandom};
 use size_format::SizeFormatterBinary as SF;
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use librqbit_core::lengths::{Lengths, ValidPieceIndex};
 
@@ -180,6 +180,14 @@ impl TorrentStateInitializing {
             .await;
         match cleared {
             Ok(0) => {}
+            // Under piece reclaim this is the norm and not a signal: the
+            // have-set is flushed on a schedule and the reclaim deletes
+            // pieces between flushes, so a restart always finds a few the
+            // record still claims. The intersection above is the sync.
+            Ok(cleared) if self.shared.options.piece_reclaim => debug!(
+                cleared,
+                "the resume data claimed pieces the reclaim has since released"
+            ),
             Ok(cleared) => warn!(
                 cleared,
                 "the resume data claimed pieces the storage no longer has"
