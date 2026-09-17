@@ -1311,6 +1311,15 @@ impl TorrentStateLive {
                 info!(id=self.shared.id, info_hash=?self.shared.info_hash, "torrent finished downloading");
             }
             self.finished_notify.notify_waiters();
+            // The last piece landing is what turns an idle request loop's
+            // next ask into "nothing left to do, disconnect", and a loop
+            // parked in its wait has nothing else to wake it: the Windows
+            // e2e runs of d1376b40 and 4110d894 counted 224 and 182 tasks
+            // alive fifteen seconds after the download, all of them that.
+            // The finish only -- a pulse on every piece was a herd: 2000
+            // pieces of 32 KiB in the download test, every idle loop
+            // re-walking the lookahead under the write lock for each.
+            self.new_pieces_notify.notify_waiters();
 
             if !self.has_active_streams_unfinished_files(locked) {
                 // prevent deadlocks.
@@ -1320,14 +1329,6 @@ impl TorrentStateLive {
                 self.disconnect_all_peers_that_have_full_torrent();
             }
         }
-        // A piece completing moves the head of every lookahead: what an
-        // idle peer could cut or join is not what it was when it was
-        // refused, and the last piece completing is what turns its loop's
-        // next ask into "nothing left, disconnect". A loop parked in its
-        // wait with nothing else to wake it sat until the backstop -- the
-        // Windows e2e run of 4110d894 counted 182 tasks alive fifteen
-        // seconds after the download, all of them that.
-        self.new_pieces_notify.notify_waiters();
         Ok(())
     }
 
