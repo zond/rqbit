@@ -143,12 +143,18 @@ before the reader arrived, on pieces that needed six.
 
 So the depth is a runtime setting (`PieceTracker::set_deadline_pieces`,
 through `ManagedTorrent`, kept for a torrent not yet live like the peer
-limit), and the tracker reports what its split pieces have been taking:
-`median_deadline_completion`, the median over the last sixteen deadline
-pieces of first-claim-to-last-chunk, the upper middle when even so that a
-horizon sized from it starts pieces earlier rather than later. Only pieces
-a reader waited on are samples; a piece one peer fetched whole deep in the
-lookahead says nothing about a reader's wait.
+limit), and the tracker reports what its pieces have been taking:
+`median_completion`, the median over the last sixteen completed pieces of
+first-claim-to-last-chunk, the upper middle when even so that a horizon
+sized from it starts pieces earlier rather than later. **Every piece is a
+sample, whole or split.** The horizon's question is how far ahead the
+split must start for a piece to be whole when the reader arrives, and
+until the split reaches it a piece is one peer's whole reservation -- so
+the whole pieces are the time to cover and the split ones, filled by
+several peers at once, are the fast end. A first draft sampled split
+pieces only, and measured the mode it was sizing: a deeper split made
+pieces faster, which made the depth shallower, which put the cut back to a
+second before the reader.
 
 **This crate holds no opinion about where the depth should sit.** It knows
 how long its pieces take but not how fast the reader eats them or when

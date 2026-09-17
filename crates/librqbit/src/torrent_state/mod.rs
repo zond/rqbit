@@ -652,7 +652,7 @@ impl ManagedTorrent {
     /// that is not live yet and applied when it goes live, like the peer limit.
     ///
     /// The number is the embedder's: this crate knows how long its pieces take
-    /// ([`Self::deadline_completion_median`]) but not how fast a reader consumes them
+    /// ([`Self::piece_completion_median`]) but not how fast a reader consumes them
     /// or when one has stalled, and those are what size it.
     pub fn set_deadline_pieces(&self, pieces: usize) {
         self.shared
@@ -673,12 +673,12 @@ impl ManagedTorrent {
             .unwrap_or_else(|| self.shared.deadline_pieces.load(Ordering::Relaxed))
     }
 
-    /// How long the pieces a reader waited on have been taking, first claim to last
-    /// chunk, as the median of the recent ones; `None` for a torrent that is not live
+    /// How long a piece has been taking, first claim to last chunk, as the median of
+    /// the recent ones, whole and split alike; `None` for a torrent that is not live
     /// or has completed none. See
-    /// [`crate::piece_tracker::PieceTracker::median_deadline_completion`].
-    pub fn deadline_completion_median(&self) -> Option<std::time::Duration> {
-        self.live()?.deadline_completion_median()
+    /// [`crate::piece_tracker::PieceTracker::median_completion`].
+    pub fn piece_completion_median(&self) -> Option<std::time::Duration> {
+        self.live()?.piece_completion_median()
     }
 
     /// The holders of piece `index` and how each is doing, or nothing for a

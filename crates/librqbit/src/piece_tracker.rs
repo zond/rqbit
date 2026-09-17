@@ -185,13 +185,13 @@ enum Share {
 /// the embedder that sees the stall raises the count
 /// ([`PieceTracker::set_deadline_pieces`]), and this tracker tells it how
 /// long its split pieces have been taking
-/// ([`PieceTracker::median_deadline_completion`]) so it knows where to
+/// ([`PieceTracker::median_completion`]) so it knows where to
 /// start.
 pub const DEFAULT_DEADLINE_PIECES: usize = 2;
 
 /// How many split-piece completion times are kept for the median: enough
 /// to smooth one slow piece, few enough to follow a swarm that changes.
-const DEADLINE_SAMPLES: usize = 16;
+const COMPLETION_SAMPLES: usize = 16;
 
 /// Tracks a piece currently being downloaded.
 ///
@@ -224,13 +224,6 @@ pub struct InflightPiece {
     /// flight, which is what every takeover on it is measured against
     /// ([`Activity::outpaces`]) and what the steal rule reads.
     started: Instant,
-    /// Whether a reader has been waiting on this piece -- reserved split
-    /// at the head of the lookahead, or cut there having been reserved
-    /// whole deeper in. What decides whether its completion time is one
-    /// of the samples behind [`PieceTracker::median_deadline_completion`]:
-    /// a piece nobody waited for says nothing about how long a reader
-    /// waits.
-    deadline: bool,
 }
 
 impl InflightPiece {
@@ -278,7 +271,6 @@ impl InflightPiece {
                 }],
                 unclaimed,
                 started,
-                deadline: split,
             },
             first,
         )
@@ -654,9 +646,10 @@ pub struct PieceTracker {
     /// How deep into the lookahead pieces are split; see
     /// [`DEFAULT_DEADLINE_PIECES`] and [`Self::set_deadline_pieces`].
     deadline_pieces: usize,
-    /// How long the last [`DEADLINE_SAMPLES`] deadline pieces took from
-    /// their first claim to their last chunk, oldest first.
-    deadline_completions: VecDeque<Duration>,
+    /// How long the last [`COMPLETION_SAMPLES`] pieces took from their
+    /// first claim to their last chunk, oldest first; see
+    /// [`Self::median_completion`].
+    completions: VecDeque<Duration>,
 }
 
 impl PieceTracker {
@@ -668,7 +661,7 @@ impl PieceTracker {
             chunks,
             inflight: HashMap::new(),
             deadline_pieces: DEFAULT_DEADLINE_PIECES,
-            deadline_completions: VecDeque::new(),
+            completions: VecDeque::new(),
         }
     }
 
@@ -683,7 +676,7 @@ impl PieceTracker {
     ///
     /// This is the embedder's knob and this tracker holds no opinion about
     /// where it should sit: it knows how long its pieces take
-    /// ([`Self::median_deadline_completion`]) but not how fast the reader
+    /// ([`Self::median_completion`]) but not how fast the reader
     /// consumes them, nor when the reader has actually stalled. What it
     /// guarantees is the mechanics -- pieces inside the count are split,
     /// joinable by anyone who outpaces the newest holder, and asked for
@@ -692,20 +685,28 @@ impl PieceTracker {
         self.deadline_pieces = pieces.max(1);
     }
 
-    /// How long a piece a reader waits on has been taking, from its first
-    /// claim to its last chunk: the median of the last
-    /// [`DEADLINE_SAMPLES`] such pieces, or `None` before any completed.
+    /// How long a piece has been taking, from its first claim to its last
+    /// chunk: the median of the last [`COMPLETION_SAMPLES`] completed, or
+    /// `None` before any has.
+    ///
+    /// **Every piece is a sample**, whole or split. The question a horizon
+    /// sized from this answers is "how far ahead must the split start for
+    /// the piece to be whole when the reader arrives", and until the split
+    /// reaches it a piece *is* one peer's whole reservation -- so what a
+    /// whole piece takes is the time to cover, and the split pieces, which
+    /// several peers fill at once, are the fast end of the sample. A median
+    /// of split pieces alone measured the mode it was sizing: a deeper
+    /// split made pieces faster, which made the depth shallower, which put
+    /// the cut back to a second before the reader.
     ///
     /// The upper of the two middles when the count is even, so a horizon
     /// sized from it errs towards starting a piece earlier rather than
-    /// later. Only deadline pieces count -- a piece fetched whole deep in
-    /// the lookahead, by one peer at whatever pace, is not a measurement of
-    /// how long a reader waits.
-    pub fn median_deadline_completion(&self) -> Option<Duration> {
-        if self.deadline_completions.is_empty() {
+    /// later.
+    pub fn median_completion(&self) -> Option<Duration> {
+        if self.completions.is_empty() {
             return None;
         }
-        let mut sorted: Vec<Duration> = self.deadline_completions.iter().copied().collect();
+        let mut sorted: Vec<Duration> = self.completions.iter().copied().collect();
         sorted.sort_unstable();
         Some(sorted[sorted.len() / 2])
     }
@@ -929,10 +930,7 @@ impl PieceTracker {
                     let share = if deep < deadline_pieces {
                         // A piece that reached the head whole is cut here,
                         // as it would have been had it been reserved here;
-                        // see [`InflightPiece::split_whole`]. It is a
-                        // deadline piece from here on whether or not
-                        // anything is cut: a reader is waiting on it.
-                        inflight.deadline = true;
+                        // see [`InflightPiece::split_whole`].
                         inflight.split_whole(
                             |claim| tracker.chunks_missing(piece, claim),
                             activity,
@@ -1100,12 +1098,10 @@ impl PieceTracker {
     pub fn take_inflight_at(&mut self, piece: ValidPieceIndex, now: Instant) -> Option<Duration> {
         let inflight = self.inflight.remove(&piece)?;
         let took = now.saturating_duration_since(inflight.started);
-        if inflight.deadline {
-            if self.deadline_completions.len() == DEADLINE_SAMPLES {
-                self.deadline_completions.pop_front();
-            }
-            self.deadline_completions.push_back(took);
+        if self.completions.len() == COMPLETION_SAMPLES {
+            self.completions.pop_front();
         }
+        self.completions.push_back(took);
         Some(took)
     }
 
@@ -2786,20 +2782,16 @@ mod tests {
         );
     }
 
-    /// **The median is of the pieces a reader waited on, and of nothing
-    /// else.** A piece reserved whole deep in the lookahead and fetched by
-    /// one peer at its own pace says nothing about how long a reader
-    /// waits, however long it took.
+    /// **The median is of every piece, whole or split.** A piece one peer
+    /// fetched whole deep in the lookahead is what a piece is until the
+    /// split reaches it, so its time is the time a horizon has to cover;
+    /// the split pieces are the fast end of the sample, not the sample.
     #[test]
-    fn the_completion_median_counts_deadline_pieces_only() {
+    fn the_completion_median_counts_every_piece() {
         let (mut tracker, _file_infos, _priorities) = make_split_tracker(6);
         let t0 = Instant::now();
         let secs = |n: u64| t0 + Duration::from_secs(n);
-        assert_eq!(
-            tracker.median_deadline_completion(),
-            None,
-            "nothing has completed"
-        );
+        assert_eq!(tracker.median_completion(), None, "nothing has completed");
 
         // Two split at the head, one whole and slow deep in.
         tracker.reserve_piece(piece(&tracker, 0), peer(1), 0, true, t0);
@@ -2808,30 +2800,26 @@ mod tests {
         assert_eq!(
             tracker.take_inflight_at(piece(&tracker, 5), secs(40)),
             Some(Duration::from_secs(40)),
-            "the whole piece's own time is still reported to its caller"
         );
         assert_eq!(
-            tracker.median_deadline_completion(),
-            None,
-            "but it is not a sample: nobody was waiting on it"
+            tracker.median_completion(),
+            Some(Duration::from_secs(40)),
+            "the whole piece is a sample: it is what a piece takes on one peer"
         );
 
         tracker.take_inflight_at(piece(&tracker, 0), secs(4));
         assert_eq!(
-            tracker.median_deadline_completion(),
-            Some(Duration::from_secs(4))
-        );
-        tracker.take_inflight_at(piece(&tracker, 1), secs(8));
-        assert_eq!(
-            tracker.median_deadline_completion(),
-            Some(Duration::from_secs(8)),
+            tracker.median_completion(),
+            Some(Duration::from_secs(40)),
             "the upper middle of an even count: the horizon errs towards earlier"
         );
+        tracker.take_inflight_at(piece(&tracker, 1), secs(8));
+        assert_eq!(tracker.median_completion(), Some(Duration::from_secs(8)));
     }
 
-    /// A piece reserved whole that the stream then reaches becomes a
-    /// deadline piece, and its completion counts from its first claim --
-    /// the reader waited for all of it, not just the part after the cut.
+    /// A piece reserved whole that the stream then reaches and cuts counts
+    /// from its first claim -- the reader waited for all of it, not just
+    /// the part after the cut.
     #[test]
     fn a_piece_cut_at_the_head_counts_from_its_first_claim() {
         let (mut tracker, file_infos, priorities) = make_split_tracker(6);
@@ -2853,7 +2841,7 @@ mod tests {
         );
         tracker.take_inflight_at(reached, secs(12));
         assert_eq!(
-            tracker.median_deadline_completion(),
+            tracker.median_completion(),
             Some(Duration::from_secs(12)),
             "twelve seconds from the first claim, not two from the cut"
         );

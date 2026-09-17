@@ -1415,12 +1415,12 @@ impl TorrentStateLive {
         )
     }
 
-    /// See [`crate::ManagedTorrent::deadline_completion_median`].
-    pub fn deadline_completion_median(&self) -> Option<std::time::Duration> {
-        self.lock_read("deadline_completion_median")
+    /// See [`crate::ManagedTorrent::piece_completion_median`].
+    pub fn piece_completion_median(&self) -> Option<std::time::Duration> {
+        self.lock_read("piece_completion_median")
             .pieces
             .as_ref()?
-            .median_deadline_completion()
+            .median_completion()
     }
 
     /// Change the live-peer cap of a running torrent.
@@ -3509,7 +3509,7 @@ mod connection_tests {
         handle.set_deadline_pieces(7);
         assert_eq!(live.deadline_pieces(), Some(7));
         assert_eq!(
-            handle.deadline_completion_median(),
+            handle.piece_completion_median(),
             None,
             "nothing has been fetched, so there is nothing to measure yet"
         );
