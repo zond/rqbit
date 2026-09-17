@@ -2096,11 +2096,23 @@ impl PeerConnectionHandler for &'_ PeerHandler {
 enum Next {
     /// A share of a piece to send requests for.
     Share(ValidPieceIndex, Range<u32>),
-    /// Nothing now, but a piece this peer is over its share of still has
-    /// shares other peers may be coming for: ask again once a chunk of this
-    /// peer's own has landed (`piece_tracker::CLAIMS_PER_PEER`).
-    Crowded,
+    /// Nothing now. Ask again when a chunk of this peer's own lands (what
+    /// makes a share its under `piece_tracker::CLAIMS_PER_PEER`), when the
+    /// lookahead changes (`new_pieces_notify`), or at `retry_at` -- when a
+    /// claim or a whole head piece it saw will have been in flight longer
+    /// than its own round trip and is its to join or cut. `None` when only
+    /// an event can change the answer. See CLAIMS.md, "When a refused peer
+    /// asks again".
+    Wait { retry_at: Option<Instant> },
 }
+
+/// How long an idle request loop waits before asking again with nothing
+/// having woken it. Every refusal names what would lift it -- a chunk of
+/// the peer's own, a change to the lookahead, an instant -- so nothing
+/// should ever reach this; when something does, a wake-up is missing and
+/// the loop says so at `info`, which is the one trace of it a field log
+/// would carry.
+const IDLE_BACKSTOP: Duration = Duration::from_secs(30);
 
 /// How much of the tracker a request loop is asking for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2337,6 +2349,9 @@ impl PeerHandler {
 
         // Steal info to process after releasing the peer lock
         let mut steal_info: Option<(SocketAddr, ValidPieceIndex)> = None;
+        // Whether this ask put shares in a pool, which the idle loops are
+        // told about once the locks are down.
+        let mut pool_changed = false;
 
         let result = self
             .state
@@ -2375,7 +2390,7 @@ impl PeerHandler {
                     Ask::Head => pieces.acquire_head_share(request),
                 };
 
-                match result {
+                let next = match result {
                     AcquireResult::Reserved { piece, chunks } => {
                         trace!("reserved piece {} chunks {:?}", piece, chunks);
                         Ok(Some(Next::Share(piece, chunks)))
@@ -2390,9 +2405,11 @@ impl PeerHandler {
                         steal_info = Some((from_peer, piece));
                         Ok(Some(Next::Share(piece, chunks)))
                     }
-                    AcquireResult::NoneAvailable => Ok(None),
-                    AcquireResult::Crowded => Ok(Some(Next::Crowded)),
-                }
+                    AcquireResult::NoneAvailable { retry_at }
+                    | AcquireResult::Crowded { retry_at } => Ok(Some(Next::Wait { retry_at })),
+                };
+                pool_changed = pieces.take_pool_changed();
+                next
             })
             .transpose()
             .map(|r| r.flatten());
@@ -2400,6 +2417,9 @@ impl PeerHandler {
         // Process steal notification outside the peer lock to avoid deadlock
         if let Some((from_peer, piece)) = steal_info {
             self.state.peers.on_steal(from_peer, self.addr, piece);
+        }
+        if pool_changed {
+            self.state.new_pieces_notify.notify_waiters();
         }
 
         result
@@ -2599,40 +2619,68 @@ impl PeerHandler {
 
             // The lookahead, a 10x steal, the queue, a 3x steal: see `acquire_next_piece`.
             let new_piece_notify = self.state.new_pieces_notify.notified();
+            // And this peer's own bitfield growing -- a Have or Bitfield
+            // from it -- which is the one change that makes a piece it
+            // could not take takeable.
+            let have_notify = self.on_bitfield_notify.notified();
             // Armed before the ask, so a chunk landing between the ask and
             // the wait is not a wake-up missed.
             let slots = self.request_slots_changed();
             let slot_freed = slots.as_ref().map(|notify| notify.notified());
             let (next, claimed) = match self.acquire_next_piece(Ask::Anything)? {
                 Some(Next::Share(next, claimed)) => (next, claimed),
-                Some(Next::Crowded) => {
-                    // Turned away from shares other peers may be coming for,
-                    // with nothing else to do. What would make a share this
-                    // peer's is a chunk of its own landing
-                    // (`piece_tracker::CLAIMS_PER_PEER`), and a landing frees
-                    // a request slot -- so that is what is waited for, with
-                    // the long timeout as the backstop.
-                    match slot_freed {
-                        Some(freed) => {
-                            let _ =
-                                aframe!(tokio::time::timeout(Duration::from_secs(5), freed)).await;
+                Some(Next::Wait { retry_at }) => {
+                    // Refused everywhere, for now. Four things change the
+                    // answer, and the loop waits for whichever comes first:
+                    // a chunk of its own landing, which frees a request
+                    // slot and makes a share its; the lookahead changing --
+                    // shares handed back, a piece cut or reserved split at
+                    // the head, a stream, a hash failure -- which pulses
+                    // `new_pieces_notify`; this peer announcing a piece it
+                    // did not have; and time, when the claim or the whole
+                    // head piece it was turned away from has been in flight
+                    // for its own round trip. Nothing else is worth waking
+                    // for, so the backstop is long and its firing is a bug
+                    // report.
+                    // No slot notify is a peer the live table does not
+                    // hold right now (the e2e tests reach here between
+                    // states): the other two wake-ups still apply.
+                    let freed = async move {
+                        match slot_freed {
+                            Some(freed) => freed.await,
+                            None => std::future::pending::<()>().await,
                         }
-                        None => return Ok(()),
-                    }
+                    };
+                    let retry = async move {
+                        match retry_at {
+                            Some(at) => tokio::time::sleep_until(at.into()).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    };
+                    aframe!(async {
+                        tokio::select! {
+                            _ = freed => debug!("a chunk of our own landed, asking again"),
+                            _ = new_piece_notify => debug!("the lookahead changed, asking again"),
+                            _ = have_notify => debug!("the peer has a piece it did not, asking again"),
+                            _ = retry => debug!("a claim we saw is ours to join now, asking again"),
+                            _ = tokio::time::sleep(IDLE_BACKSTOP) => info!(
+                                had_retry = retry_at.is_some(),
+                                "an idle request loop woke on the backstop: a wake-up is missing somewhere"
+                            ),
+                        }
+                    })
+                    .await;
                     continue;
                 }
                 None => {
-                    debug!("no pieces to request");
-                    match aframe!(tokio::time::timeout(
-                        // Half of default rw timeout not to race with it.
+                    // Choked: nothing to ask for until the peer unchokes us,
+                    // which arrives on its own message.
+                    debug!("choked, nothing to request");
+                    let _ = aframe!(tokio::time::timeout(
                         Duration::from_secs(5),
                         new_piece_notify
                     ))
-                    .await
-                    {
-                        Ok(()) => debug!("woken up, new pieces might be available"),
-                        Err(_) => debug!("woken up by sleep timer"),
-                    }
+                    .await;
                     continue;
                 }
             };
@@ -3418,7 +3466,7 @@ mod connection_tests {
 
         let piece_of = |next: Next| match next {
             Next::Share(piece, _) => piece,
-            Next::Crowded => panic!("a fresh piece is nobody's to be over a share of"),
+            Next::Wait { .. } => panic!("a fresh piece is nobody's to be over a share of"),
         };
         let old_piece = piece_of(
             old.acquire_next_piece(Ask::Anything)?

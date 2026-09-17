@@ -108,12 +108,11 @@ pieces this peer could actually take.
    fourteen seconds and a doubler with five seconds of latency, and a cap
    of two kept every faster peer off it for six seconds.
 
-4. **Refused everywhere: `Crowded`.** Returned only after the whole
-   lookahead, a steal attempt and the ordinary queue have all yielded
-   nothing. The request loop then waits for **its own next chunk to land**
-   -- the event that would make a share its -- with the existing 5 s wait
-   as backstop. A peer over its share always has claims in flight to wait
-   on, so this cannot deadlock.
+4. **Refused everywhere.** `Crowded` or `NoneAvailable`, only after the
+   whole lookahead, a steal attempt and the ordinary queue have all
+   yielded nothing -- and each carries `retry_at`, the first instant a
+   refusal it met on the way would be lifted by time. What the request
+   loop then waits for is under "When a refused peer asks again" below.
 
 5. **A fresh peer** outpaces nothing: two free shares if any, otherwise a
    whole piece from the ordinary queue. It proves itself there.
@@ -167,6 +166,42 @@ new video opens. Reactive joining -- letting anyone pile onto a blocked
 piece's last range -- was considered and rejected: it duplicates the range
 once per peer that frees a slot and can only shorten a stall that has
 already started, where a depth sized from measurement prevents it.
+
+## When a refused peer asks again
+
+A refusal is a fact about a moment, and three kinds of moment change it.
+The request loop waits for whichever comes first, and for nothing else:
+
+- **A chunk of its own lands.** That frees a request slot and, under
+  `CLAIMS_PER_PEER`, is what makes a share of a crowded piece its.
+- **The lookahead changes** -- `new_pieces_notify`. Shares handed back by
+  a choked or dead peer, a hash failure requeuing a piece, a stream or a
+  selection changing what is wanted, and, since the seventh field log
+  (2026-09-17 14:55), **shares put in a pool**: a piece reserved split at
+  the head, or a whole one cut there (`PieceTracker::take_pool_changed`,
+  pulsed by `acquire_next_piece` once the locks are down). An idle peer
+  with nothing it could join is waiting for exactly that, and nothing
+  else it waits on announced it.
+- **Time.** Every "only if the asker outpaces" rule -- cut a whole head
+  piece, take a share beyond two, join a claim -- is `my_latency < now -
+  since`, and the walk knows `since` when it says no. So it keeps the
+  earliest `since + my_latency` over everything it refused
+  (`Retry`), and the loop sleeps until then (`retry_at`). A fresh peer
+  outpaces nothing and gets `None`; so does a peer that saw nothing it
+  could ever join. Exact, per peer, one wake at the first useful moment,
+  and no timer scanning the claims under the write lock.
+
+Before this, a refused peer slept a flat five seconds unless a chunk of
+its own landed. In the field log of 2026-09-17 14:55 the last claim of
+the tail piece sat with a holder of 6.9 s round trip while a peer of
+489 ms, nine claims of that piece already delivered, was refused at ~400
+ms of the claim's age -- not yet outpacing it -- and, with nothing in
+flight, slept through the moment it would have been let in; the piece
+took 6.5 s from the slow holder. With `retry_at` it asks again at 490 ms.
+
+A backstop of thirty seconds remains, and its firing is logged at `info`
+(`an idle request loop woke on the backstop`): nothing legitimate reaches
+it, so a line in a field log means a wake-up is missing somewhere.
 
 ## What this replaced, so nobody rebuilds it
 

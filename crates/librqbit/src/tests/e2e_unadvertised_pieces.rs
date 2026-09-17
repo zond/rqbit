@@ -571,14 +571,16 @@ async fn e2e_unadvertised_pieces_completing_while_held_back() -> anyhow::Result<
         middle.set_pieces_advertised(0..TOTAL_PIECES, true)?,
         TOTAL_PIECES as usize
     );
-    // What the watcher then downloads is not waited for here: its request loop parks on a
-    // five-second timer when a peer has nothing it wants, and nothing wakes it when that
-    // changes, so waiting for the transfer would time the timer and not the announcement.
-    // A piece put back reaching a connected peer's disk is what
-    // test_e2e_unadvertised_pieces_come_back asserts.
+    // Either the watcher now sees the middle as a seeder, or it has already
+    // fetched the lot and the two have parted as finished peers do: a
+    // request loop woken by the Haves it was waiting on downloads sixteen
+    // small pieces over loopback faster than this polls, and used to sit on
+    // a five-second timer instead. Both mean the Haves arrived; the counters
+    // below say on which connection.
     timeout(Duration::from_secs(30), async {
         loop {
-            if live_peers(&watcher)?.1 == 1 {
+            if live_peers(&watcher)?.1 == 1 || have_pieces(&watcher)?.len() == TOTAL_PIECES as usize
+            {
                 return Ok::<_, anyhow::Error>(());
             }
             tokio::time::sleep(Duration::from_millis(20)).await;

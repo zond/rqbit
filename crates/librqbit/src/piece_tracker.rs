@@ -83,6 +83,9 @@ struct Activity {
     /// How long this peer's most recent chunk took, request to arrival;
     /// `None` before the first.
     last_latency: Option<Duration>,
+    /// The one reading of the clock this ask is made at; see
+    /// [`AcquireRequest::now`].
+    now: Instant,
 }
 
 impl Activity {
@@ -98,9 +101,37 @@ impl Activity {
     /// seconds of latency and a hundred requests in flight lands a chunk
     /// every few milliseconds and never looked quiet, while its piece took
     /// ten seconds. What the reader waits on is the piece.
-    fn outpaces(&self, since: Instant, now: Instant) -> bool {
-        let waited = now.saturating_duration_since(since);
+    fn outpaces(&self, since: Instant) -> bool {
+        let waited = self.now.saturating_duration_since(since);
         self.last_latency.is_some_and(|latency| latency < waited)
+    }
+
+    /// The instant [`Self::outpaces`] over `since` turns true -- when a
+    /// peer refused now would be admitted -- or `None` for a peer that has
+    /// never delivered, which outpaces nothing however long it waits. The
+    /// comparison is strict, so one millisecond past the round trip.
+    fn ready_at(&self, since: Instant) -> Option<Instant> {
+        self.last_latency
+            .map(|latency| since + latency + Duration::from_millis(1))
+    }
+}
+
+/// **When a peer refused on time grounds should ask again**: the earliest
+/// of the instants at which each refusal it met -- a cut it did not yet
+/// outpace the piece for, a share beyond its two, a claim whose newest
+/// holder it did not yet outpace -- would have gone the other way. The
+/// walk collects it as it refuses, and the request loop sleeps until it
+/// rather than for a fixed spell; see CLAIMS.md, "When a refused peer
+/// asks again". `None` when nothing time-based was refused: a fresh peer,
+/// or a lookahead with nothing this peer could ever join.
+#[derive(Debug, Default, Clone, Copy)]
+struct Retry(Option<Instant>);
+
+impl Retry {
+    fn refused(&mut self, activity: Activity, since: Instant) {
+        if let Some(at) = activity.ready_at(since) {
+            self.0 = Some(self.0.map_or(at, |best| best.min(at)));
+        }
     }
 }
 
@@ -301,7 +332,7 @@ impl InflightPiece {
         missing: impl Fn(&Range<u32>) -> u32,
         share: Share,
         activity: Activity,
-        now: Instant,
+        retry: &mut Retry,
     ) -> Result<Option<Range<u32>>, Crowded> {
         // This connection's finished shares are over. It is back here
         // because it has sent every request of them and they have all
@@ -333,13 +364,14 @@ impl InflightPiece {
             // in the pool, and whoever returns half a second later takes
             // them. See [`CLAIMS_PER_PEER`].
             Some(_) => {
-                if !activity.outpaces(self.started, now) {
+                if !activity.outpaces(self.started) {
+                    retry.refused(activity, self.started);
                     return Err(Crowded);
                 }
                 self.unclaimed.pop_front().expect("front() just answered")
             }
             None if share == Share::Unclaimed => return Ok(None),
-            None => match self.stalled_claim(peer, &missing, activity, now) {
+            None => match self.stalled_claim(peer, &missing, activity, retry) {
                 Some(chunks) => chunks,
                 None => return Ok(None),
             },
@@ -348,7 +380,7 @@ impl InflightPiece {
             peer,
             connection,
             chunks: chunks.clone(),
-            started: now,
+            started: activity.now,
             last_delivery: None,
         });
         Ok(Some(chunks))
@@ -387,19 +419,17 @@ impl InflightPiece {
     /// ordinary queue to prove itself.
     ///
     /// `true` when anything was cut.
-    fn split_whole(
-        &mut self,
-        missing: impl Fn(&Range<u32>) -> u32,
-        activity: Activity,
-        now: Instant,
-    ) -> bool {
+    fn split_whole(&mut self, missing: impl Fn(&Range<u32>) -> u32, activity: Activity) -> bool {
         let since = self.started;
         let [holder] = self.participants.as_mut_slice() else {
             return false;
         };
+        // A refusal here names no instant of its own: the holder of a whole
+        // piece is the newest holder of its one claim, and `stalled_claim`
+        // records that claim's instant for the same asker a moment later.
         if !self.unclaimed.is_empty()
             || holder.chunks.end.saturating_sub(holder.chunks.start) <= CLAIM_CHUNKS
-            || !activity.outpaces(since, now)
+            || !activity.outpaces(since)
         {
             return false;
         }
@@ -455,7 +485,7 @@ impl InflightPiece {
         peer: PeerHandle,
         missing: impl Fn(&Range<u32>) -> u32,
         activity: Activity,
-        now: Instant,
+        retry: &mut Retry,
     ) -> Option<Range<u32>> {
         let mut best: Option<(u32, Instant, Range<u32>)> = None;
         for candidate in &self.participants {
@@ -472,7 +502,11 @@ impl InflightPiece {
                 .fold((candidate.started, false), |(newest, mine), p| {
                     (newest.max(p.started), mine || p.peer == peer)
                 });
-            if mine || !activity.outpaces(newest, now) {
+            if mine {
+                continue;
+            }
+            if !activity.outpaces(newest) {
+                retry.refused(activity, newest);
                 continue;
             }
             let better = match best.as_ref() {
@@ -560,6 +594,9 @@ impl InflightPiece {
 struct Walk {
     /// The share it took, if any.
     taken: Option<AcquireResult>,
+    /// When to ask again, if every refusal on the way was one that time
+    /// would lift; see [`Retry`].
+    retry: Retry,
     /// The first in-flight piece it could not join: the one a stream
     /// reaches soonest, and the steal candidate.
     held_priority_piece: Option<ValidPieceIndex>,
@@ -572,6 +609,7 @@ impl Walk {
     fn taken(result: AcquireResult) -> Self {
         Walk {
             taken: Some(result),
+            retry: Retry::default(),
             held_priority_piece: None,
             crowded: false,
         }
@@ -592,14 +630,19 @@ pub enum AcquireResult {
         chunks: Range<u32>,
         from_peer: PeerHandle,
     },
-    /// No pieces are available for this peer.
-    NoneAvailable,
+    /// No pieces are available for this peer. `retry_at` is when a
+    /// refusal it met on the way would be lifted by time alone -- a claim
+    /// or a whole head piece it will outpace once they have been in flight
+    /// for its own round trip -- or `None` when only an event can change
+    /// the answer; see [`Retry`].
+    NoneAvailable { retry_at: Option<Instant> },
     /// Nothing for this peer right now, but a piece it is over its share of
     /// still has shares other peers may be coming for: ask again once a
     /// chunk of its own has landed, which is what would make the share its
-    /// ([`CLAIMS_PER_PEER`]), rather than after the long wait for new
-    /// pieces.
-    Crowded,
+    /// ([`CLAIMS_PER_PEER`]), or at `retry_at`, when the piece will have
+    /// been in flight longer than this peer's round trip and the shares
+    /// nobody came for are its.
+    Crowded { retry_at: Option<Instant> },
 }
 
 /// Parameters for acquiring a piece.
@@ -658,6 +701,11 @@ pub struct PieceTracker {
     /// first claim to their last chunk, oldest first; see
     /// [`Self::median_completion`].
     completions: VecDeque<Duration>,
+    /// Whether an acquisition since the last [`Self::take_pool_changed`]
+    /// put shares in a pool -- a piece reserved split at the head, or a
+    /// whole one cut there. What an idle peer waiting for something to
+    /// join has to be told about, since nothing else it waits on says it.
+    pool_changed: bool,
 }
 
 impl PieceTracker {
@@ -670,7 +718,17 @@ impl PieceTracker {
             inflight: HashMap::new(),
             deadline_pieces: DEFAULT_DEADLINE_PIECES,
             completions: VecDeque::new(),
+            pool_changed: false,
         }
+    }
+
+    /// Whether shares were put in a pool since this was last asked -- a
+    /// piece reserved split at the head of the lookahead, or a whole one
+    /// cut there -- and clears it. The caller wakes the idle request loops
+    /// on `true`: they wait for exactly this, and nothing else they wait on
+    /// announces it (CLAIMS.md, "When a refused peer asks again").
+    pub fn take_pool_changed(&mut self) -> bool {
+        std::mem::take(&mut self.pool_changed)
     }
 
     /// How many pieces at the head of the lookahead are split between the
@@ -782,6 +840,7 @@ impl PieceTracker {
     {
         let Walk {
             taken,
+            retry,
             held_priority_piece,
             crowded,
         } = self.walk_lookahead(&mut req, usize::MAX);
@@ -815,9 +874,9 @@ impl PieceTracker {
         }
 
         if crowded {
-            AcquireResult::Crowded
+            AcquireResult::Crowded { retry_at: retry.0 }
         } else {
-            AcquireResult::NoneAvailable
+            AcquireResult::NoneAvailable { retry_at: retry.0 }
         }
     }
 
@@ -847,9 +906,10 @@ impl PieceTracker {
         S: Fn(ValidPieceIndex) -> bool,
     {
         let deadline_pieces = self.deadline_pieces;
-        self.walk_lookahead(&mut req, deadline_pieces)
-            .taken
-            .unwrap_or(AcquireResult::NoneAvailable)
+        let walk = self.walk_lookahead(&mut req, deadline_pieces);
+        walk.taken.unwrap_or(AcquireResult::NoneAvailable {
+            retry_at: walk.retry.0,
+        })
     }
 
     /// The walk over a stream's lookahead in playback order, `depth` pieces
@@ -878,7 +938,9 @@ impl PieceTracker {
         let mut crowded = false;
         let activity = Activity {
             last_latency: req.last_latency,
+            now: req.now,
         };
+        let mut retry = Retry::default();
         for piece in &mut req.priority_pieces {
             if deep >= depth {
                 break;
@@ -939,11 +1001,11 @@ impl PieceTracker {
                         // A piece that reached the head whole is cut here,
                         // as it would have been had it been reserved here;
                         // see [`InflightPiece::split_whole`].
-                        inflight.split_whole(
-                            |claim| tracker.chunks_missing(piece, claim),
-                            activity,
-                            req.now,
-                        );
+                        if inflight
+                            .split_whole(|claim| tracker.chunks_missing(piece, claim), activity)
+                        {
+                            self.pool_changed = true;
+                        }
                         Share::OrDuplicate
                     } else {
                         Share::Unclaimed
@@ -954,7 +1016,7 @@ impl PieceTracker {
                         |claim| tracker.chunks_missing(piece, claim),
                         share,
                         activity,
-                        req.now,
+                        &mut retry,
                     ) {
                         Ok(Some(chunks)) => {
                             return Walk::taken(AcquireResult::Reserved { piece, chunks });
@@ -976,6 +1038,7 @@ impl PieceTracker {
         }
         Walk {
             taken: None,
+            retry,
             held_priority_piece,
             crowded,
         }
@@ -1006,6 +1069,9 @@ impl PieceTracker {
             |claim| tracker.chunks_missing(piece, claim),
             now,
         );
+        if !inflight.unclaimed.is_empty() {
+            self.pool_changed = true;
+        }
         self.inflight.insert(piece, inflight);
         AcquireResult::Reserved { piece, chunks }
     }
@@ -1686,7 +1752,7 @@ mod tests {
         assert_eq!(claimed(ask(&mut tracker, t0)), 0..16);
         assert_eq!(claimed(ask(&mut tracker, t0)), 16..32);
         assert!(
-            matches!(ask(&mut tracker, ms(100)), AcquireResult::Crowded),
+            matches!(ask(&mut tracker, ms(100)), AcquireResult::Crowded { .. }),
             "over its share on a piece younger than its own round trip: others may be coming"
         );
         assert_eq!(
@@ -2011,7 +2077,7 @@ mod tests {
                 got, waited_on,
                 "a peer was sent to re-fetch a claim already on disk: {chunks:?}"
             ),
-            AcquireResult::NoneAvailable => panic!("the other pieces are still free"),
+            AcquireResult::NoneAvailable { .. } => panic!("the other pieces are still free"),
             other => panic!("expected a reservation elsewhere, got {other:?}"),
         }
     }
@@ -2414,7 +2480,7 @@ mod tests {
         assert!(
             matches!(
                 head_share(&mut tracker, &file_infos, &priorities, 3, &window, t0),
-                AcquireResult::NoneAvailable
+                AcquireResult::NoneAvailable { .. }
             ),
             "the head ask reached past the deadline pieces"
         );
@@ -2642,7 +2708,10 @@ mod tests {
         assert_eq!(claimed(ask(&mut tracker, 1, t0, 300)), 0..16);
         assert_eq!(claimed(ask(&mut tracker, 1, t0, 300)), 16..32);
         assert!(
-            matches!(ask(&mut tracker, 1, ms(50), 300), AcquireResult::Crowded),
+            matches!(
+                ask(&mut tracker, 1, ms(50), 300),
+                AcquireResult::Crowded { .. }
+            ),
             "fifty milliseconds into the piece, a peer with a 300 ms round trip waits"
         );
         assert_eq!(
@@ -2720,7 +2789,7 @@ mod tests {
         assert!(
             matches!(
                 acquire_in_window(&mut tracker, &file_infos, &priorities, 1, &window, t0),
-                AcquireResult::Crowded
+                AcquireResult::Crowded { .. }
             ),
             "with its share of both head pieces and every deeper piece whole, the \
              peer is told to come back"
@@ -2852,6 +2921,178 @@ mod tests {
             tracker.median_completion(),
             Some(Duration::from_secs(12)),
             "twelve seconds from the first claim, not two from the cut"
+        );
+    }
+
+    /// **A refusal says when to ask again.** A peer over its share is
+    /// turned away from a piece younger than its own round trip, and told
+    /// the instant the piece will be that old; a peer that has never
+    /// delivered is told nothing, since it outpaces nothing however long it
+    /// waits. See CLAIMS.md, "When a refused peer asks again".
+    #[test]
+    fn a_refusal_says_when_the_share_becomes_the_askers() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(1);
+        let waited_on = piece(&tracker, 0);
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let ask = |tracker: &mut PieceTracker, who: u8, now: Instant, latency: Option<u64>| {
+            acquire_with(
+                tracker,
+                &file_infos,
+                &priorities,
+                who,
+                &[waited_on],
+                now,
+                latency.map(Duration::from_millis),
+            )
+        };
+
+        assert_eq!(claimed(ask(&mut tracker, 1, t0, Some(300))), 0..16);
+        assert_eq!(claimed(ask(&mut tracker, 1, t0, Some(300))), 16..32);
+        match ask(&mut tracker, 1, ms(50), Some(300)) {
+            AcquireResult::Crowded { retry_at } => assert_eq!(
+                retry_at,
+                Some(ms(301)),
+                "the piece started at t0 and this peer's round trip is 300 ms"
+            ),
+            other => panic!("over its share on a fresh piece: {other:?}"),
+        }
+
+        // A fresh peer takes its two freely, and is then told nothing: it
+        // has no round trip to outpace anything with, however long it
+        // waits. (The pool is empty by now, so the refusal is a join's.)
+        assert_eq!(claimed(ask(&mut tracker, 2, ms(60), None)), 32..48);
+        assert_eq!(claimed(ask(&mut tracker, 2, ms(60), None)), 48..64);
+        match ask(&mut tracker, 2, ms(70), None) {
+            AcquireResult::Crowded { retry_at } | AcquireResult::NoneAvailable { retry_at } => {
+                assert_eq!(retry_at, None)
+            }
+            other => panic!("a fresh peer with nothing left to take: {other:?}"),
+        }
+    }
+
+    /// **A join refused says when the newest holder is outpaced.** Every
+    /// claim of the piece is held, two from the start and two from later;
+    /// a peer with a half-second round trip is told the earliest instant
+    /// any of them is a round trip old.
+    #[test]
+    fn a_refusal_to_join_says_when_the_newest_holder_is_outpaced() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(1);
+        let waited_on = piece(&tracker, 0);
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let ask = |tracker: &mut PieceTracker, who: u8, now: Instant, latency: u64| {
+            acquire_with(
+                tracker,
+                &file_infos,
+                &priorities,
+                who,
+                &[waited_on],
+                now,
+                Some(Duration::from_millis(latency)),
+            )
+        };
+        assert_eq!(claimed(ask(&mut tracker, 1, t0, 300)), 0..16);
+        assert_eq!(claimed(ask(&mut tracker, 1, t0, 300)), 16..32);
+        assert_eq!(claimed(ask(&mut tracker, 2, ms(200), 300)), 32..48);
+        assert_eq!(claimed(ask(&mut tracker, 2, ms(200), 300)), 48..64);
+
+        match ask(&mut tracker, 3, ms(300), 500) {
+            AcquireResult::NoneAvailable { retry_at } => assert_eq!(
+                retry_at,
+                Some(ms(501)),
+                "the first peer's claims are the oldest; five hundred milliseconds after them"
+            ),
+            other => panic!("every claim is held by someone not yet outpaced: {other:?}"),
+        }
+    }
+
+    /// **And at the head, when the cut becomes possible.** A piece one peer
+    /// reserved whole that the stream then reaches: a faster peer arriving
+    /// before the piece is a round trip old is refused, told when it may
+    /// cut, and cuts when it comes back then.
+    #[test]
+    fn a_refusal_at_the_head_says_when_the_cut_becomes_possible() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(6);
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let reached = piece(&tracker, 2);
+        tracker.reserve_piece(reached, peer(1), 0, false, t0);
+        let latency = Some(Duration::from_millis(500));
+        let head_ask = |tracker: &mut PieceTracker, now: Instant| {
+            tracker.acquire_head_share(AcquireRequest {
+                peer: peer(2),
+                connection: 0,
+                peer_avg_time: None,
+                last_latency: latency,
+                now,
+                priority_pieces: std::iter::once(reached),
+                file_priorities: &priorities,
+                file_infos: &file_infos,
+                peer_has_piece: |_| true,
+                can_steal: |_| true,
+            })
+        };
+
+        match head_ask(&mut tracker, ms(100)) {
+            AcquireResult::NoneAvailable { retry_at } => assert_eq!(
+                retry_at,
+                Some(ms(501)),
+                "the whole piece is a hundred milliseconds old; this peer cuts at five hundred"
+            ),
+            other => panic!("a hundred milliseconds in, nothing is this peer's: {other:?}"),
+        }
+        assert_eq!(
+            claimed(head_ask(&mut tracker, ms(600))),
+            16..32,
+            "back at the instant it was told, it cuts the piece and takes the next claim"
+        );
+    }
+
+    /// **Shares put in a pool are announced, once.** A piece reserved split
+    /// at the head, or a whole one cut there, is what an idle peer waiting
+    /// for something to join needs to hear about; a whole reservation deep
+    /// in the window is not.
+    #[test]
+    fn shares_put_in_a_pool_are_announced_once() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(6);
+        let t0 = Instant::now();
+        let window: Vec<ValidPieceIndex> = (0..6).map(|id| piece(&tracker, id)).collect();
+        assert!(!tracker.take_pool_changed(), "nothing has happened");
+
+        // The head piece, reserved split: shares in the pool.
+        assert_eq!(
+            claimed(acquire_in_window(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                1,
+                &window,
+                t0
+            )),
+            0..16
+        );
+        assert!(tracker.take_pool_changed());
+        assert!(!tracker.take_pool_changed(), "and it is reported once");
+
+        // A whole piece deep in the window: nobody else's to share yet.
+        tracker.reserve_piece(piece(&tracker, 5), peer(2), 0, false, t0);
+        assert!(!tracker.take_pool_changed());
+
+        // Cut when the stream reaches it: shares in the pool again.
+        let tail: Vec<ValidPieceIndex> = vec![piece(&tracker, 5)];
+        let _ = acquire_with(
+            &mut tracker,
+            &file_infos,
+            &priorities,
+            3,
+            &tail,
+            t0 + Duration::from_secs(10),
+            Some(Duration::from_secs(1)),
+        );
+        assert!(
+            tracker.take_pool_changed(),
+            "the cut put the rest of the piece in the pool"
         );
     }
 
@@ -3364,7 +3605,7 @@ mod tests {
                 got, waited_on,
                 "the piece being checked was reserved again, chunks {chunks:?}"
             ),
-            AcquireResult::NoneAvailable => panic!("the other pieces are still free"),
+            AcquireResult::NoneAvailable { .. } => panic!("the other pieces are still free"),
             other => panic!("expected a reservation elsewhere, got {other:?}"),
         }
     }
@@ -3519,7 +3760,7 @@ mod tests {
         );
         let res = acquire(&mut tracker, &file_infos, &file_priorities, None);
         assert!(
-            matches!(res, AcquireResult::NoneAvailable),
+            matches!(res, AcquireResult::NoneAvailable { .. }),
             "a second peer was handed a piece we have: {res:?}"
         );
     }
@@ -3542,7 +3783,7 @@ mod tests {
         // that while the storage behind it is being deleted.
         let res = acquire(&mut tracker, &file_infos, &file_priorities, Some(p0));
         assert!(
-            matches!(res, AcquireResult::NoneAvailable),
+            matches!(res, AcquireResult::NoneAvailable { .. }),
             "acquired a piece whose storage is being released: {res:?}"
         );
 
@@ -3550,7 +3791,7 @@ mod tests {
         tracker.reselect_pieces([p0]).unwrap();
         let res = acquire(&mut tracker, &file_infos, &file_priorities, None);
         assert!(
-            matches!(res, AcquireResult::NoneAvailable),
+            matches!(res, AcquireResult::NoneAvailable { .. }),
             "acquired a piece whose storage is being released: {res:?}"
         );
 
@@ -3587,7 +3828,7 @@ mod tests {
         tracker.reselect_pieces([p0]).unwrap();
         let res = acquire(&mut tracker, &file_infos, &file_priorities, None);
         assert!(
-            matches!(res, AcquireResult::NoneAvailable),
+            matches!(res, AcquireResult::NoneAvailable { .. }),
             "acquired a piece whose storage is being released: {res:?}"
         );
 
@@ -4027,7 +4268,7 @@ mod tests {
         });
 
         match result {
-            AcquireResult::NoneAvailable => {}
+            AcquireResult::NoneAvailable { .. } => {}
             _ => panic!("Expected NoneAvailable, got {:?}", result),
         }
     }
