@@ -2657,8 +2657,16 @@ impl PeerHandler {
                             None => std::future::pending::<()>().await,
                         }
                     };
+                    // And the connection going: the writer's channel closes
+                    // with it, and a loop that only found out on its next
+                    // send sat here for the backstop after the peer was gone
+                    // -- the Windows e2e run of 2026-09-17 had 224 tasks
+                    // still alive when the test expected none.
+                    let gone = self.tx.closed();
+                    let mut peer_gone = false;
                     aframe!(async {
                         tokio::select! {
+                            _ = gone => peer_gone = true,
                             _ = freed => debug!("a chunk of our own landed, asking again"),
                             _ = new_piece_notify => debug!("the lookahead changed, asking again"),
                             _ = have_notify => debug!("the peer has a piece it did not, asking again"),
@@ -2670,6 +2678,9 @@ impl PeerHandler {
                         }
                     })
                     .await;
+                    if peer_gone {
+                        return Err(Error::PeerTaskDead);
+                    }
                     continue;
                 }
                 None => {
