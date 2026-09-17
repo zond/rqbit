@@ -126,6 +126,42 @@ pieces this peer could actually take.
    was in none of the three sets and would otherwise never be fetched
    again.
 
+## How deep the splitting goes is the embedder's
+
+Every rule above applies inside a depth: the first `deadline_pieces` of
+the lookahead are split, joinable, and asked for before any chunk sent
+deeper in. That depth was the constant 2 -- the piece the reader is on
+and the next -- on the reasoning that every piece after those has a whole
+piece of playback to arrive in. **That is true only when a piece arrives
+in less than a piece of playback**, and the field of 2026-09-17 (phone and
+television, same wifi, same film) showed a swarm where it does not: the
+film wanted 3.6 MB/s, pieces of 4 MiB took 2 to 12 s to complete, and the
+reader walked into piece after piece still in flight, waiting each time
+on the slowest claim. The rules were working -- joins came, in the order
+the outpacing test admits them -- but splitting had begun about a second
+before the reader arrived, on pieces that needed six.
+
+So the depth is a runtime setting (`PieceTracker::set_deadline_pieces`,
+through `ManagedTorrent`, kept for a torrent not yet live like the peer
+limit), and the tracker reports what its split pieces have been taking:
+`median_deadline_completion`, the median over the last sixteen deadline
+pieces of first-claim-to-last-chunk, the upper middle when even so that a
+horizon sized from it starts pieces earlier rather than later. Only pieces
+a reader waited on are samples; a piece one peer fetched whole deep in the
+lookahead says nothing about a reader's wait.
+
+**This crate holds no opinion about where the depth should sit.** It knows
+how long its pieces take but not how fast the reader eats them or when
+the player has actually stopped, and those are what size a horizon. The
+embedder's loop, for the record: start each video at the median divided
+by the playback time of one piece, floored at 2; add one piece each time
+the player reports a stall after its first frame; cap at the lookahead in
+pieces, since past that nothing is being fetched to split; reset when a
+new video opens. Reactive joining -- letting anyone pile onto a blocked
+piece's last range -- was considered and rejected: it duplicates the range
+once per peer that frees a slot and can only shorten a stall that has
+already started, where a depth sized from measurement prevents it.
+
 ## What this replaced, so nobody rebuilds it
 
 - **Blind doubling** (any arriving peer could double any claim with the
@@ -182,7 +218,9 @@ peer: it waits one chunk arrival, not a timer.
 
 Built 2026-09-14 (`a31258c0`), rebuilt on the piece's age 2026-09-15 after
 two field logs; the head-at-every-slot ask and the newest-holder rule for
-joining a claim added the same day after the fourth log. Every rule and the three wiring points are proven by a test
+joining a claim added the same day after the fourth log. The depth became
+the embedder's setting, with the completion median beside it, on
+2026-09-17 after the phone reproduced the television's stalls. Every rule and the three wiring points are proven by a test
 that fails under mutation. The first log on the latency rules (xtremio
 `a58f5f0`) had 24- and 30-second head-piece blocks; the second (`ef6ac8c`,
 with the claims probe) showed why: ten of sixteen shares of piece 0 sitting

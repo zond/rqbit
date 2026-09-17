@@ -1439,6 +1439,7 @@ impl Session {
                         .or(self.peer_limit)
                         .unwrap_or(crate::torrent_state::DEFAULT_PEER_LIMIT),
                 ),
+                deadline_pieces: AtomicUsize::new(crate::piece_tracker::DEFAULT_DEADLINE_PIECES),
                 unadvertised_pieces: Default::default(),
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),

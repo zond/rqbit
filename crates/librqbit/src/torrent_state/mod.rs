@@ -196,6 +196,11 @@ pub struct ManagedTorrentShared {
     /// [`crate::SessionOptions::peer_limit`], else [`DEFAULT_PEER_LIMIT`] -- until
     /// [`ManagedTorrent::set_peer_limit`] changes it. Read when the torrent goes live.
     pub(crate) peer_limit: AtomicUsize,
+    /// How many pieces at the head of a stream's lookahead are split between peers:
+    /// [`crate::piece_tracker::DEFAULT_DEADLINE_PIECES`] until
+    /// [`ManagedTorrent::set_deadline_pieces`] changes it. Read when the torrent goes
+    /// live, and forwarded to the live tracker when it already is.
+    pub(crate) deadline_pieces: AtomicUsize,
     /// Whether [`ManagedTorrent::set_pieces_advertised`] has anything held back, so the
     /// Have path can answer "announce it" without taking the state lock when it doesn't.
     ///
@@ -639,6 +644,41 @@ impl ManagedTorrent {
         if let Some(live) = self.live() {
             live.set_peer_limit(limit);
         }
+    }
+
+    /// Sets how many pieces at the head of a stream's lookahead are split between the
+    /// peers that have them, and may have a claim fetched twice; see
+    /// [`crate::piece_tracker::PieceTracker::set_deadline_pieces`]. Kept for a torrent
+    /// that is not live yet and applied when it goes live, like the peer limit.
+    ///
+    /// The number is the embedder's: this crate knows how long its pieces take
+    /// ([`Self::deadline_completion_median`]) but not how fast a reader consumes them
+    /// or when one has stalled, and those are what size it.
+    pub fn set_deadline_pieces(&self, pieces: usize) {
+        self.shared
+            .deadline_pieces
+            .store(pieces.max(1), Ordering::Relaxed);
+        if let Some(live) = self.live() {
+            live.set_deadline_pieces(pieces);
+        }
+    }
+
+    /// How many pieces at the head of a stream's lookahead are split right now: the
+    /// live tracker's answer, else what [`Self::set_deadline_pieces`] last stored. What
+    /// an embedder writes beside its own stall count, so a field log says both what
+    /// was asked for and what happened.
+    pub fn deadline_pieces(&self) -> usize {
+        self.live()
+            .and_then(|live| live.deadline_pieces())
+            .unwrap_or_else(|| self.shared.deadline_pieces.load(Ordering::Relaxed))
+    }
+
+    /// How long the pieces a reader waited on have been taking, first claim to last
+    /// chunk, as the median of the recent ones; `None` for a torrent that is not live
+    /// or has completed none. See
+    /// [`crate::piece_tracker::PieceTracker::median_deadline_completion`].
+    pub fn deadline_completion_median(&self) -> Option<std::time::Duration> {
+        self.live()?.deadline_completion_median()
     }
 
     /// The holders of piece `index` and how each is doing, or nothing for a

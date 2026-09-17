@@ -361,7 +361,14 @@ impl TorrentStateLive {
                 live_outgoing_peers: Default::default(),
             },
             _locked: RwLock::new(TorrentStateLocked {
-                pieces: Some(PieceTracker::new(paused.chunk_tracker)),
+                pieces: Some({
+                    // The depth an embedder set while this torrent was not live,
+                    // applied as it becomes so -- the peer limit's rule.
+                    let mut pieces = PieceTracker::new(paused.chunk_tracker);
+                    pieces
+                        .set_deadline_pieces(paused.shared.deadline_pieces.load(Ordering::Acquire));
+                    pieces
+                }),
                 file_priorities,
                 fatal_errors_tx: Some(fatal_errors_tx),
                 unflushed_bitv_bytes: 0,
@@ -1386,6 +1393,34 @@ impl TorrentStateLive {
     /// How many peers this torrent keeps connected (or connecting) at once.
     pub fn peer_limit(&self) -> usize {
         self.peer_limit.load(Ordering::Acquire)
+    }
+
+    /// Sets the split depth on the live tracker; see
+    /// [`crate::ManagedTorrent::set_deadline_pieces`]. The state lock, briefly, and no
+    /// I/O: the next `acquire_piece` walks with the new depth.
+    pub fn set_deadline_pieces(&self, pieces: usize) {
+        if let Some(tracker) = self.lock_write("set_deadline_pieces").pieces.as_mut() {
+            tracker.set_deadline_pieces(pieces);
+        }
+    }
+
+    /// The split depth in force on the live tracker; see
+    /// [`crate::ManagedTorrent::deadline_pieces`].
+    pub fn deadline_pieces(&self) -> Option<usize> {
+        Some(
+            self.lock_read("deadline_pieces")
+                .pieces
+                .as_ref()?
+                .deadline_pieces(),
+        )
+    }
+
+    /// See [`crate::ManagedTorrent::deadline_completion_median`].
+    pub fn deadline_completion_median(&self) -> Option<std::time::Duration> {
+        self.lock_read("deadline_completion_median")
+            .pieces
+            .as_ref()?
+            .median_deadline_completion()
     }
 
     /// Change the live-peer cap of a running torrent.
@@ -3400,6 +3435,83 @@ mod connection_tests {
             live.inflight_piece_owners(),
             vec![(new_piece.get(), addr)],
             "the old connection's death took the new one's piece with it, or kept its own"
+        );
+        Ok(())
+    }
+
+    /// **The split depth is kept for a torrent not yet live and applied when
+    /// it is, and changes a live one at once** -- the peer limit's rule, for
+    /// the same reason: the embedder decides it from what it sees of the
+    /// player, which may be before the torrent has finished checking.
+    #[tokio::test]
+    async fn the_deadline_depth_set_before_live_is_the_trackers_once_live() -> anyhow::Result<()> {
+        setup_test_logging();
+        const CHUNKS_PER_PIECE: u32 = 32;
+        const PIECE_LEN: u32 = CHUNK_SIZE * CHUNKS_PER_PIECE;
+
+        let files = create_default_random_dir_with_torrents(
+            1,
+            PIECE_LEN as usize * 4,
+            Some("deadline_depth"),
+        );
+        let torrent = create_torrent(
+            files.path(),
+            CreateTorrentOptions {
+                piece_length: Some(PIECE_LEN),
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await?;
+        let dir = TempDir::with_prefix("deadline_depth_client")?;
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            crate::SessionOptions {
+                dht: None,
+                persistence: None,
+                peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.as_bytes()?.to_vec()),
+                Some(crate::AddTorrentOptions {
+                    overwrite: true,
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+
+        // Set before waiting for the torrent to be live: kept on the shared
+        // state and read as the live tracker is built, whichever order the
+        // check and this call happen in.
+        assert_eq!(
+            handle.deadline_pieces(),
+            crate::piece_tracker::DEFAULT_DEADLINE_PIECES,
+            "the default until somebody says otherwise"
+        );
+        handle.set_deadline_pieces(5);
+        tokio::time::timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+        let live = handle.live().context("expected a live torrent")?;
+        assert_eq!(
+            live.deadline_pieces(),
+            Some(5),
+            "applied as the torrent went live"
+        );
+        assert_eq!(handle.deadline_pieces(), 5);
+
+        // And a change while live reaches the tracker at once.
+        handle.set_deadline_pieces(7);
+        assert_eq!(live.deadline_pieces(), Some(7));
+        assert_eq!(
+            handle.deadline_completion_median(),
+            None,
+            "nothing has been fetched, so there is nothing to measure yet"
         );
         Ok(())
     }
