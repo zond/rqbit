@@ -1320,6 +1320,14 @@ impl TorrentStateLive {
                 self.disconnect_all_peers_that_have_full_torrent();
             }
         }
+        // A piece completing moves the head of every lookahead: what an
+        // idle peer could cut or join is not what it was when it was
+        // refused, and the last piece completing is what turns its loop's
+        // next ask into "nothing left, disconnect". A loop parked in its
+        // wait with nothing else to wake it sat until the backstop -- the
+        // Windows e2e run of 4110d894 counted 182 tasks alive fifteen
+        // seconds after the download, all of them that.
+        self.new_pieces_notify.notify_waiters();
         Ok(())
     }
 
