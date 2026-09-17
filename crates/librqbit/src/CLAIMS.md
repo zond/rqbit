@@ -144,7 +144,7 @@ before the reader arrived, on pieces that needed six.
 So the depth is a runtime setting (`PieceTracker::set_deadline_pieces`,
 through `ManagedTorrent`, kept for a torrent not yet live like the peer
 limit), and the tracker reports what its pieces have been taking:
-`median_completion`, the median over the last sixteen completed pieces of
+`median_completion`, the median over the last sixty-four completed pieces of
 first-claim-to-last-chunk, the upper middle when even so that a horizon
 sized from it starts pieces earlier rather than later. **Every piece is a
 sample, whole or split.** The horizon's question is how far ahead the

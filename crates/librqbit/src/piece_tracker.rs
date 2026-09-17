@@ -189,9 +189,17 @@ enum Share {
 /// start.
 pub const DEFAULT_DEADLINE_PIECES: usize = 2;
 
-/// How many split-piece completion times are kept for the median: enough
-/// to smooth one slow piece, few enough to follow a swarm that changes.
-const COMPLETION_SAMPLES: usize = 16;
+/// How many completed pieces the completion median is over.
+///
+/// Sixteen was a seek's worth: after one, the ring filled with the split
+/// pieces at the new head -- fast, several peers on each -- and the median
+/// fell to under three seconds, then the whole pieces reserved deep in the
+/// window by slow peers came in at eight, and the depth an embedder sized
+/// from it flapped between three and eight within forty seconds (field,
+/// 2026-09-17 12:22). Sixty-four is about seventy-five seconds of a 4 MiB
+/// piece film: one seek's burst is a sixth of the sample and moves the
+/// median, not swings it.
+const COMPLETION_SAMPLES: usize = 64;
 
 /// Tracks a piece currently being downloaded.
 ///
@@ -2844,6 +2852,45 @@ mod tests {
             tracker.median_completion(),
             Some(Duration::from_secs(12)),
             "twelve seconds from the first claim, not two from the cut"
+        );
+    }
+
+    /// **The ring holds sixty-four completions, and the oldest leaves
+    /// first.** Sixty-four one-second pieces, then seventeen slow ones:
+    /// the slow ones are seventeen samples of sixty-four and the median
+    /// stays at a second -- a sixteen-deep ring would by then hold nothing
+    /// but slow ones. Then enough slow ones to fill the ring: the fast ones
+    /// are gone and the median is the slow time. A shorter ring let one
+    /// seek's burst of fast split pieces swing the median, and the depth
+    /// with it.
+    #[test]
+    fn the_completion_ring_is_sixty_four_deep_and_forgets_the_oldest() {
+        let (mut tracker, _file_infos, _priorities) = make_split_tracker(200);
+        let t0 = Instant::now();
+        fn complete(tracker: &mut PieceTracker, id: u32, took: u64, t0: Instant) {
+            let index = piece(tracker, id);
+            tracker.reserve_piece(index, peer(1), 0, false, t0);
+            tracker.take_inflight_at(index, t0 + Duration::from_secs(took));
+        }
+        let samples = u32::try_from(COMPLETION_SAMPLES).unwrap();
+        for id in 0..samples {
+            complete(&mut tracker, id, 1, t0);
+        }
+        for id in samples..samples + 17 {
+            complete(&mut tracker, id, 40, t0);
+        }
+        assert_eq!(
+            tracker.median_completion(),
+            Some(Duration::from_secs(1)),
+            "seventeen slow pieces in sixty-four do not move the median"
+        );
+        for id in samples + 17..2 * samples + 17 {
+            complete(&mut tracker, id, 40, t0);
+        }
+        assert_eq!(
+            tracker.median_completion(),
+            Some(Duration::from_secs(40)),
+            "a ring of slow pieces later the fast ones are forgotten"
         );
     }
 
