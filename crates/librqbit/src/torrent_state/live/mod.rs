@@ -2448,6 +2448,21 @@ impl PeerHandler {
         if self.state.torrent().options.disable_upload() {
             anyhow::bail!("upload disabled, but peer requested a piece")
         }
+        // The session's upload switch is off: we are choking this peer, or about to --
+        // the writer sends the Choke when it sees the switch -- and a choked peer's
+        // requests are dropped. Dropped here, before anything is spent on them: past
+        // this point a request is validated (and one for a piece we no longer have
+        // hangs up on the peer), queued on the upload scheduler, and paid for in upload
+        // tokens, only for the writer to throw it away behind the Choke.
+        if self
+            .state
+            .upload_enabled
+            .as_ref()
+            .is_some_and(|enabled| !*enabled.borrow())
+        {
+            trace!(?request, "upload is switched off, dropping the request");
+            return Ok(());
+        }
 
         let piece_index = match self.state.lengths.validate_piece_index(request.index) {
             Some(p) => p,
@@ -3540,6 +3555,69 @@ mod connection_tests {
             vec![(new_piece.get(), addr)],
             "the old connection's death took the new one's piece with it, or kept its own"
         );
+        Ok(())
+    }
+
+    /// **With the upload switch off, a request is dropped, not judged.**
+    /// review #37: it used to be validated first, and a request for a
+    /// piece we do not have -- the ordinary thing to ask of a peer whose
+    /// pieces the reclaim takes back -- hung up on a peer we were not
+    /// uploading to anyway.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn with_the_upload_switch_off_a_request_is_dropped_not_judged() -> anyhow::Result<()> {
+        setup_test_logging();
+        let files =
+            create_default_random_dir_with_torrents(1, CHUNK_SIZE as usize * 4, Some("upload_off"));
+        let torrent = create_torrent(
+            files.path(),
+            CreateTorrentOptions {
+                piece_length: Some(CHUNK_SIZE),
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await?;
+        // Somewhere else, so it has nothing: every request is for a chunk we lack.
+        let dir = TempDir::with_prefix("upload_off_client")?;
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            crate::SessionOptions {
+                dht: None,
+                persistence: None,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.as_bytes()?.to_vec()),
+                Some(crate::AddTorrentOptions {
+                    overwrite: true,
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        tokio::time::timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+        let live = handle.live().context("expected a live torrent")?;
+        let (tx, _rx) = unbounded_channel();
+        let handler = PeerHandler::for_test(live, SocketAddr::from((Ipv4Addr::LOCALHOST, 1)), tx);
+        let request = peer_binary_protocol::Request {
+            index: 0,
+            begin: 0,
+            length: CHUNK_SIZE,
+        };
+
+        anyhow::ensure!(
+            handler.on_download_request(request).is_err(),
+            "uploading, a request for a chunk we lack is an error, as it always was"
+        );
+        session.set_upload_enabled(false);
+        handler
+            .on_download_request(request)
+            .context("with the switch off the request should have been dropped")?;
         Ok(())
     }
 
