@@ -15,6 +15,10 @@ use crate::{
     limits::LimitsConfig,
     listen::ListenerOptions,
     spawn_utils::BlockingSpawner,
+    storage::{
+        BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage,
+        filesystem::FilesystemStorageFactory,
+    },
     tests::test_util::{create_default_random_dir_with_torrents, setup_test_logging, wait_until},
     torrent_state::{ManagedTorrentHandle, TorrentStateLive, TorrentStatsState},
 };
@@ -37,7 +41,32 @@ struct TwoSessions {
 }
 
 impl TwoSessions {
+    /// Connected and one piece in.
     async fn setup(prefix: &str) -> Self {
+        let this = Self::connect(prefix, None).await;
+        // A whole checked piece, not just bytes on the wire: what the tests below say
+        // about the have-set is only about completed pieces.
+        wait_until(
+            || match (this.live.stats_snapshot(), this.handle.stats()) {
+                (s, stats) if stats.progress_bytes > 0 && s.peer_stats.live == 1 => Ok(()),
+                (s, stats) => bail!(
+                    "waiting for the first piece: {} {s:?}",
+                    stats.progress_bytes
+                ),
+            },
+            WAIT,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !this.handle.stats().finished,
+            "the rate limit keeps the download unfinished"
+        );
+        this
+    }
+
+    /// The client torrent live, with its seeder handed to it and nothing waited for.
+    async fn connect(prefix: &str, storage_factory: Option<BoxStorageFactory>) -> Self {
         setup_test_logging();
 
         let tempdir = create_default_random_dir_with_torrents(4, 1_000_000, Some(prefix));
@@ -106,6 +135,7 @@ impl TwoSessions {
                 Some(AddTorrentOptions {
                     initial_peers: Some(vec![seeder_addr]),
                     overwrite: true,
+                    storage_factory,
                     ..Default::default()
                 }),
             )
@@ -118,34 +148,14 @@ impl TwoSessions {
             .await
             .expect("the client torrent goes live");
 
-        let this = Self {
+        Self {
             seeder,
             client,
             handle,
             live,
             _seeder_dir: tempdir,
             _client_dir: root,
-        };
-
-        // A whole checked piece, not just bytes on the wire: what the tests below say
-        // about the have-set is only about completed pieces.
-        wait_until(
-            || match (this.live.stats_snapshot(), this.handle.stats()) {
-                (s, stats) if stats.progress_bytes > 0 && s.peer_stats.live == 1 => Ok(()),
-                (s, stats) => bail!(
-                    "waiting for the first piece: {} {s:?}",
-                    stats.progress_bytes
-                ),
-            },
-            WAIT,
-        )
-        .await
-        .unwrap();
-        assert!(
-            !this.handle.stats().finished,
-            "the rate limit keeps the download unfinished"
-        );
-        this
+        }
     }
 }
 
@@ -319,4 +329,168 @@ async fn deselecting_every_file_stops_fetching_without_pausing_inner() {
     t.seeder.ratelimits.set_upload_bps(None);
     handle.wait_until_completed().await.unwrap();
     info!("finished after the deselection");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pause_during_a_hash_check_does_not_strand_the_piece() {
+    tokio::time::timeout(
+        Duration::from_secs(180),
+        a_pause_during_a_hash_check_does_not_strand_the_piece_inner(),
+    )
+    .await
+    .expect("test timed out");
+}
+
+/// **A pause that lands while a piece is being checked leaves that piece fetchable.**
+///
+/// From the last chunk landing to the have-bit, a piece is in none of the tracker's sets:
+/// every chunk is marked, `take_inflight` has taken it out of the in-flight map so that
+/// nobody steals it mid-check, and it is not have yet. A pause right there used to carry
+/// it into the paused tracker like that, and after the unpause nothing ever asked for it
+/// again -- the picker skips a fully-downloaded piece because one is being checked, and
+/// the check that was died with the old live state. The download carried on around the
+/// hole and never finished: `pause_stops_fetching_and_unpause_keeps_the_have_set` hung in
+/// `wait_until_completed` on CI (run 34900118835, 2026-09-14) until its 180 s timeout,
+/// after its resume check had already passed. The window there is a few milliseconds --
+/// the seeder's first burst completes two pieces at once, and the test pauses on seeing
+/// the first -- so this test holds the check open instead: the storage's commit, which
+/// runs after the hash check and before the have-bit, blocks on the first piece until
+/// the pause is done.
+async fn a_pause_during_a_hash_check_does_not_strand_the_piece_inner() {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let storage = HeldCommitStorageFactory {
+        gate: std::sync::Arc::new(CommitGate {
+            entered: std::sync::Mutex::new(Some(entered_tx)),
+            release: std::sync::Mutex::new(release_rx),
+        }),
+    };
+    let t = TwoSessions::connect("rqbit_pause_mid_check", Some(storage.boxed())).await;
+    let (client, handle) = (&t.client, &t.handle);
+
+    // The first piece to pass its hash check is stuck in the commit that follows it --
+    // and with it the only connection, whose reader is the one doing the check, which is
+    // the shape of the CI run too: a pause arriving while the seeder's connection is
+    // inside a check.
+    let held = tokio::time::timeout(WAIT, entered_rx)
+        .await
+        .expect("a piece reaches its commit")
+        .unwrap();
+    info!(
+        held,
+        "a piece is between its hash check and its have-bit, pausing"
+    );
+
+    client.pause(handle).await.unwrap();
+    // The check it was part of goes on against the live state the pause has already
+    // taken apart, and comes to nothing.
+    release_tx.send(()).unwrap();
+    client.unpause(handle).await.unwrap();
+
+    t.seeder.ratelimits.set_upload_bps(None);
+    tokio::time::timeout(WAIT, handle.wait_until_completed())
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the download never finished: piece {held} was left fully marked, not have and \
+                 not queued, with nothing checking it -- {:?}",
+                handle.stats()
+            )
+        })
+        .unwrap();
+    info!("finished after a pause mid-check");
+}
+
+/// Where the storage waits: the first commit it is asked for says so on `entered` and
+/// then waits on `release`. Every later commit goes straight through.
+struct CommitGate {
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<u32>>>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[derive(Clone)]
+struct HeldCommitStorageFactory {
+    gate: std::sync::Arc<CommitGate>,
+}
+
+impl StorageFactory for HeldCommitStorageFactory {
+    type Storage = HeldCommitStorage;
+
+    fn create(
+        &self,
+        shared: &crate::ManagedTorrentShared,
+        metadata: &crate::torrent_state::TorrentMetadata,
+    ) -> anyhow::Result<Self::Storage> {
+        Ok(HeldCommitStorage {
+            underlying: Box::new(FilesystemStorageFactory::default().create(shared, metadata)?),
+            gate: self.gate.clone(),
+        })
+    }
+
+    fn clone_box(&self) -> BoxStorageFactory {
+        self.clone().boxed()
+    }
+}
+
+struct HeldCommitStorage {
+    underlying: Box<dyn TorrentStorage>,
+    gate: std::sync::Arc<CommitGate>,
+}
+
+impl TorrentStorage for HeldCommitStorage {
+    fn init(
+        &mut self,
+        shared: &crate::ManagedTorrentShared,
+        metadata: &crate::torrent_state::TorrentMetadata,
+    ) -> anyhow::Result<()> {
+        self.underlying.init(shared, metadata)
+    }
+
+    fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        self.underlying.pread_exact(file_id, offset, buf)
+    }
+
+    fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+        self.underlying.pwrite_all(file_id, offset, buf)
+    }
+
+    fn remove_file(&self, file_id: usize, filename: &std::path::Path) -> anyhow::Result<()> {
+        self.underlying.remove_file(file_id, filename)
+    }
+
+    fn remove_directory_if_empty(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.underlying.remove_directory_if_empty(path)
+    }
+
+    fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
+        self.underlying.ensure_file_length(file_id, length)
+    }
+
+    fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+        Ok(Box::new(HeldCommitStorage {
+            underlying: self.underlying.take()?,
+            gate: self.gate.clone(),
+        }))
+    }
+
+    fn on_piece_completed(
+        &self,
+        piece_index: librqbit_core::lengths::ValidPieceIndex,
+    ) -> anyhow::Result<()> {
+        // Called from the chunk writer's blocking section, so blocking here is what a
+        // slow commit looks like.
+        let first = self.gate.entered.lock().unwrap().take();
+        if let Some(entered) = first {
+            let _ = entered.send(piece_index.get());
+            let _ = self.gate.release.lock().unwrap().recv();
+        }
+        self.underlying.on_piece_completed(piece_index)
+    }
+
+    fn has_piece(
+        &self,
+        piece_index: librqbit_core::lengths::ValidPieceIndex,
+    ) -> anyhow::Result<bool> {
+        self.underlying.has_piece(piece_index)
+    }
 }
