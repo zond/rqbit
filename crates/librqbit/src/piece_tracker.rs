@@ -261,7 +261,9 @@ pub struct InflightPiece {
     unclaimed: VecDeque<Range<u32>>,
     /// When the first participant started: how long the piece has been in
     /// flight, which is what every takeover on it is measured against
-    /// ([`Activity::outpaces`]) and what the steal rule reads.
+    /// ([`Activity::outpaces`]) and what the completion median samples. A
+    /// steal does not reset it; the steal rule reads the holder's own
+    /// [`Participant::started`] instead.
     started: Instant,
 }
 
@@ -1136,7 +1138,9 @@ impl PieceTracker {
             // already getting the parallelism a steal would be buying.
             .filter(|(_, info)| info.participants.len() == 1 && info.unclaimed.is_empty())
             .filter(|(p, _)| (req.peer_has_piece)(**p))
-            .map(|(p, info)| (*p, info.started))
+            // Ranked by how long its holder has had it, which is what the threshold
+            // below reads: a piece keeps its own start across a steal (see there).
+            .map(|(p, info)| (*p, info.participants[0].started))
             .min_by_key(|(_, started)| *started)?;
 
         self.steal_piece(req, piece, threshold)
@@ -1165,7 +1169,10 @@ impl PieceTracker {
             return None;
         };
         let old_peer = only.peer;
-        if old_peer == req.peer || req.now.saturating_duration_since(info.started) < min_elapsed {
+        // How long this holder has had it, not how long the piece has been in flight: a
+        // piece stolen once is old, and measured on its age the next peer along could
+        // take it off the thief at once.
+        if old_peer == req.peer || req.now.saturating_duration_since(only.started) < min_elapsed {
             return None;
         }
 
@@ -1184,7 +1191,10 @@ impl PieceTracker {
             started: req.now,
             last_delivery: None,
         };
-        info.started = req.now;
+        // The piece keeps its start. It is what a reader has waited on it for, which is
+        // the clock every takeover is measured against (`Activity::outpaces`) and the
+        // sample the completion median takes; restarted here, a piece stolen from a
+        // stalled peer looked fresh to both.
 
         Some(AcquireResult::Stolen {
             piece,
@@ -4377,12 +4387,13 @@ mod tests {
         let file_priorities = make_default_file_priorities(&file_infos);
 
         // The incumbent is sitting on piece 0, and has been for an age by our standards.
-        tracker.reserve_piece(piece(&tracker, 0), peer(1), 0, false, Instant::now());
-        tracker
-            .inflight
-            .get_mut(&piece(&tracker, 0))
-            .unwrap()
-            .started = Instant::now() - Duration::from_secs(600);
+        tracker.reserve_piece(
+            piece(&tracker, 0),
+            peer(1),
+            0,
+            false,
+            Instant::now() - Duration::from_secs(600),
+        );
 
         let acquire = |tracker: &mut PieceTracker| {
             tracker.acquire_piece(AcquireRequest {
@@ -4431,9 +4442,13 @@ mod tests {
         let file_priorities = make_default_file_priorities(&file_infos);
 
         let stream_piece = piece(&tracker, 3);
-        tracker.reserve_piece(stream_piece, peer(1), 0, true, Instant::now());
-        tracker.inflight.get_mut(&stream_piece).unwrap().started =
-            Instant::now() - Duration::from_secs(600);
+        tracker.reserve_piece(
+            stream_piece,
+            peer(1),
+            0,
+            true,
+            Instant::now() - Duration::from_secs(600),
+        );
 
         let result = tracker.acquire_piece(AcquireRequest {
             peer: peer(2),
@@ -4470,6 +4485,81 @@ mod tests {
                 assert_eq!(from_peer, peer(1));
             }
             other => panic!("expected the stream's piece to be stolen, got {other:?}"),
+        }
+    }
+
+    /// **A steal keeps the piece's start** (review #32). The reader has
+    /// waited on the piece since it was first handed out, so the median
+    /// counts from then; and the thief is measured on its own hold, so the
+    /// next peer along cannot take the piece off it at once.
+    #[test]
+    fn a_steal_keeps_the_pieces_start() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(2);
+        let t0 = Instant::now();
+        let secs = |n: u64| t0 + Duration::from_secs(n);
+        let stolen = piece(&tracker, 0);
+        let other = piece(&tracker, 1);
+        tracker.reserve_piece(stolen, peer(1), 0, false, t0);
+        tracker.reserve_piece(other, peer(4), 0, false, secs(50));
+        let steal = |tracker: &mut PieceTracker, who: u8, now: Instant| {
+            tracker.acquire_piece(AcquireRequest {
+                peer: peer(who),
+                connection: 0,
+                peer_avg_time: Some(Duration::from_secs(1)),
+                last_latency: None,
+                now,
+                priority_pieces: std::iter::empty(),
+                file_priorities: &priorities,
+                file_infos: &file_infos,
+                peer_has_piece: |_| true,
+                can_steal: |_| true,
+            })
+        };
+
+        match steal(&mut tracker, 2, secs(100)) {
+            AcquireResult::Stolen { piece, .. } => assert_eq!(piece, stolen),
+            other => panic!("the piece held a hundred seconds was not stolen: {other:?}"),
+        }
+        // The next peer along: piece 0 is the older piece, but its thief has
+        // had it a second. What it can take is piece 1, held fifty.
+        match steal(&mut tracker, 3, secs(101)) {
+            AcquireResult::Stolen { piece, .. } => assert_eq!(
+                piece, other,
+                "the thief lost the piece a second after taking it"
+            ),
+            other => panic!("the piece held fifty seconds was not stolen: {other:?}"),
+        }
+        assert_eq!(
+            tracker.take_inflight_at(stolen, secs(110)),
+            Some(Duration::from_secs(110)),
+            "the piece took 110 s from its first claim, not 10 from the steal"
+        );
+
+        // And a stream's piece, which is stolen by name rather than ranked: the
+        // thief is measured on its own hold there too.
+        let (mut tracker, file_infos, priorities) = make_split_tracker(1);
+        let waited_on = piece(&tracker, 0);
+        tracker.reserve_piece(waited_on, peer(1), 0, false, t0);
+        let steal_head = |tracker: &mut PieceTracker, who: u8, now: Instant| {
+            tracker.acquire_piece(AcquireRequest {
+                peer: peer(who),
+                connection: 0,
+                peer_avg_time: Some(Duration::from_secs(1)),
+                last_latency: None,
+                now,
+                priority_pieces: std::iter::once(waited_on),
+                file_priorities: &priorities,
+                file_infos: &file_infos,
+                peer_has_piece: |_| true,
+                can_steal: |_| true,
+            })
+        };
+        match steal_head(&mut tracker, 2, secs(100)) {
+            AcquireResult::Stolen { piece, .. } => assert_eq!(piece, waited_on),
+            other => panic!("the stream's piece held a hundred seconds was not stolen: {other:?}"),
+        }
+        if let AcquireResult::Stolen { .. } = steal_head(&mut tracker, 3, secs(101)) {
+            panic!("the thief lost the stream's piece a second after taking it");
         }
     }
 
