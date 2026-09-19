@@ -797,14 +797,19 @@ impl ManagedTorrent {
                     let t = t.clone();
                     let span = t.shared().span.clone();
                     let token = token.clone();
+                    // The session is held weakly across the waits below -- the queue of
+                    // checks and the whole hash check, minutes on a large torrent. A
+                    // session stops when its owner drops it, and held here it lived on
+                    // with every one of its tasks, and the torrent went live under a
+                    // session nobody owned.
+                    let concurrent_init_semaphore = session.concurrent_initialize_semaphore.clone();
+                    let session = Arc::downgrade(&session);
 
                     spawn_with_cancel(
                         debug_span!(parent: span.clone(), "initialize_and_start"),
                         "initialize_and_start",
                         token.clone(),
                         async move {
-                            let concurrent_init_semaphore =
-                                session.concurrent_initialize_semaphore.clone();
                             let _permit = concurrent_init_semaphore
                                 .acquire()
                                 .await
@@ -814,6 +819,10 @@ impl ManagedTorrent {
 
                             match check_result {
                                 Ok(paused) => {
+                                    let Some(session) = session.upgrade() else {
+                                        debug!("the session is gone, not starting the torrent");
+                                        return Ok(());
+                                    };
                                     let mut g = t.locked.write();
                                     // Under the lock, so that nobody can observe "no
                                     // check running" while the state still says

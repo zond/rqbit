@@ -561,3 +561,50 @@ async fn unpause_during_the_initial_check_keeps_the_peer_stream_inner() -> anyho
     drop(seeder_dir);
     Ok(())
 }
+
+/// Opens the gate when dropped, so a test that fails with a check held in it
+/// does not leave a thread spinning in [`Gate::hold`].
+struct OpenOnDrop(Arc<Gate>);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+/// review #40. A session stops when its owner drops it. The initial check can
+/// take minutes, and the task running it must not hold the session while it
+/// does: held, a dropped session lived on with every one of its tasks, and
+/// the torrent went live under a session nobody owned.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_initial_check_does_not_keep_a_dropped_session_alive() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (dir, torrent_bytes) = complete_torrent_on_disk("rqbit_check_session_drop").await?;
+    let gate = Arc::new(Gate::default());
+    let _open = OpenOnDrop(gate.clone());
+
+    let session = Session::new_with_opts(dir.path().into(), session_opts(None, None)).await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent_bytes),
+            Some(add_opts(&dir, false, &gate)),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    gate.wait_until_check_started().await?;
+
+    let weak = Arc::downgrade(&session);
+    drop(session);
+    wait_until(
+        || match weak.upgrade() {
+            None => Ok(()),
+            Some(_) => bail!("the session is still alive"),
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .context("the initial check kept the dropped session alive")?;
+    drop(handle);
+    Ok(())
+}
