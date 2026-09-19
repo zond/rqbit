@@ -1499,9 +1499,17 @@ impl TorrentStateLive {
     /// than the new cap has room for, disconnects the surplus -- least useful first, by the
     /// order [`surplus_rank`] lays out -- and forgets their permits as they come back
     /// instead of releasing them. A peer asked to go ends like one we drop after finishing:
-    /// its in-flight pieces return to the queue and it stays in the table as `NotNeeded`, so
-    /// nothing re-dials it until the cap is raised; incoming connections beyond the cap are
-    /// refused as before. Live peers exceed the cap by the number still hanging up, and by
+    /// its in-flight pieces return to the queue and it stays in the table as `NotNeeded`;
+    /// incoming connections beyond the cap are refused as before.
+    ///
+    /// **What holds is the cap, not the parking.** `NotNeeded` is not a state nothing
+    /// dials again: every call to `reconnect_all_not_needed_peers` re-queues the lot, and
+    /// a stream's read that has to wait makes one (`maybe_reconnect_needed_peers_for_file`,
+    /// on each pending `poll_read` and on opening a stream), as do a finished release of
+    /// dropped pieces and a reselect. What stops them coming back over the cap is the peer
+    /// adder: a re-queued address waits for a permit like any other, and while the cap is
+    /// full there is none. So the swarm stays at the cap; what a lowering cannot promise is
+    /// that the peers it hung up on are the ones still parked a minute later. Live peers exceed the cap by the number still hanging up, and by
     /// no more than that: a dial in flight holds its slot from the moment it takes it, so
     /// the ranking sees every peer that holds one.
     ///
@@ -1758,7 +1766,10 @@ impl TorrentStateLive {
 
     /// Put every `NotNeeded` outgoing peer back in the queue to be dialled: the ones a
     /// lowered cap parked, and equally the ones that left cleanly and the seeders parked
-    /// when the torrent finished.
+    /// when the torrent finished. Called on a raise, and on everything that makes a piece
+    /// wanted again -- a stream read that parks, a release of dropped pieces, a reselect --
+    /// so a lowered cap does not keep the peers it parked parked. The cap itself holds
+    /// regardless: what the queue feeds is the adder, and the adder waits for a permit.
     ///
     /// They go on a queue of their own, which the adder drains before the one
     /// `add_peer_if_not_seen` feeds with every address a tracker, the DHT and PEX name.
