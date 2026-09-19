@@ -2428,6 +2428,11 @@ impl PeerHandler {
                     | AcquireResult::Crowded { retry_at } => Ok(Some(Next::Wait { retry_at })),
                 };
                 pool_changed = pieces.take_pool_changed();
+                // This connection's own requests, so under its own entry: what it
+                // still has out for a claim it was just retired from.
+                for (piece, chunks) in pieces.take_retired_claims() {
+                    live.cancel_inflight_requests_in(piece, &chunks);
+                }
                 next
             })
             .transpose()
@@ -4111,6 +4116,135 @@ mod connection_tests {
         assert_eq!(
             cancelled, 16,
             "the loser was not sent a Cancel for each request of its claim"
+        );
+        Ok(())
+    }
+
+    /// **A claim retired with its requests still out has them cancelled**
+    /// (review #28). A holder that lost a duplicate race sits on a finished
+    /// claim -- every chunk on disk, delivered by the other copy -- with its
+    /// own requests for it still on the wire. When it comes back to the
+    /// piece the claim is retired, and after that nothing could find those
+    /// requests to cancel them: they held its request window until the
+    /// seeder answered them, for bytes already on disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retired_claim_has_its_outstanding_requests_cancelled() -> anyhow::Result<()> {
+        setup_test_logging();
+        const CHUNKS_PER_PIECE: u32 = 32;
+        const PIECE_LEN: u32 = CHUNK_SIZE * CHUNKS_PER_PIECE;
+
+        let files =
+            create_default_random_dir_with_torrents(1, PIECE_LEN as usize * 2, Some("retired"));
+        let torrent = create_torrent(
+            files.path(),
+            CreateTorrentOptions {
+                piece_length: Some(PIECE_LEN),
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await?;
+        let dir = TempDir::with_prefix("retired_client")?;
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            crate::SessionOptions {
+                dht: None,
+                persistence: None,
+                peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.as_bytes()?.to_vec()),
+                Some(crate::AddTorrentOptions {
+                    overwrite: true,
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        tokio::time::timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+        let live = handle.live().context("expected a live torrent")?;
+        let head = live.lengths.validate_piece_index(0).context("piece 0")?;
+        // A stream at the start of the file, so the head piece is split.
+        let _stream = handle.clone().stream(0).await?;
+
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1));
+        live.peers
+            .add_if_not_seen(addr)
+            .context("a fresh address")?;
+        let (mut writer, tx) = live
+            .peers
+            .mark_peer_connecting(addr, CancellationToken::new())?;
+        live.peers.with_peer_mut(addr, "test", |p| {
+            p.connecting_to_live(Id20::new([0u8; 20]), &live.peers, ConnectionKind::Tcp);
+        });
+        live.peers.with_live_mut(addr, "test", |l| {
+            l.bitfield = BF::from_boxed_slice(vec![0xff].into_boxed_slice());
+        });
+        let handler = PeerHandler::for_test(live.clone(), addr, tx);
+
+        let first = match handler
+            .acquire_next_piece(Ask::Anything)?
+            .context("a share for the peer")?
+        {
+            Next::Share(piece, chunks) => {
+                anyhow::ensure!(piece == head, "got piece {piece}");
+                chunks
+            }
+            Next::Wait { .. } => anyhow::bail!("a fresh head piece has shares for anyone"),
+        };
+        // Every request of it on the wire, and every chunk of it delivered by
+        // somebody else.
+        let chunks: Vec<ChunkInfo> = live
+            .lengths
+            .iter_chunk_infos_in(head, first.clone())
+            .collect();
+        live.peers.with_live_mut(addr, "test", |l| {
+            for chunk in &chunks {
+                l.add_inflight_request(*chunk);
+            }
+        });
+        {
+            let block = vec![0u8; CHUNK_SIZE as usize];
+            let mut g = live.lock_write("test");
+            let pieces = g.get_pieces_mut()?;
+            for chunk in &chunks {
+                pieces.mark_chunk_downloaded(&Piece::from_data(
+                    head.get(),
+                    chunk.offset,
+                    &block[..],
+                ));
+            }
+        }
+        // Back for more: the finished claim is retired.
+        while writer.try_recv().is_ok() {}
+        let _ = handler.acquire_next_piece(Ask::Anything)?;
+
+        let outstanding: Vec<ChunkInfo> = live
+            .peers
+            .with_live(addr, |l| l.inflight_requests().copied().collect())
+            .context("the peer is still live")?;
+        anyhow::ensure!(
+            outstanding.iter().all(|c| !first.contains(&c.chunk_index) || c.piece_index != head),
+            "requests for the retired claim are still out: {outstanding:?}"
+        );
+        let mut cancelled = 0;
+        while let Ok(request) = writer.try_recv() {
+            if let WriterRequest::Message(peer_binary_protocol::Message::Cancel(cancel)) = request
+                && cancel.index == head.get()
+            {
+                cancelled += 1;
+            }
+        }
+        anyhow::ensure!(
+            cancelled == chunks.len(),
+            "{cancelled} Cancels sent for {} requests of the retired claim",
+            chunks.len()
         );
         Ok(())
     }

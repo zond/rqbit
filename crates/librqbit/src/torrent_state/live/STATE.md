@@ -125,7 +125,10 @@ This changes three of the invariants below:
   chunks have landed, so `ChunkTracker::chunks_missing()` is what tells
   `inflight` that a claim is done. A claim with nothing missing is not
   offered to a second peer, is not put back by `release()`, and is retired
-  from `participants` when its own holder next asks for work. Ranking on
+  from `participants` when its own holder next asks for work -- and
+  whatever that holder still has out for it (it lost a duplicate race) is
+  cancelled then (`take_retired_claims`), since nothing can find those
+  requests once the claim is gone. Ranking on
   `started` over a list nothing retired from meant "outstanding longest"
   named a claim that had landed minutes ago, and every free peer was sent
   to fetch it again -- which is also what put several peers on one piece's

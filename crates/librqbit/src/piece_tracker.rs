@@ -335,23 +335,30 @@ impl InflightPiece {
         share: Share,
         activity: Activity,
         retry: &mut Retry,
+        retired: &mut Vec<Range<u32>>,
     ) -> Result<Option<Range<u32>>, Crowded> {
-        // This connection's finished shares are over. It is back here
-        // because it has sent every request of them and they have all
-        // landed, so it holds nothing of them on the wire and owes the
-        // piece nothing more for them. Left in, they are what
-        // `stalled_claim` ranks and `release` puts back -- a peer four
-        // claims into a piece carried four entries, of which three were
-        // bytes long since on disk.
+        // This connection's finished shares are over: every chunk of them
+        // is on disk, and it owes the piece nothing more for them. Left
+        // in, they are what `stalled_claim` ranks and `release` puts back
+        // -- a peer four claims into a piece carried four entries, of which
+        // three were bytes long since on disk.
         //
-        // Only this connection's, and only here. A holder that lost a
-        // duplicate race is also sitting on a finished claim, and it is
-        // still on the piece in every way that matters: its requests are
-        // outstanding, and `overtaken_by` has to find it when the piece
-        // completes so they can be cancelled. It retires when it comes back
-        // here itself, or when the piece ends.
-        self.participants
-            .retain(|p| !(p.peer == peer && p.connection == connection && missing(&p.chunks) == 0));
+        // Only this connection's, and only here. It is back here because it
+        // has *sent* every request of them, not because they have landed: a
+        // holder that lost a duplicate race is sitting on a finished claim
+        // with its requests still out, and once the claim is gone
+        // `overtaken_by` cannot find it to cancel them when the piece
+        // completes. So what retires is handed back in `retired`, and the
+        // caller cancels whatever this connection still has out for it
+        // (review #28); for a claim it delivered itself that is nothing.
+        self.participants.retain(|p| {
+            let finished =
+                p.peer == peer && p.connection == connection && missing(&p.chunks) == 0;
+            if finished {
+                retired.push(p.chunks.clone());
+            }
+            !finished
+        });
         let chunks = match self.unclaimed.front() {
             // Room for this peer on this piece, so take the next share.
             Some(_) if self.held_by(peer) < CLAIMS_PER_PEER => {
@@ -730,6 +737,9 @@ pub struct PieceTracker {
     /// whole one cut there. What an idle peer waiting for something to
     /// join has to be told about, since nothing else it waits on says it.
     pool_changed: bool,
+    /// Finished claims the asking connection was retired from since the
+    /// last [`Self::take_retired_claims`]; see [`InflightPiece::claim`].
+    retired: Vec<(ValidPieceIndex, Range<u32>)>,
 }
 
 impl PieceTracker {
@@ -756,6 +766,7 @@ impl PieceTracker {
             deadline_pieces: DEFAULT_DEADLINE_PIECES,
             completions: VecDeque::new(),
             pool_changed: false,
+            retired: Vec::new(),
         }
     }
 
@@ -766,6 +777,15 @@ impl PieceTracker {
     /// announces it (CLAIMS.md, "When a refused peer asks again").
     pub fn take_pool_changed(&mut self) -> bool {
         std::mem::take(&mut self.pool_changed)
+    }
+
+    /// The finished claims the asking connection was retired from since
+    /// this was last asked, and clears them. Its requests for them may
+    /// still be out -- a holder that lost a duplicate race -- and nothing
+    /// else will cancel them once the claim is gone; see
+    /// [`InflightPiece::claim`].
+    pub fn take_retired_claims(&mut self) -> Vec<(ValidPieceIndex, Range<u32>)> {
+        std::mem::take(&mut self.retired)
     }
 
     /// How many pieces at the head of the lookahead are split between the
@@ -1051,14 +1071,19 @@ impl PieceTracker {
                     } else {
                         Share::Unclaimed
                     };
-                    match inflight.claim(
+                    let mut retired = Vec::new();
+                    let claimed = inflight.claim(
                         req.peer,
                         req.connection,
                         |claim| tracker.chunks_missing(piece, claim),
                         share,
                         activity,
                         &mut retry,
-                    ) {
+                        &mut retired,
+                    );
+                    self.retired
+                        .extend(retired.into_iter().map(|chunks| (piece, chunks)));
+                    match claimed {
                         Ok(Some(chunks)) => {
                             return Walk::taken(AcquireResult::Reserved { piece, chunks });
                         }

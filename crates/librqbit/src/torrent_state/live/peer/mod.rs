@@ -2,6 +2,7 @@ pub mod stats;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::ops::Range;
 use std::sync::{Arc, atomic::Ordering};
 
 use librqbit_core::hash_id::Id20;
@@ -408,6 +409,31 @@ impl LivePeerState {
             }
         });
 
+        if self.inflight_requests.len() != before {
+            self.request_slots_changed.notify_waiters();
+        }
+    }
+
+    /// Cancel what we have out with this peer for `chunks` of `piece`: a claim it was
+    /// retired from with its requests still on the wire (`PieceTracker::take_retired_claims`).
+    /// Each is tolerated if it arrives anyway, like any late cancelled chunk.
+    pub fn cancel_inflight_requests_in(&mut self, piece: ValidPieceIndex, chunks: &Range<u32>) {
+        let tx = &self.tx;
+        let late_cancelled_request_tolerance = &mut self.late_cancelled_request_tolerance;
+        let before = self.inflight_requests.len();
+        self.inflight_requests.retain(|req, _| {
+            if req.piece_index == piece && chunks.contains(&req.chunk_index) {
+                let _ = tx.send(WriterRequest::Message(Message::Cancel(Request {
+                    index: piece.get(),
+                    begin: req.offset,
+                    length: req.size,
+                })));
+                *late_cancelled_request_tolerance += 1;
+                false
+            } else {
+                true
+            }
+        });
         if self.inflight_requests.len() != before {
             self.request_slots_changed.notify_waiters();
         }
