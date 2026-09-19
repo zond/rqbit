@@ -75,7 +75,8 @@ The walk goes over the lookahead in playback order, `deep` counting the
 pieces this peer could actually take.
 
 1. **Cut a whole piece at the head** (`InflightPiece::split_whole`). At
-   depth < 2, a piece held whole is cut if the asker outpaces the piece:
+   depth < 2, a piece held whole is cut if the asker -- never its own
+   holder -- outpaces the piece:
    the holder keeps the claim it is currently delivering into (the first
    with anything missing), claims already on disk need nobody, and every
    claim after goes to the pool. Without this, splitting never engaged in

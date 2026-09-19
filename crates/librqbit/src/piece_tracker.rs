@@ -421,11 +421,23 @@ impl InflightPiece {
     /// ordinary queue to prove itself.
     ///
     /// `true` when anything was cut.
-    fn split_whole(&mut self, missing: impl Fn(&Range<u32>) -> u32, activity: Activity) -> bool {
+    fn split_whole(
+        &mut self,
+        peer: PeerHandle,
+        missing: impl Fn(&Range<u32>) -> u32,
+        activity: Activity,
+    ) -> bool {
         let since = self.started;
         let [holder] = self.participants.as_mut_slice() else {
             return false;
         };
+        // Never by its own holder. The holder outpacing its own piece says nothing
+        // about anybody coming for the rest of it, and the cut would only move the
+        // tail it already has requests out for into the pool -- where it takes it
+        // back itself, one claim at a time, or leaves it to be fetched twice.
+        if holder.peer == peer {
+            return false;
+        }
         // A refusal here names no instant of its own: the holder of a whole
         // piece is the newest holder of its one claim, and `stalled_claim`
         // records that claim's instant for the same asker a moment later.
@@ -1027,7 +1039,11 @@ impl PieceTracker {
                         // as it would have been had it been reserved here;
                         // see [`InflightPiece::split_whole`].
                         if inflight
-                            .split_whole(|claim| tracker.chunks_missing(piece, claim), activity)
+                            .split_whole(
+                                req.peer,
+                                |claim| tracker.chunks_missing(piece, claim),
+                                activity,
+                            )
                         {
                             self.pool_changed = true;
                         }
@@ -3353,6 +3369,36 @@ mod tests {
             }
             other => panic!("expected a share of the cut piece, got {other:?}"),
         }
+    }
+
+    /// **A holder does not cut its own whole piece** (review #29). It is
+    /// the one peer whose outpacing the piece says nothing about who else
+    /// is coming, and a cut would only pool the tail it has requests out
+    /// for.
+    #[test]
+    fn a_holder_does_not_cut_its_own_whole_piece() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(6);
+        let t0 = Instant::now();
+        let reached = piece(&tracker, 2);
+        tracker.reserve_piece(reached, peer(1), 0, false, t0);
+        let window: Vec<ValidPieceIndex> = (2..6).map(|id| piece(&tracker, id)).collect();
+        let asked = acquire_with(
+            &mut tracker,
+            &file_infos,
+            &priorities,
+            1,
+            &window,
+            t0 + Duration::from_secs(10),
+            Some(Duration::from_millis(100)),
+        );
+        assert_ne!(
+            reserved_or_none(asked),
+            Some(reached),
+            "the holder was handed a share of its own piece"
+        );
+        let holders = tracker.participants(reached);
+        assert_eq!(holders.len(), 1);
+        assert_eq!(holders[0].chunks, 0..64, "the holder cut its own piece");
     }
 
     /// **A claim handed out again is doubled like any other when its new
