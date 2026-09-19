@@ -772,7 +772,9 @@ impl ChunkTracker {
     ///
     /// Keeping them is only useful because a request is filtered against
     /// `chunk_status` before it goes out, so the peer that picks the piece
-    /// up asks for what is missing and not for the piece.
+    /// up asks for what is missing and not for the piece. A dropped piece
+    /// is wiped all the same: it goes back to no queue, so nobody picks it
+    /// up (see `requeue_piece`).
     pub(crate) fn requeue_piece_keeping_chunks(&mut self, index: ValidPieceIndex) {
         self.requeue_piece(index, Chunks::Keep)
     }
@@ -790,13 +792,20 @@ impl ChunkTracker {
         debug!("marking piece={} as broken", index);
         // A dropped piece is not wanted. This is reached on hash failure, on every peer
         // disconnect and on every pause, so requeuing here would be the "delete it and
-        // download it again" loop that the want-set exists to prevent. Its chunks are
-        // still reset below: a live stream's priority window can pull the piece back in
-        // without going through the queue, and if it does it must start from scratch.
-        if !self.is_piece_dropped(index) {
+        // download it again" loop that the want-set exists to prevent.
+        let dropped = self.is_piece_dropped(index);
+        if !dropped {
             self.queue_pieces.set(index.get() as usize, true);
         }
-        if chunks == Chunks::Wipe
+        // Its chunks are reset even when the caller asked to keep them. Keeping is for
+        // the peer that picks the piece up from the queue, and a dropped piece is not
+        // queued: nobody is coming for what it has. Left marked, they are what
+        // `drop_piece` reads as "a peer is working on it" -- a piece out of the queue and
+        // out of the in-flight map with chunks on disk -- and it refuses the piece for
+        // good, so the caller can never take back the storage they sit in. A live
+        // stream's priority window can still pull the piece back in without the queue,
+        // and then it starts from scratch.
+        if (chunks == Chunks::Wipe || dropped)
             && let Some(s) = self.chunk_status.get_mut(self.lengths.chunk_range(index))
         {
             s.fill(false);
@@ -1851,6 +1860,32 @@ mod piece_reclaim_tests {
         ct.mark_chunk_downloaded(&Piece::from_data(p0.get(), 0, &block))
             .unwrap();
         assert!(ct.drop_pieces(&fi, [p0], |_| false).unwrap().is_empty());
+    }
+
+    // review #4. The same pull, and the last peer on it leaves before the piece is
+    // complete: the piece is requeued keeping its chunks, which for a dropped piece is
+    // requeued to nowhere. Kept, the chunk would have the piece refused as "a peer is
+    // working on it" on every later ask, with nobody ever coming back to finish it, and
+    // its storage could not be taken back until a restart.
+    #[test]
+    fn test_a_dropped_piece_whose_last_holder_left_can_be_dropped_again() {
+        let l = lengths();
+        let fi = file_infos();
+        let mut ct = tracker(l, &fi);
+        ct.enable_piece_reclaim();
+        download(&mut ct, &l, 0);
+        let p0 = piece(&l, 0);
+        assert_eq!(ct.drop_pieces(&fi, [p0], |_| false).unwrap(), [p0]);
+        assert_eq!(ct.finish_release([p0]), 0);
+
+        let block = vec![0u8; CHUNK_SIZE as usize];
+        ct.mark_chunk_downloaded(&Piece::from_data(p0.get(), 0, &block))
+            .unwrap();
+        ct.requeue_piece_keeping_chunks(p0);
+
+        assert!(!ct.is_piece_queued(p0), "a dropped piece is still not wanted");
+        assert!(!ct.any_chunk_arrived(p0));
+        assert_eq!(ct.drop_pieces(&fi, [p0], |_| false).unwrap(), [p0]);
     }
 
     // A piece reselected while its claim is still being released is not dropped again

@@ -1315,7 +1315,9 @@ impl PieceTracker {
             // requests are filtered against `chunk_status`
             // (`PeerConnection`'s request loop), so whoever picks it up
             // next asks for the chunks that are missing rather than for the
-            // piece.
+            // piece. A dropped piece is the exception: it goes back to no
+            // queue, so nobody picks it up, and its chunks are wiped after all
+            // (`ChunkTracker::requeue_piece`).
             if self.chunks.any_chunk_arrived(piece) {
                 self.chunks.requeue_piece_keeping_chunks(piece);
             } else {
