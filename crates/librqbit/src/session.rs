@@ -5,7 +5,7 @@ use std::{
     net::SocketAddr,
     path::{Component, Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -941,33 +941,45 @@ impl Session {
         .boxed()
     }
 
+    /// Reads an incoming connection's handshake and finds the torrent it is for.
+    ///
+    /// Holds the session only weakly across its waits. A session is stopped by
+    /// dropping it, and a check holding it strongly would keep it alive for as long
+    /// as the check waits on the remote -- up to the read timeout for the
+    /// handshake, and more for the torrent to go live. Sessions that keep dialling
+    /// each other then keep each other alive: each one's checks hold the other
+    /// long after its owner has let go of it.
     async fn check_incoming_connection(
-        self: Arc<Self>,
+        session: Weak<Self>,
         addr: SocketAddr,
         kind: ConnectionKind,
         mut reader: BoxAsyncReadVectored,
         writer: BoxAsyncWrite,
     ) -> anyhow::Result<(Arc<TorrentStateLive>, CheckedIncomingConnection)> {
-        let rwtimeout = self
-            .peer_opts
-            .read_write_timeout
-            .unwrap_or_else(|| Duration::from_secs(10));
+        let (rwtimeout, own_peer_id) = {
+            let this = session.upgrade().context("session is dead")?;
+            let rwtimeout = this
+                .peer_opts
+                .read_write_timeout
+                .unwrap_or_else(|| Duration::from_secs(10));
 
-        let incoming_ip = addr.ip();
-        if self.blocklist.has(incoming_ip) {
-            self.stats
-                .counters
-                .blocked_incoming
-                .fetch_add(1, Ordering::Relaxed);
-            bail!("Incoming ip {incoming_ip} is in blocklist");
-        }
-        if self.allowlist.as_ref().is_some_and(|l| !l.has(incoming_ip)) {
-            self.stats
-                .counters
-                .blocked_incoming
-                .fetch_add(1, Ordering::Relaxed);
-            bail!("Incoming ip {incoming_ip} is not in allowlist");
-        }
+            let incoming_ip = addr.ip();
+            if this.blocklist.has(incoming_ip) {
+                this.stats
+                    .counters
+                    .blocked_incoming
+                    .fetch_add(1, Ordering::Relaxed);
+                bail!("Incoming ip {incoming_ip} is in blocklist");
+            }
+            if this.allowlist.as_ref().is_some_and(|l| !l.has(incoming_ip)) {
+                this.stats
+                    .counters
+                    .blocked_incoming
+                    .fetch_add(1, Ordering::Relaxed);
+                bail!("Incoming ip {incoming_ip} is not in allowlist");
+            }
+            (rwtimeout, this.peer_id)
+        };
 
         let mut read_buf = ReadBuf::new();
         let h = read_buf
@@ -976,11 +988,13 @@ impl Session {
             .context("error reading handshake")?;
         trace!("received handshake from {addr}: {:?}", h);
 
-        if h.peer_id == self.peer_id {
+        if h.peer_id == own_peer_id {
             bail!("seems like we are connecting to ourselves, ignoring");
         }
 
-        let (id, torrent) = self
+        let (id, torrent) = session
+            .upgrade()
+            .context("session is dead")?
             .db
             .read()
             .torrents
@@ -1022,10 +1036,12 @@ impl Session {
                     match r {
                         Ok((addr, (read, write))) => {
                             trace!("accepted connection from {addr}");
-                            let session = session.upgrade().context("session is dead")?;
-                            let span = debug_span!(parent: session.rs(), "incoming", addr=%addr);
+                            let span = {
+                                let session = session.upgrade().context("session is dead")?;
+                                debug_span!(parent: session.rs(), "incoming", addr=%addr)
+                            };
                             futs.push(
-                                session.check_incoming_connection(addr, A::KIND, Box::new(read), Box::new(write))
+                                Self::check_incoming_connection(session.clone(), addr, A::KIND, Box::new(read), Box::new(write))
                                     .map_err(|e| {
                                         debug!("error checking incoming connection: {e:#}");
                                         e
