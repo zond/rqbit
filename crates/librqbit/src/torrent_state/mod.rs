@@ -761,6 +761,28 @@ impl ManagedTorrent {
         peer_rx: Option<PeerStream>,
         start_paused: bool,
     ) -> anyhow::Result<()> {
+        self.start_with_intent(peer_rx, Some(start_paused))
+    }
+
+    /// Start the torrent **on the intent it already has**, rather than writing one.
+    ///
+    /// For `Session::add_torrent`, which records the intent on the torrent it builds and
+    /// only then publishes it and starts it. Between those two the handle is reachable
+    /// through the session -- the persistence store is awaited in there -- so a `pause`
+    /// can land, and a start that wrote its own captured intent overwrote it: the caller
+    /// got Ok from a pause that did nothing and the torrent ran.
+    pub(crate) fn start_as_intended(
+        self: &Arc<Self>,
+        peer_rx: Option<PeerStream>,
+    ) -> anyhow::Result<()> {
+        self.start_with_intent(peer_rx, None)
+    }
+
+    fn start_with_intent(
+        self: &Arc<Self>,
+        peer_rx: Option<PeerStream>,
+        start_paused: Option<bool>,
+    ) -> anyhow::Result<()> {
         // Everything below reads the pause intent off the guard (`g.paused`) rather
         // than taking it as an argument. `start` writes the intent there before the
         // first call, so within one synchronous call the two are the same thing - but
@@ -945,7 +967,9 @@ impl ManagedTorrent {
             .upgrade()
             .context("session is dead, cannot start torrent")?;
         let mut g = self.locked.write();
-        g.paused = start_paused;
+        if let Some(start_paused) = start_paused {
+            g.paused = start_paused;
+        }
         let cancellation_token = session.cancellation_token().child_token();
 
         _start(self, peer_rx, session, Some(g), cancellation_token)
@@ -969,7 +993,15 @@ impl ManagedTorrent {
             ManagedTorrentState::Initializing(init) => {
                 let init = init.clone();
                 g.paused = true;
-                init.request_pause();
+                // Only a check that is running can be stopped, and the request is read
+                // as "a check stopped for good and only an unpause runs another"
+                // (`wait_until_initialized`). Set on a torrent whose check has not
+                // started -- a pause between `add_torrent` publishing the handle and
+                // starting it -- it made a waiter give up on a check that was about to
+                // run. `start` clears it either way; what it lands in is `g.paused`.
+                if init.is_check_running() {
+                    init.request_pause();
+                }
                 self.state_change_notify.notify_waiters();
                 Ok(())
             }

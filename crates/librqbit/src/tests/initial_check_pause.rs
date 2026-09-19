@@ -685,3 +685,126 @@ async fn a_pause_undone_before_the_check_reports_runs_the_check_again_inner() ->
     assert!(!handle.is_paused());
     Ok(())
 }
+
+/// A storage factory that pauses torrent 0 the first time the persistence store asks
+/// whether it can be persisted -- which the session does between publishing the handle
+/// and starting the torrent, and is the only deterministic way into that window.
+#[derive(Clone)]
+struct PauseWhilePersisting {
+    session: Arc<std::sync::Mutex<Option<std::sync::Weak<Session>>>>,
+    paused: Arc<AtomicBool>,
+    /// Whether, at that moment, `wait_until_initialized` would have given up on a check
+    /// that had not started yet.
+    wait_would_have_failed: Arc<AtomicBool>,
+    inner: FilesystemStorageFactory,
+}
+
+impl StorageFactory for PauseWhilePersisting {
+    type Storage = Box<dyn TorrentStorage>;
+
+    fn create(
+        &self,
+        shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
+    ) -> anyhow::Result<Box<dyn TorrentStorage>> {
+        Ok(Box::new(self.inner.create(shared, metadata)?))
+    }
+
+    fn is_type_id(&self, type_id: TypeId) -> bool {
+        self.inner.is_type_id(type_id)
+    }
+
+    fn ensure_persistable(&self) -> anyhow::Result<()> {
+        self.inner.ensure_persistable()?;
+        if self.paused.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let session = self
+            .session
+            .lock()
+            .unwrap()
+            .clone()
+            .and_then(|s| s.upgrade())
+            .context("the test did not hand over its session")?;
+        let handle = session
+            .get(TorrentIdOrHash::Id(0))
+            .context("the handle is not published yet")?;
+        handle.pause().context("pausing the torrent")?;
+        self.wait_would_have_failed.store(
+            handle.with_state(|s| match s {
+                crate::ManagedTorrentState::Initializing(i) => {
+                    i.is_pause_requested() && !i.is_check_running()
+                }
+                _ => false,
+            }),
+            Ordering::SeqCst,
+        );
+        info!("paused the torrent from inside add_torrent");
+        Ok(())
+    }
+
+    fn clone_box(&self) -> BoxStorageFactory {
+        self.clone().boxed()
+    }
+}
+
+/// review #36. `add_torrent` publishes the handle, awaits the persistence store and only
+/// then starts the torrent. A `pause` in that window used to be lost -- the start wrote
+/// the intent it had captured before the handle existed -- and it left a pause request on
+/// a check that had not started, which `wait_until_initialized` reads as a check that
+/// stopped for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pause_while_a_torrent_is_being_added_is_not_lost() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (dir, torrent_bytes) = complete_torrent_on_disk("rqbit_pause_while_adding").await?;
+    let persistence = dir.path().join("session");
+    let factory = PauseWhilePersisting {
+        session: Default::default(),
+        paused: Default::default(),
+        wait_would_have_failed: Default::default(),
+        inner: FilesystemStorageFactory::default(),
+    };
+    let session = Session::new_with_opts(
+        dir.path().into(),
+        session_opts(Some(&persistence), Some(factory.clone().boxed())),
+    )
+    .await?;
+    *factory.session.lock().unwrap() = Some(Arc::downgrade(&session));
+
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent_bytes),
+            Some(AddTorrentOptions {
+                overwrite: true,
+                output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    assert!(
+        factory.paused.load(Ordering::SeqCst),
+        "the test never got into the window it is about"
+    );
+    assert!(
+        !factory.wait_would_have_failed.load(Ordering::SeqCst),
+        "a waiter would have been told the check had stopped, before it had started"
+    );
+    assert!(handle.is_paused(), "the pause was swallowed by the add");
+
+    timeout(WAIT, handle.wait_until_initialized())
+        .await
+        .context("the check never finished")??;
+    wait_until(
+        || match handle.stats().state {
+            TorrentStatsState::Paused => Ok(()),
+            other => bail!("waiting for the torrent to settle paused, it is {other:?}"),
+        },
+        WAIT,
+    )
+    .await
+    .context("a torrent paused while it was being added ran anyway")?;
+    assert!(handle.live().is_none());
+    Ok(())
+}

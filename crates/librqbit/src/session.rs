@@ -1496,8 +1496,12 @@ impl Session {
 
         let _e = managed_torrent.shared.span.clone().entered();
 
+        // On the intent the torrent was built with, not on `opts.paused`: the handle has
+        // been reachable through the session since `g.add_torrent` above, and a `pause`
+        // that landed in between (the persistence store is awaited there) is what
+        // `g.paused` says now.
         managed_torrent
-            .start(peer_rx, opts.paused)
+            .start_as_intended(peer_rx)
             .context("error starting torrent")?;
 
         if let Some(name) = metadata.info.name() {
