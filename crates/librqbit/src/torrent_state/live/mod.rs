@@ -2777,6 +2777,17 @@ impl PeerHandler {
                 }
                 share.chunks.pop_front();
 
+                // **Still ours to ask for?** The share was ours when it was handed
+                // out, and it is sent a chunk at a time over as long as the peer
+                // takes to free a slot. Meanwhile a faster peer can have cut the
+                // piece, stolen it, a choke handed it back, or it completed; the
+                // chunks that left with it are someone else's now or on disk, and
+                // asking for them anyway is a duplicate every one (review #3).
+                if !self.still_to_request(&chunk) {
+                    trace!(?chunk, "no longer ours to ask for; skipping");
+                    continue;
+                }
+
                 let request = Request {
                     index: chunk.piece_index.get(),
                     begin: chunk.offset,
@@ -2868,11 +2879,12 @@ impl PeerHandler {
     /// the write as `PreviouslyCompleted`: 210 MB of 592 MB fetched in the
     /// field log of 2026-09-14.
     ///
-    /// One reading, before the loop rather than per chunk: a chunk that
-    /// lands while we are sending is one redundant request, which is what
-    /// every chunk cost before this. The rest of the piece is either
-    /// another peer's claim or still unclaimed, and this peer comes back
-    /// round for one of those when it is done here.
+    /// The first reading, when the share is handed out; the request loop
+    /// asks again before each chunk goes out (`still_to_request`), since a
+    /// share can lose chunks to another peer or to the disk while it is
+    /// being sent. The rest of the piece is either another peer's claim or
+    /// still unclaimed, and this peer comes back round for one of those
+    /// when it is done here.
     fn chunks_to_send(&self, piece: ValidPieceIndex, claimed: Range<u32>) -> VecDeque<ChunkInfo> {
         let mut to_request = {
             let g = self.state.lock_read("chunks already on disk");
@@ -2889,6 +2901,21 @@ impl PeerHandler {
             // a reading.
             .filter(|_| to_request.next().unwrap_or(true))
             .collect()
+    }
+
+    /// See [`crate::piece_tracker::PieceTracker::still_to_request`].
+    fn still_to_request(&self, chunk: &ChunkInfo) -> bool {
+        self.state
+            .lock_read("still_to_request")
+            .get_pieces()
+            .is_ok_and(|pieces| {
+                pieces.still_to_request(
+                    chunk.piece_index,
+                    self.addr,
+                    self.connection,
+                    chunk.chunk_index,
+                )
+            })
     }
 
     fn on_i_am_choked(&self) {
@@ -4245,6 +4272,144 @@ mod connection_tests {
             cancelled == chunks.len(),
             "{cancelled} Cancels sent for {} requests of the retired claim",
             chunks.len()
+        );
+        Ok(())
+    }
+
+    /// **A share taken from a peer mid-send is not sent any further**
+    /// (review #3). The request loop sends a share a chunk at a time as
+    /// slots free; here the piece is stolen after the first window has
+    /// gone out, and the next slot must go to other work, not to the rest
+    /// of a piece that is now another peer's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_share_taken_mid_send_is_not_sent_any_further() -> anyhow::Result<()> {
+        setup_test_logging();
+        const CHUNKS_PER_PIECE: u32 = 32;
+        const PIECE_LEN: u32 = CHUNK_SIZE * CHUNKS_PER_PIECE;
+
+        let files =
+            create_default_random_dir_with_torrents(1, PIECE_LEN as usize * 2, Some("taken"));
+        let torrent = create_torrent(
+            files.path(),
+            CreateTorrentOptions {
+                piece_length: Some(PIECE_LEN),
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await?;
+        let dir = TempDir::with_prefix("taken_client")?;
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            crate::SessionOptions {
+                dht: None,
+                persistence: None,
+                peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.as_bytes()?.to_vec()),
+                Some(crate::AddTorrentOptions {
+                    overwrite: true,
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        tokio::time::timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+        let live = handle.live().context("expected a live torrent")?;
+
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 2));
+        live.peers
+            .add_if_not_seen(addr)
+            .context("a fresh address")?;
+        let (_rx, _tx) = live
+            .peers
+            .mark_peer_connecting(addr, CancellationToken::new())?;
+        live.peers.with_peer_mut(addr, "test", |p| {
+            p.connecting_to_live(Id20::new([0u8; 20]), &live.peers, ConnectionKind::Tcp);
+        });
+        live.peers.with_live_mut(addr, "test", |l| {
+            l.bitfield = BF::from_boxed_slice(vec![0xffu8].into_boxed_slice());
+        });
+        let (tx, mut requests) = unbounded_channel();
+        let handler = PeerHandler::for_test(live.clone(), addr, tx);
+        handler.lock_flow_control("test").request_window = 4;
+        let requester = tokio::spawn(async move { handler.task_peer_chunk_requester().await });
+
+        let next_request = async |requests: &mut UnboundedReceiver<WriterRequest>| {
+            loop {
+                let sent = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+                    .await
+                    .context("the peer sent nothing")?
+                    .context("the requester hung up")?;
+                if let WriterRequest::Message(peer_binary_protocol::Message::Request(r)) = sent {
+                    return anyhow::Ok(r);
+                }
+            }
+        };
+
+        // A window's worth of the first piece, which it holds whole.
+        let mut first = Vec::new();
+        for _ in 0..4 {
+            first.push(next_request(&mut requests).await?);
+        }
+        let taken = live
+            .lengths
+            .validate_piece_index(first[0].index)
+            .context("a piece")?;
+        anyhow::ensure!(
+            first.iter().all(|r| r.index == taken.get()),
+            "expected a window of one piece, got {first:?}"
+        );
+
+        // Another peer, much faster, steals it.
+        {
+            let mut g = live.lock_write("test");
+            let TorrentStateLocked {
+                pieces,
+                file_priorities,
+                ..
+            } = &mut **g;
+            let pieces = pieces.as_mut().context("no chunk tracker")?;
+            match pieces.acquire_piece(crate::piece_tracker::AcquireRequest {
+                peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+                connection: 0,
+                now: std::time::Instant::now() + Duration::from_secs(60),
+                peer_avg_time: Some(Duration::from_millis(1)),
+                last_latency: None,
+                priority_pieces: std::iter::empty(),
+                file_priorities,
+                file_infos: &live.metadata.file_infos,
+                peer_has_piece: |p| p == taken,
+                can_steal: |_| true,
+            }) {
+                crate::piece_tracker::AcquireResult::Stolen { piece, .. } => {
+                    anyhow::ensure!(piece == taken, "stole piece {piece} instead");
+                }
+                other => anyhow::bail!("expected a steal, got {other:?}"),
+            }
+        }
+
+        // A chunk lands and frees a slot.
+        let landed = live
+            .lengths
+            .chunk_info_from_received_data(taken, first[0].begin, CHUNK_SIZE)
+            .context("a chunk of the taken piece")?;
+        live.peers.with_live_mut(addr, "test", |l| {
+            l.remove_inflight_request(&landed);
+        });
+        let next = next_request(&mut requests).await?;
+        requester.abort();
+        anyhow::ensure!(
+            next.index != taken.get(),
+            "the freed slot asked for chunk at {} of piece {taken}, which was stolen",
+            next.begin
         );
         Ok(())
     }

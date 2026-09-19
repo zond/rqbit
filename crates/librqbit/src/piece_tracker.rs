@@ -779,6 +779,27 @@ impl PieceTracker {
         std::mem::take(&mut self.pool_changed)
     }
 
+    /// Whether `connection` to `peer` should still ask for chunk
+    /// `chunk_index` of `piece`: it holds a claim covering it, and the chunk
+    /// is not on disk. The request loop asks before each request it sends,
+    /// because what it was handed can be taken from under it -- a cut at
+    /// the head, a steal, a choke's handback, the piece completing -- and it
+    /// sends a share one chunk at a time over as long as the peer takes.
+    pub fn still_to_request(
+        &self,
+        piece: ValidPieceIndex,
+        peer: PeerHandle,
+        connection: u64,
+        chunk_index: u32,
+    ) -> bool {
+        let chunk = chunk_index..chunk_index + 1;
+        self.inflight.get(&piece).is_some_and(|inflight| {
+            inflight.participants.iter().any(|p| {
+                p.peer == peer && p.connection == connection && p.chunks.contains(&chunk_index)
+            })
+        }) && self.chunks.chunks_missing(piece, &chunk) > 0
+    }
+
     /// The finished claims the asking connection was retired from since
     /// this was last asked, and clears them. Its requests for them may
     /// still be out -- a holder that lost a duplicate race -- and nothing
