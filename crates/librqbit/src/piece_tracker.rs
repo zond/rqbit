@@ -447,7 +447,17 @@ impl InflightPiece {
             return false;
         };
         holder.chunks = claims[current].clone();
-        self.unclaimed.extend(claims.into_iter().skip(current + 1));
+        // Only what is still missing goes to the pool. A holder requests in
+        // order, but a piece handed out again keeps the chunks earlier peers
+        // left (`release_pieces_owned_by`), so a claim past the current one
+        // can be on disk already -- and a peer handed one would walk it,
+        // find nothing to ask for, and come back.
+        self.unclaimed.extend(
+            claims
+                .into_iter()
+                .skip(current + 1)
+                .filter(|claim| missing(claim) > 0),
+        );
         true
     }
 
@@ -3297,6 +3307,42 @@ mod tests {
             "a ten-second-old piece was not cut because its holder landed a chunk \
              fifty milliseconds ago"
         );
+    }
+
+    /// **A cut pools only the claims still missing something** (review
+    /// #30). A piece handed out again keeps the chunks earlier peers left,
+    /// so a claim past the one its holder is delivering into can be on
+    /// disk already; the peer that cuts takes the next claim with work in
+    /// it, not that one.
+    #[test]
+    fn a_cut_does_not_pool_a_claim_already_on_disk() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(6);
+        let t0 = Instant::now();
+        let reached = piece(&tracker, 2);
+        tracker.reserve_piece(reached, peer(1), 0, false, t0);
+        // What a previous holder left: the second claim, whole.
+        deliver(&mut tracker, reached, 16..32);
+        let window: Vec<ValidPieceIndex> = (2..6).map(|id| piece(&tracker, id)).collect();
+        let cutter = acquire_with(
+            &mut tracker,
+            &file_infos,
+            &priorities,
+            2,
+            &window,
+            t0 + Duration::from_secs(10),
+            Some(Duration::from_millis(100)),
+        );
+        match cutter {
+            AcquireResult::Reserved { piece, chunks } => {
+                assert_eq!(piece, reached, "the head piece was cut");
+                assert_eq!(
+                    chunks,
+                    32..48,
+                    "the holder keeps 0..16 and 16..32 is on disk: 32..48 is the next with work"
+                );
+            }
+            other => panic!("expected a share of the cut piece, got {other:?}"),
+        }
     }
 
     /// **A claim handed out again is doubled like any other when its new
