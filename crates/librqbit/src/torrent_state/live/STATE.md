@@ -109,10 +109,14 @@ This changes three of the invariants below:
 
 - **A piece may have several peers.** `inflight[p]` holds a list of
   participants, and a peer is disqualified from writing to a piece by having
-  no share of it, not by not being *the* owner.
+  no share of it, not by not being *the* owner. A share is checked again
+  before each request of it goes out (`still_to_request`): it is sent one
+  chunk at a time as slots free, and a cut, a steal, a choke's handback or
+  the piece completing can take part of it away in between.
 - **A release is partial.** One connection leaving returns its claim to the
-  unclaimed pool; the piece is only broken -- which wipes every chunk of it
-  -- when the last participant goes. A claim another participant is still
+  unclaimed pool; the piece is re-queued when the last participant goes --
+  keeping the chunks other peers delivered, unless it is a piece the
+  reclaim dropped, which is wiped because nothing will pick it up. A claim another participant is still
   fetching does **not** go back: anything in the unclaimed pool is handed
   out on the next `claim()`, which pops the pool without consulting
   `MAX_HOLDERS_PER_CLAIM` -- only `stalled_claim` does -- so a claim put
