@@ -709,6 +709,19 @@ pub struct PieceTracker {
 }
 
 impl PieceTracker {
+    /// Hands `piece` to `peer` whole, whatever state it is in -- the one
+    /// thing no route in the tracker is meant to do to a finished piece,
+    /// for the test that a chunk delivered on such a share is not written.
+    #[cfg(test)]
+    pub(crate) fn reserve_whole_for_test(
+        &mut self,
+        piece: ValidPieceIndex,
+        peer: PeerHandle,
+        now: Instant,
+    ) {
+        let _ = self.reserve_piece(piece, peer, 0, false, now);
+    }
+
     // === CONSTRUCTION ===
 
     /// Create a new PieceTracker wrapping the given ChunkTracker.
@@ -1058,6 +1071,20 @@ impl PieceTracker {
         split: bool,
         now: Instant,
     ) -> AcquireResult {
+        // Should be unreachable: the walk and the queue both refuse a
+        // piece that is have or mid-check. Said out loud if it is not,
+        // because a peer on a finished piece is how a write lands in a
+        // piece the storage has already committed (piece 4342, 2026-09-19)
+        // and this names the route that got it here.
+        let have = self.chunks.is_piece_have(piece);
+        if have || self.chunks.is_piece_fully_downloaded(piece) {
+            tracing::warn!(
+                piece = piece.get(),
+                %peer,
+                have,
+                "reserving a piece that is already complete"
+            );
+        }
         self.chunks.reserve_needed_piece(piece);
         let chunks_in_piece = self.chunks.get_lengths().chunks_per_piece(piece);
         let tracker = &self.chunks;

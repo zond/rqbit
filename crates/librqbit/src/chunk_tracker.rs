@@ -397,7 +397,17 @@ impl ChunkTracker {
             // peer has already delivered and queue the piece for a second peer as well:
             // every other caller of it takes the piece out of the in-flight map first,
             // and this is the one that must not.
-            if self.selected[id.get() as usize] && !is_inflight(id) {
+            // Nor one whose chunks are all written: that piece is between
+            // its last chunk and its hash check, out of the queue and out
+            // of the in-flight map, and wiping and queueing it hands it to
+            // a second peer while the first copy is being committed --
+            // whose chunks then land in a piece the storage has finished.
+            // `mark_piece_downloaded` undrops it when the check passes,
+            // and a failed check requeues it itself.
+            if self.selected[id.get() as usize]
+                && !is_inflight(id)
+                && !self.is_piece_fully_downloaded(id)
+            {
                 // Puts it back in the queue and resets its chunks.
                 self.mark_piece_broken_if_not_have(id);
                 res.queued += 1;
@@ -949,7 +959,9 @@ impl ChunkTracker {
                     // The user asked the file back whether or not a peer
                     // is on this piece; what a peer is on, it keeps.
                     self.undrop_piece(idx);
-                    if !is_inflight(idx) {
+                    // Not a piece being hash-checked either; see
+                    // `reselect_pieces`.
+                    if !is_inflight(idx) && !self.is_piece_fully_downloaded(idx) {
                         self.mark_piece_broken_if_not_have(idx);
                     }
                 }
@@ -1859,6 +1871,59 @@ mod piece_reclaim_tests {
         assert!(!ct.is_piece_dropped(p0));
         assert!(ct.drop_pieces(&fi, [p0], |_| false).unwrap().is_empty());
         assert!(!ct.is_piece_dropped(p0));
+    }
+
+    /// **A piece being hash-checked is neither wiped nor queued by a
+    /// reselect.** Between its last chunk and its check a piece is in no
+    /// set -- not have, not queued, not in flight -- and a reselect that
+    /// sees "dropped, selected, not in flight" used to wipe it and queue
+    /// it for a second peer, whose chunks then landed in a piece the
+    /// storage had just finished (field log 2026-09-19, piece 4342). The
+    /// same for asking the file back with `update_only_files`.
+    #[test]
+    fn test_a_piece_being_checked_is_not_requeued_by_a_reselect() {
+        let l = lengths();
+        let fi = file_infos();
+        let mut ct = tracker(l, &fi);
+        ct.enable_piece_reclaim();
+        for id in 0..3 {
+            download(&mut ct, &l, id);
+        }
+        let p0 = piece(&l, 0);
+        ct.drop_pieces(&fi, [p0], |_| false).unwrap();
+
+        // A stream's window pulls it back without the queue: reserved, both
+        // chunks land, and the check is running.
+        ct.reserve_needed_piece(p0);
+        let block = vec![0u8; CHUNK_SIZE as usize];
+        for chunk in 0..2 {
+            ct.mark_chunk_downloaded(&Piece::from_data(p0.get(), chunk * CHUNK_SIZE, &block))
+                .unwrap();
+        }
+        assert!(ct.is_piece_fully_downloaded(p0));
+        assert!(!ct.is_piece_have(p0));
+
+        ct.reselect_pieces([p0], |_| false).unwrap();
+        assert!(
+            ct.is_piece_fully_downloaded(p0),
+            "a reselect wiped the piece being checked"
+        );
+        assert!(!ct.is_piece_queued(p0), "and queued it for another peer");
+
+        ct.update_only_files(&fi, &HashSet::from_iter([1]), |_| false)
+            .unwrap();
+        ct.update_only_files(&fi, &HashSet::from_iter([0, 1]), |_| false)
+            .unwrap();
+        assert!(
+            ct.is_piece_fully_downloaded(p0),
+            "asking the file back wiped the piece being checked"
+        );
+        assert!(!ct.is_piece_queued(p0), "and queued it for another peer");
+
+        // The check passes, and it is ours.
+        ct.mark_piece_downloaded(p0, &fi);
+        assert!(ct.is_piece_have(p0));
+        assert!(!ct.is_piece_queued(p0));
     }
 
     #[test]

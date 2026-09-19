@@ -3032,6 +3032,32 @@ impl PeerHandler {
                         return Ok(());
                     }
                 };
+                // **Nothing may write into a piece the storage has finished.**
+                // A piece that is have, or whose every chunk is already
+                // written and is being checked, gains nothing from this
+                // chunk -- `mark_chunk_downloaded` below would answer
+                // `PreviouslyCompleted` -- but the write would already
+                // have happened, and the piece-per-file store answers a
+                // write into a held piece by opening a fresh staged copy
+                // over it, which every read of that piece is then served:
+                // a few chunks of a four-megabyte piece, EOF past them and
+                // zeros between. Field log 2026-09-19, piece 4342, and
+                // pieces 834 and 3181 before it. The in-flight check above
+                // should make this unreachable; this is the invariant
+                // stated where the write happens, whatever route let the
+                // peer in, and the line names the route next time.
+                let chunks = g.get_chunks()?;
+                let have = chunks.is_piece_have(chunk_info.piece_index);
+                if have || chunks.is_piece_fully_downloaded(chunk_info.piece_index) {
+                    info!(
+                        piece = chunk_info.piece_index.get(),
+                        offset = chunk_info.offset,
+                        peer = %addr,
+                        have,
+                        "a chunk arrived for a piece that is already complete; not written"
+                    );
+                    return Ok(());
+                }
             }
 
             // While we hold per piece lock, noone can steal it.
@@ -4401,6 +4427,149 @@ mod connection_tests {
         assert!(
             late.is_none(),
             "a chunk was written into piece 0 after the storage was told it was complete: {ops:?}"
+        );
+        Ok(())
+    }
+
+    /// **A chunk for a piece that is already complete is not written.**
+    ///
+    /// Whatever route leaves a peer holding a share of a finished piece,
+    /// its chunk must not reach the storage: the piece-per-file store
+    /// answers a write into a held piece by opening a fresh staged copy
+    /// over the complete one and serving every later read from it -- EOF
+    /// past its few chunks, zeros between. Field log 2026-09-19: piece
+    /// 4342 read `reading 262144 bytes at 998011 of piece 4342` for
+    /// minutes after it had been served whole. Here peer 1 completes the
+    /// piece, the piece is handed back to peer 2 as if some route had done
+    /// it, and peer 2's chunk arrives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_chunk_for_a_complete_piece_is_not_written() -> anyhow::Result<()> {
+        setup_test_logging();
+        const CHUNKS_PER_PIECE: u32 = 32;
+        const PIECE_LEN: u32 = CHUNK_SIZE * CHUNKS_PER_PIECE;
+        const FILE_SIZE: usize = (PIECE_LEN * 2) as usize;
+
+        let files = create_default_random_dir_with_torrents(1, FILE_SIZE, Some("rqbit_late"));
+        let content = std::fs::read(files.path().join("0.data"))?;
+        let torrent = create_torrent(
+            files.path(),
+            CreateTorrentOptions {
+                piece_length: Some(PIECE_LEN),
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await?;
+
+        let recorder = Arc::new(Recorder::default());
+        let out = TempDir::with_prefix("rqbit_late_client")?;
+        let session = Session::new_with_opts(
+            out.path().into(),
+            crate::SessionOptions {
+                dht: None,
+                persistence: None,
+                peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.as_bytes()?.to_vec()),
+                Some(crate::AddTorrentOptions {
+                    overwrite: true,
+                    output_folder: Some(out.path().to_str().unwrap().to_owned()),
+                    storage_factory: Some(
+                        RecordingStorageFactory {
+                            recorder: recorder.clone(),
+                            inner: FilesystemStorageFactory::default(),
+                        }
+                        .boxed(),
+                    ),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        tokio::time::timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+        let live = handle.live().context("expected a live torrent")?;
+        let target = live.lengths.validate_piece_index(0).context("piece 0")?;
+
+        let mut addrs = Vec::new();
+        let mut peer_rxs = Vec::new();
+        for port in 1..=2u16 {
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+            live.peers
+                .add_if_not_seen(addr)
+                .context("a fresh address")?;
+            let (rx, _tx) = live
+                .peers
+                .mark_peer_connecting(addr, CancellationToken::new())?;
+            live.peers.with_peer_mut(addr, "test", |p| {
+                p.connecting_to_live(Id20::new([0u8; 20]), &live.peers, ConnectionKind::Tcp);
+            });
+            live.peers.with_live_mut(addr, "test", |l| {
+                l.bitfield = BF::from_boxed_slice(vec![0xff].into_boxed_slice());
+            });
+            addrs.push(addr);
+            peer_rxs.push(rx);
+        }
+        let chunks: Vec<ChunkInfo> = live.lengths.iter_chunk_infos(target).collect();
+        let bytes = |chunk: &ChunkInfo| -> Vec<u8> {
+            let start = chunk.offset as usize;
+            content[start..start + chunk.size as usize].to_vec()
+        };
+        let deliver = |addr: SocketAddr, chunk: ChunkInfo| {
+            let live = live.clone();
+            let data = bytes(&chunk);
+            async move {
+                let (tx, _rx) = unbounded_channel();
+                let handler = PeerHandler::for_test(live.clone(), addr, tx);
+                live.peers.with_live_mut(addr, "test", |l| {
+                    l.add_inflight_request(chunk);
+                });
+                handler
+                    .on_received_piece(Piece::from_data(target.get(), chunk.offset, &data))
+                    .await
+            }
+        };
+
+        // Peer 1 takes the piece and delivers all of it.
+        live.lock_write("test")
+            .get_pieces_mut()?
+            .reserve_whole_for_test(target, addrs[0], std::time::Instant::now());
+        for chunk in &chunks {
+            deliver(addrs[0], *chunk).await?;
+        }
+        recorder
+            .wait_for_completion_of(0, Duration::from_secs(10))
+            .await;
+        anyhow::ensure!(
+            live.lock_read("test").get_chunks()?.is_piece_have(target),
+            "peer 1 did not complete the piece: {:?}",
+            recorder.ops()
+        );
+
+        // Some route hands the finished piece to peer 2, and its chunk lands.
+        live.lock_write("test")
+            .get_pieces_mut()?
+            .reserve_whole_for_test(target, addrs[1], std::time::Instant::now());
+        deliver(addrs[1], chunks[0]).await?;
+        drop(peer_rxs);
+
+        let ops = recorder.ops();
+        let completed = ops
+            .iter()
+            .position(|op| *op == Op::Completed(0))
+            .context("the piece never completed")?;
+        let late = ops
+            .iter()
+            .enumerate()
+            .find(|(index, op)| *index > completed && **op == Op::Wrote(0));
+        assert!(
+            late.is_none(),
+            "a chunk was written into piece 0 after it was complete: {ops:?}"
         );
         Ok(())
     }
