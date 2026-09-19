@@ -45,7 +45,7 @@ pub mod stats;
 
 use std::{
     borrow::Cow,
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
     num::NonZeroU32,
     ops::{Deref, DerefMut, Range},
@@ -284,6 +284,16 @@ pub struct TorrentStateLive {
     finished_notify: Notify,
     new_pieces_notify: Notify,
 
+    /// Pieces whose hash failed with more than one peer having written into them, and
+    /// who those peers were: the piece is fetched again from somebody else.
+    ///
+    /// Nothing here can say which of them sent the bad bytes -- a split piece is filled
+    /// by several peers and the hash is over all of it -- so nobody is blamed or banned;
+    /// what the set is for is not asking the same peers for the same piece again. It is
+    /// advisory: if no other peer has the piece, the peers in it may take it after all,
+    /// or the piece would never be fetched at all. Cleared when the piece verifies.
+    hash_failure_exclusions: Mutex<HashMap<ValidPieceIndex, HashSet<SocketAddr>>>,
+
     down_speed_estimator: SpeedEstimator,
     up_speed_estimator: SpeedEstimator,
     cancellation_token: CancellationToken,
@@ -383,6 +393,7 @@ impl TorrentStateLive {
             peer_limit: AtomicUsize::new(peer_limit),
             peer_permits_to_forget: AtomicUsize::new(0),
             new_pieces_notify: Notify::new(),
+            hash_failure_exclusions: Mutex::new(HashMap::new()),
             peer_queue_tx,
             peer_requeue_tx,
             finished_notify: Notify::new(),
@@ -1223,6 +1234,46 @@ impl TorrentStateLive {
             self.reconnect_all_not_needed_peers();
             self.new_pieces_notify.notify_waiters();
         }
+    }
+
+    /// Leave `piece` to peers other than `writers` (see `hash_failure_exclusions`).
+    fn exclude_from_piece(&self, piece: ValidPieceIndex, writers: Vec<SocketAddr>) {
+        self.hash_failure_exclusions
+            .lock()
+            .entry(piece)
+            .or_default()
+            .extend(writers);
+    }
+
+    /// The pieces `peer` should leave to others right now: ones it wrote into before a
+    /// hash failure that somebody with no part in that failure has. A piece nobody else
+    /// has is not on the list -- it is better fetched again from the same peers than
+    /// never (see `hash_failure_exclusions`).
+    fn pieces_to_leave_to_others(&self, peer: SocketAddr) -> Vec<ValidPieceIndex> {
+        let excluded: Vec<(ValidPieceIndex, HashSet<SocketAddr>)> = {
+            let g = self.hash_failure_exclusions.lock();
+            if g.is_empty() {
+                return Vec::new();
+            }
+            g.iter()
+                .filter(|(_, writers)| writers.contains(&peer))
+                .map(|(piece, writers)| (*piece, writers.clone()))
+                .collect()
+        };
+        // The peer table, and never with the exclusions or the state lock held.
+        excluded
+            .into_iter()
+            .filter(|(piece, writers)| {
+                self.peers.states.iter().any(|e| match e.value().get_state() {
+                    PeerState::Live(l) => {
+                        !writers.contains(e.key())
+                            && l.bitfield.get(piece.get() as usize).map(|v| *v) == Some(true)
+                    }
+                    _ => false,
+                })
+            })
+            .map(|(piece, _)| piece)
+            .collect()
     }
 
     /// Wake every peer that found nothing to ask for and is waiting for a piece to be
@@ -2371,6 +2422,9 @@ impl PeerHandler {
         // Whether this ask put shares in a pool, which the idle loops are
         // told about once the locks are down.
         let mut pool_changed = false;
+        // Pieces this peer wrote into before a hash failure that somebody else can
+        // fetch instead. Read before the locks below: it walks the peer table.
+        let leave_to_others = self.state.pieces_to_leave_to_others(self.addr);
 
         let result = self
             .state
@@ -2397,7 +2451,10 @@ impl PeerHandler {
                     priority_pieces: self.state.streams.iter_next_pieces(&self.state.lengths),
                     file_priorities,
                     file_infos: &self.state.metadata.file_infos,
-                    peer_has_piece: |p| bf.get(p.get() as usize).map(|v| *v) == Some(true),
+                    peer_has_piece: |p| {
+                        bf.get(p.get() as usize).map(|v| *v) == Some(true)
+                            && !leave_to_others.contains(&p)
+                    },
                     can_steal: |p| {
                         self.state.per_piece_locks[p.get_usize()]
                             .try_write()
@@ -3250,8 +3307,11 @@ impl PeerHandler {
                     let piece_len = state.lengths.piece_length(chunk_info.piece_index) as u64;
                     {
                         let mut g = state.lock_write("mark_piece_downloaded");
-                        g.get_pieces_mut()?
-                            .mark_piece_hash_ok(chunk_info.piece_index, &state.metadata.file_infos);
+                        let pieces = g.get_pieces_mut()?;
+                        // The piece is ours: nobody wrote a bad byte into it after all,
+                        // and nobody is left out of the next one.
+                        pieces.take_writers(chunk_info.piece_index);
+                        pieces.mark_piece_hash_ok(chunk_info.piece_index, &state.metadata.file_infos);
                         // Under the same lock as the have-bit: drop_pieces() subtracts
                         // from this under that lock, and must not get there first.
                         state
@@ -3285,22 +3345,50 @@ impl PeerHandler {
 
                     trace!(piece = index, "successfully downloaded and verified");
 
+                    state
+                        .hash_failure_exclusions
+                        .lock()
+                        .remove(&chunk_info.piece_index);
+
                     state.on_piece_completed(chunk_info.piece_index)?;
 
                     state.transmit_haves(chunk_info.piece_index);
                 }
                 false => {
+                    // Who filled the piece. The one that delivered the last chunk is not
+                    // the one that spoiled it unless it was the only one writing: a piece
+                    // a stream waits on is filled by every peer that has a share of it,
+                    // and the hash is over all of it.
+                    let writers = {
+                        let mut g = state.lock_write("mark_piece_broken");
+                        let pieces = g.get_pieces_mut()?;
+                        let writers = pieces.take_writers(chunk_info.piece_index);
+                        pieces.mark_piece_hash_failed(chunk_info.piece_index);
+                        writers
+                    };
+                    state.new_pieces_notify.notify_waiters();
+                    if writers.len() > 1 {
+                        // If we cannot say who did it we cannot accuse anyone: nobody is
+                        // disconnected and nobody is written off. What we can do is fetch
+                        // the piece again from other peers, which is what the exclusion
+                        // is (see `hash_failure_exclusions`).
+                        warn!(
+                            id = state.shared.id,
+                            info_hash = ?state.shared.info_hash,
+                            ?addr,
+                            writers = writers.len(),
+                            "checksum for piece={} did not validate, and several peers wrote it: \
+                             nobody is blamed, the piece is fetched again from others", index
+                        );
+                        state.exclude_from_piece(chunk_info.piece_index, writers);
+                        return Ok(());
+                    }
                     warn!(
                         id = state.shared.id,
                         info_hash = ?state.shared.info_hash,
                         ?addr,
                         "checksum for piece={} did not validate. disconnecting peer.", index
                     );
-                    state
-                        .lock_write("mark_piece_broken")
-                        .get_pieces_mut()?
-                        .mark_piece_hash_failed(chunk_info.piece_index);
-                    state.new_pieces_notify.notify_waiters();
                     anyhow::bail!("i am probably a bogus peer. dying.")
                 }
             };
@@ -4411,6 +4499,156 @@ mod connection_tests {
             "the freed slot asked for chunk at {} of piece {taken}, which was stolen",
             next.begin
         );
+        Ok(())
+    }
+
+    /// **A piece several peers filled that fails its hash blames nobody,
+    /// and is fetched again from other peers** (review #5). The hash is
+    /// over the whole piece, so with more than one writer nothing can say
+    /// whose bytes were bad: the peer that happened to deliver the last
+    /// chunk used to be disconnected for it. Nobody is accused now; the
+    /// piece is wiped, queued, and left to peers that had no part in it --
+    /// unless nobody else has it, when it is better fetched from them
+    /// again than never.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_piece_several_peers_filled_blames_nobody_and_goes_to_others() -> anyhow::Result<()> {
+        setup_test_logging();
+        const CHUNKS_PER_PIECE: u32 = 32;
+        const PIECE_LEN: u32 = CHUNK_SIZE * CHUNKS_PER_PIECE;
+
+        let files =
+            create_default_random_dir_with_torrents(1, PIECE_LEN as usize * 2, Some("blameless"));
+        let content = std::fs::read(files.path().join("0.data"))?;
+        let torrent = create_torrent(
+            files.path(),
+            CreateTorrentOptions {
+                piece_length: Some(PIECE_LEN),
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await?;
+        let dir = TempDir::with_prefix("blameless_client")?;
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            crate::SessionOptions {
+                dht: None,
+                persistence: None,
+                peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.as_bytes()?.to_vec()),
+                Some(crate::AddTorrentOptions {
+                    overwrite: true,
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        tokio::time::timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+        let live = handle.live().context("expected a live torrent")?;
+        let target = live.lengths.validate_piece_index(0).context("piece 0")?;
+        let other_piece = live.lengths.validate_piece_index(1).context("piece 1")?;
+        // A stream at the start, so the piece is split between the peers.
+        let _stream = handle.clone().stream(0).await?;
+
+        let mut handlers = Vec::new();
+        let mut peer_rxs = Vec::new();
+        for port in [1u16, 2, 3] {
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+            live.peers
+                .add_if_not_seen(addr)
+                .context("a fresh address")?;
+            let (rx, tx) = live
+                .peers
+                .mark_peer_connecting(addr, CancellationToken::new())?;
+            live.peers.with_peer_mut(addr, "test", |p| {
+                p.connecting_to_live(Id20::new([0u8; 20]), &live.peers, ConnectionKind::Tcp);
+            });
+            live.peers.with_live_mut(addr, "test", |l| {
+                l.bitfield = BF::from_boxed_slice(vec![0xffu8].into_boxed_slice());
+            });
+            handlers.push(PeerHandler::for_test(live.clone(), addr, tx));
+            peer_rxs.push(rx);
+        }
+        let (good, bad, bystander) = (&handlers[0], &handlers[1], &handlers[2]);
+        let share = |handler: &PeerHandler| -> anyhow::Result<Range<u32>> {
+            match handler
+                .acquire_next_piece(Ask::Anything)?
+                .context("a share for the peer")?
+            {
+                Next::Share(piece, chunks) => {
+                    anyhow::ensure!(piece == target, "got piece {piece}");
+                    Ok(chunks)
+                }
+                Next::Wait { .. } => anyhow::bail!("a fresh head piece has shares for anyone"),
+            }
+        };
+        let first = share(good)?;
+        let second = share(bad)?;
+
+        // Both fill their share; one of them with rubbish, and which one is
+        // exactly what the hash cannot say.
+        let rubbish = vec![0xa5u8; CHUNK_SIZE as usize];
+        for (handler, claim, good_bytes) in
+            [(good, first, true), (bad, second.clone(), false)]
+        {
+            for chunk in live.lengths.iter_chunk_infos_in(target, claim) {
+                live.peers.with_live_mut(handler.addr, "test", |l| {
+                    l.add_inflight_request(chunk);
+                });
+                let start = chunk.offset as usize;
+                let data = if good_bytes {
+                    &content[start..start + chunk.size as usize]
+                } else {
+                    &rubbish[..chunk.size as usize]
+                };
+                handler
+                    .on_received_piece(Piece::from_data(target.get(), chunk.offset, data))
+                    .await
+                    .context("the peer that finished a piece that failed its hash was blamed")?;
+            }
+        }
+        anyhow::ensure!(
+            !live.lock_read("test").get_chunks()?.is_piece_have(target),
+            "the piece passed its hash; the test wrote the wrong bytes"
+        );
+
+        // The peers that filled it are left out of the refetch while somebody
+        // else has it.
+        let asked = good.acquire_next_piece(Ask::Anything)?;
+        match asked {
+            Some(Next::Share(piece, _)) => anyhow::ensure!(
+                piece == other_piece,
+                "a peer that wrote into the failed piece was given it again"
+            ),
+            other => anyhow::bail!("expected the other piece, got {other:?}"),
+        }
+        match bystander.acquire_next_piece(Ask::Anything)? {
+            Some(Next::Share(piece, _)) => {
+                anyhow::ensure!(piece == target, "the bystander got piece {piece}")
+            }
+            other => anyhow::bail!("expected the failed piece to go to the bystander: {other:?}"),
+        }
+
+        // And nobody else has it: better fetched again from them than never.
+        live.peers.with_live_mut(bystander.addr, "test", |l| {
+            l.bitfield = BF::from_boxed_slice(vec![0x00u8].into_boxed_slice());
+        });
+        match bad.acquire_next_piece(Ask::Anything)? {
+            Some(Next::Share(piece, _)) => anyhow::ensure!(
+                piece == target,
+                "with nobody else to fetch it, the piece was still refused: got {piece}"
+            ),
+            other => anyhow::bail!("expected the failed piece after all, got {other:?}"),
+        }
+        drop(peer_rxs);
         Ok(())
     }
 

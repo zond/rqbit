@@ -159,7 +159,8 @@ This changes three of the invariants below:
 
 A piece no stream waits on is still claimed whole by one peer: it has no
 deadline to spend the extra lock round-trips on, and single ownership is
-what lets a failed hash be blamed on the peer that sent it.
+what lets a failed hash be blamed on the peer that sent it. A split piece
+that fails its hash blames nobody -- see "Failed hash" below.
 
 3. Data arrival (`on_incoming_piece`):
    - Remove chunk from `inflight_requests`
@@ -243,6 +244,22 @@ IN_FLIGHT → QUEUED
 1. All chunks received, hash verification fails
 2. `PieceTracker::take_inflight(piece)` → removes from `inflight`
 3. `PieceTracker::mark_piece_hash_failed(piece)` → calls `mark_piece_broken_if_not_have(piece)` → sets `queue_pieces[p] = true`
+
+**Failed hash: who is to blame.** The hash is over the whole piece, and
+`PieceTracker::take_writers(piece)` says who wrote into it -- every peer
+the write path stamped through `note_delivery`, across re-queues, since
+the piece was last empty.
+
+- **One writer**: it sent the bytes, and it is disconnected as it always
+  was.
+- **More than one**: nothing can say whose bytes were bad, so nobody is
+  disconnected and nobody is written off. The writers go into
+  `TorrentStateLive::hash_failure_exclusions`, and while any other peer
+  has the piece, they are not offered it again
+  (`pieces_to_leave_to_others`, read before `acquire_piece`). If no other
+  peer has it, they may take it after all -- a piece nobody fetches is
+  worse than one fetched twice. The set is cleared when the piece
+  verifies.
 
 ### Pause Flow
 

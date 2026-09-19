@@ -740,6 +740,13 @@ pub struct PieceTracker {
     /// Finished claims the asking connection was retired from since the
     /// last [`Self::take_retired_claims`]; see [`InflightPiece::claim`].
     retired: Vec<(ValidPieceIndex, Range<u32>)>,
+    /// Who has written into each piece that is not on disk yet, stamped by
+    /// the write path ([`Self::note_delivery`]). Outlives the in-flight
+    /// entry, because the chunks do: a piece re-queued keeping its chunks
+    /// carries what earlier peers put in it. Read when the piece's hash
+    /// fails, which is the only thing that asks who filled it; see
+    /// [`Self::take_writers`].
+    writers: HashMap<ValidPieceIndex, Vec<PeerHandle>>,
 }
 
 impl PieceTracker {
@@ -767,6 +774,7 @@ impl PieceTracker {
             completions: VecDeque::new(),
             pool_changed: false,
             retired: Vec::new(),
+            writers: HashMap::new(),
         }
     }
 
@@ -807,6 +815,14 @@ impl PieceTracker {
     /// [`InflightPiece::claim`].
     pub fn take_retired_claims(&mut self) -> Vec<(ValidPieceIndex, Range<u32>)> {
         std::mem::take(&mut self.retired)
+    }
+
+    /// Every peer that wrote into `piece` since it was last empty, and
+    /// forgets them. One of them sent the bytes a failed hash is about --
+    /// and if there is more than one, nothing here can say which, which is
+    /// what decides whether anybody is blamed for it.
+    pub fn take_writers(&mut self, piece: ValidPieceIndex) -> Vec<PeerHandle> {
+        self.writers.remove(&piece).unwrap_or_default()
     }
 
     /// How many pieces at the head of the lookahead are split between the
@@ -1309,6 +1325,11 @@ impl PieceTracker {
     /// peer holds on the piece is stamped, since it requests them in order
     /// and a landing on any says it is not stalled here.
     pub fn note_delivery(&mut self, piece: ValidPieceIndex, peer: PeerHandle, now: Instant) {
+        // Who wrote into the piece, for the hash check to read if it fails.
+        let writers = self.writers.entry(piece).or_default();
+        if !writers.contains(&peer) {
+            writers.push(peer);
+        }
         if let Some(inflight) = self.inflight.get_mut(&piece) {
             for participant in inflight.participants.iter_mut().filter(|p| p.peer == peer) {
                 participant.last_delivery = Some(now);

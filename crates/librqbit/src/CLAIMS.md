@@ -126,6 +126,15 @@ pieces this peer could actually take.
    was in none of the three sets and would otherwise never be fetched
    again.
 
+8. **A failed hash on a piece several peers filled accuses nobody.** The
+   hash is over the whole piece, so with more than one writer nothing
+   says whose bytes were bad -- and the peer that happened to deliver the
+   last chunk is the one that used to be disconnected for it. The piece
+   is wiped and queued as always, and fetched again from peers that had
+   no part in it (`hash_failure_exclusions`); if no other peer has it,
+   the same ones may take it again rather than leave it unfetched. A
+   piece with one writer is still that peer's doing, and it goes.
+
 ## How deep the splitting goes is the embedder's
 
 Every rule above applies inside a depth: the first `deadline_pieces` of
