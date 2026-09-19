@@ -10,7 +10,8 @@ the first one's mistake again.
 ## Three states of a piece
 
 - **Whole.** One holder, one claim covering the piece. Every piece reserved
-  outside the head of the lookahead -- at depth >= `DEADLINE_PIECES` (2),
+  outside the head of the lookahead -- at depth >= the split depth (`DEFAULT_DEADLINE_PIECES`, 2, until the
+  embedder sets one),
   or from the ordinary queue -- is whole. This is vanilla rqbit: stealable
   at 10x, and `peer_avg_time` is honest because one peer fetched all of it.
 - **Split.** Cut into `CLAIM_CHUNKS` (16) claims, each held by one peer,
