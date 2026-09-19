@@ -712,9 +712,9 @@ impl ChunkTracker {
     /// Which chunks of `claim` within `piece` are still to be fetched, as
     /// `true` for "ask for this one", in claim order.
     ///
-    /// **What stops a duplicate holder re-fetching a whole claim.** Two
-    /// peers may hold one claim ([`super::piece_tracker`]'s
-    /// `MAX_HOLDERS_PER_CLAIM`), which is what rescues a piece from a
+    /// **What stops a duplicate holder re-fetching a whole claim.** A
+    /// claim may have several holders ([`super::piece_tracker`]'s
+    /// `stalled_claim`), which is what rescues a piece from a
     /// stalled peer; without this the loser re-requests every chunk of it,
     /// because the request loop walks the claim and not the gaps in it, and
     /// its bytes arrive, are counted, and are dropped at the write. In the

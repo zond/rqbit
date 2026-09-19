@@ -116,13 +116,13 @@ This changes three of the invariants below:
 - **A release is partial.** One connection leaving returns its claim to the
   unclaimed pool; the piece is re-queued when the last participant goes --
   keeping the chunks other peers delivered, unless it is a piece the
-  reclaim dropped, which is wiped because nothing will pick it up. A claim another participant is still
-  fetching does **not** go back: anything in the unclaimed pool is handed
-  out on the next `claim()`, which pops the pool without consulting
-  `MAX_HOLDERS_PER_CLAIM` -- only `stalled_claim` does -- so a claim put
-  back under its holder's feet goes straight out again, over the cap, or
-  back to the holder itself, which then finds every chunk of it already in
-  flight with itself. Nor does a claim whose chunks have **all arrived**:
+  reclaim dropped, which is wiped because nothing will pick it up. A claim
+  another participant is still fetching does **not** go back: anything in
+  the unclaimed pool is handed out on the next `claim()`, which pops the
+  pool without asking whether anyone holds it -- only `stalled_claim`
+  weighs that -- so a claim put back under its holder's feet goes straight
+  out again, to anyone at all, or back to the holder itself, which then
+  finds every chunk of it already in flight with itself. Nor does a claim whose chunks have **all arrived**:
   there is nothing left in it to fetch and the piece completes on those
   marks whoever set them.
 - **A finished claim is over.** `chunk_status` is the only record of which
@@ -137,17 +137,21 @@ This changes three of the invariants below:
   named a claim that had landed minutes ago, and every free peer was sent
   to fetch it again -- which is also what put several peers on one piece's
   writes at the tail of every split piece.
-- **The second copy goes to a stalled claim, from a peer that outpaces its
-  holder.** `stalled_claim()` considers only claims that have delivered
-  nothing of their own (`missing_at_start`), only where the asker's last
-  chunk took less time than we have waited on the holder
-  (`Activity::outpaces`; the wait runs from the holder's last delivery on
-  the piece, stamped by the write path via `note_delivery`), never the
-  asker's own, and at most two holders; among those it ranks by chunks
-  still missing with `started` as the tie-break, because what gates the
-  piece is the work remaining on its slowest claim. The same comparison
-  lets a peer cut a whole piece at the head of a stream's lookahead
-  (`split_whole`). The whole of it is written up in `CLAIMS.md`.
+- **The second copy goes to a claim whose newest holder the asker
+  outpaces.** `stalled_claim()` considers any claim still missing
+  something, whatever it has delivered, where the asker's last chunk took
+  less time than that claim has been with whoever got it last
+  (`Activity::outpaces`, measured from that hand-out -- `Participant::
+  started`), and never one the asker already holds. There is no cap on
+  holders: among the claims that qualify it ranks by chunks still missing
+  with `started` as the tie-break, because what gates the piece is the
+  work remaining on its slowest claim. The same comparison lets another
+  peer cut a whole piece at the head of a stream's lookahead
+  (`split_whole` -- never its own holder). `Participant::last_delivery`
+  is stamped by the write path (`note_delivery`) but no rule reads it: it
+  is there for the diagnostic line (`ClaimSnapshot::waited`, which is
+  therefore a wait since the last delivery, not since the hand-out). The
+  whole of it is written up in `CLAIMS.md`.
 - **A piece with several writers needs a real lock.** `per_piece_locks[p]`
   is taken **exclusively** by a chunk write, and before the state lock. A
   read lock was exclusion enough while one peer owned a piece; with several,
@@ -330,10 +334,17 @@ Care must be taken when modifying state transition logic to maintain this orderi
 
 ### Acquire Strategy
 
-`PieceTracker::acquire_piece()` uses a three-phase strategy:
+`PieceTracker::acquire_piece()` walks, in this order:
 
-1. **Try steal (10x threshold)** - Very slow peers get pieces stolen first
-2. **Try reserve** - Check priority pieces, then queue_pieces
-3. **Try steal (3x threshold)** - Moderately slow peers as fallback
+1. **The stream's lookahead, in playback order** (`walk_lookahead`) - a
+   free piece is reserved (split while within `deadline_pieces` of the
+   head, whole beyond it), and one already in flight is cut, joined or
+   shared out by the rules in `CLAIMS.md`.
+2. **Steal (10x threshold)** - the first lookahead piece this peer could
+   not take, from a holder ten times slower.
+3. **The ordinary queue** (`iter_queued_pieces`), claimed whole.
+4. **Steal (3x threshold)** - any piece from a holder three times slower,
+   ranked by how long its holder has had it.
 
-This balances fairness with efficiency - we prefer reserving new pieces but will steal from slow peers to avoid bottlenecks.
+Reserving beats stealing, except for a piece a reader is actually waiting
+on: there, nothing else this peer could fetch would help.

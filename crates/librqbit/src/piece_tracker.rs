@@ -156,8 +156,10 @@ pub struct Participant {
     started: Instant,
     /// When this holder last delivered a chunk of this piece, stamped by
     /// the write path ([`PieceTracker::note_delivery`]); `None` until it
-    /// has. The holder's half of the one comparison
-    /// ([`Activity::outpaces`]): how long we have been waiting on it.
+    /// has. **Diagnostics only**: no rule reads it -- every takeover is
+    /// measured against the piece's age or the claim's hand-out
+    /// ([`Activity::outpaces`]) -- and what it feeds is
+    /// [`ClaimSnapshot::waited`] in the blocked-read line.
     last_delivery: Option<Instant>,
 }
 
@@ -172,9 +174,12 @@ impl Participant {
 
 /// One holder of one claim, as a diagnostic line reads it: who, which
 /// chunks, how many are still missing, how long we have waited on its last
-/// delivery (or since it was asked), and the latency of its own last chunk
-/// -- the two halves of [`Activity::outpaces`], so a log of a read that
-/// blocked says why nobody took the claim over.
+/// delivery (or since it was asked, if it has delivered nothing), and the
+/// latency of its own last chunk, so a log of a read that blocked says why
+/// nobody took the claim over. Note that `waited` is not what the rules
+/// compare: a takeover is measured against the piece's age (a cut, a share
+/// beyond two) or the claim's newest hand-out (a join), never against a
+/// holder'"'"'s last delivery.
 #[derive(Debug, Clone)]
 pub struct ClaimSnapshot {
     pub peer: PeerHandle,
