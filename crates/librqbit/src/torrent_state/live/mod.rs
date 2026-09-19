@@ -2895,6 +2895,11 @@ impl PeerHandler {
         // faster peer to steal them, so a torrent with one peer stalled short of the end.
         // The same handback as a dying peer's, and in the same order: the table first,
         // then the pieces, never both locks at once.
+        //
+        // Whether or not any request was out: a share handed to the request loop is ours
+        // from the moment it is handed, and a choke between that and the first request
+        // going out left it reserved to a peer that is not sending, with nothing in
+        // flight to say so.
         let dropped = self
             .state
             .peers
@@ -2902,17 +2907,15 @@ impl PeerHandler {
                 live.forget_inflight_requests_on_choke()
             })
             .unwrap_or(0);
-        if dropped > 0 {
-            let released = self
-                .state
-                .lock_write("release_choked_peer_pieces")
-                .get_pieces_mut()
-                .map(|pieces| pieces.release_pieces_owned_by(self.addr, self.connection))
-                .unwrap_or(0);
-            trace!(dropped, released, "choked, handed our requests back");
-            if released > 0 {
-                self.state.new_pieces_notify.notify_waiters();
-            }
+        let released = self
+            .state
+            .lock_write("release_choked_peer_pieces")
+            .get_pieces_mut()
+            .map(|pieces| pieces.release_pieces_owned_by(self.addr, self.connection))
+            .unwrap_or(0);
+        trace!(dropped, released, "choked, handed our requests back");
+        if released > 0 {
+            self.state.new_pieces_notify.notify_waiters();
         }
         self.notify_request_slots_changed();
     }
@@ -3618,6 +3621,83 @@ mod connection_tests {
         handler
             .on_download_request(request)
             .context("with the switch off the request should have been dropped")?;
+        Ok(())
+    }
+
+    /// **A choke hands back a share nothing was requested for yet.** review
+    /// #31: the handback ran only when the choke discarded requests, so a
+    /// choke landing between a share being handed to the request loop and
+    /// its first request going out left the piece reserved to a peer that
+    /// was not sending.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_choke_hands_back_a_share_with_nothing_in_flight() -> anyhow::Result<()> {
+        setup_test_logging();
+        let files =
+            create_default_random_dir_with_torrents(1, CHUNK_SIZE as usize * 4, Some("choke_idle"));
+        let torrent = create_torrent(
+            files.path(),
+            CreateTorrentOptions {
+                piece_length: Some(CHUNK_SIZE),
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await?;
+        let dir = TempDir::with_prefix("choke_idle_client")?;
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            crate::SessionOptions {
+                dht: None,
+                persistence: None,
+                peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.as_bytes()?.to_vec()),
+                Some(crate::AddTorrentOptions {
+                    overwrite: true,
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        tokio::time::timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+        let live = handle.live().context("expected a live torrent")?;
+
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1));
+        live.peers
+            .add_if_not_seen(addr)
+            .context("a fresh address")?;
+        let (_rx, tx) = live
+            .peers
+            .mark_peer_connecting(addr, CancellationToken::new())?;
+        live.peers.with_peer_mut(addr, "test", |p| {
+            p.connecting_to_live(Id20::new([0u8; 20]), &live.peers, ConnectionKind::Tcp);
+        });
+        live.peers.with_live_mut(addr, "test", |l| {
+            l.bitfield = BF::from_boxed_slice(vec![0xff].into_boxed_slice());
+        });
+        let handler = PeerHandler::for_test(live.clone(), addr, tx);
+        let piece = match handler
+            .acquire_next_piece(Ask::Anything)?
+            .context("a piece for the peer")?
+        {
+            Next::Share(piece, _) => piece,
+            Next::Wait { .. } => anyhow::bail!("a fresh piece is nobody's to be over a share of"),
+        };
+        anyhow::ensure!(live.inflight_piece_owners() == vec![(piece.get(), addr)]);
+
+        handler.on_i_am_choked();
+        anyhow::ensure!(
+            live.inflight_piece_owners().is_empty(),
+            "the choked peer still holds {:?}",
+            live.inflight_piece_owners()
+        );
         Ok(())
     }
 
