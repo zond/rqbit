@@ -119,3 +119,59 @@ async fn e2e_stream() -> anyhow::Result<()> {
 async fn test_e2e_stream() -> anyhow::Result<()> {
     timeout(Duration::from_secs(10), e2e_stream()).await?
 }
+
+/// review #39. A stream open across an error and the restart after it is
+/// still one the torrent knows about: the restart used to build its states
+/// with a fresh set of streams, and the open stream stayed registered in
+/// the old one, where no completed piece woke it and `drop_pieces` could not
+/// see where it was reading.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_open_across_an_error_and_restart_is_still_seen() -> anyhow::Result<()> {
+    setup_test_logging();
+    let files = create_default_random_dir_with_torrents(1, 8192, Some("stream_across_error"));
+    let torrent = create_torrent(
+        files.path(),
+        CreateTorrentOptions {
+            piece_length: Some(1024),
+            ..Default::default()
+        },
+        &BlockingSpawner::new(1),
+    )
+    .await?;
+    // Somewhere else, so the stream has something to wait for.
+    let dir = TempDir::with_prefix("stream_across_error_client")?;
+    let session = Session::new_with_opts(
+        dir.path().into(),
+        crate::SessionOptions {
+            dht: None,
+            persistence: None,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent.as_bytes()?.to_vec()),
+            Some(crate::AddTorrentOptions {
+                overwrite: true,
+                output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+    let _stream = handle.clone().stream(0).await?;
+
+    handle.stop_with_error(anyhow::anyhow!("simulated fatal error"));
+    session.unpause(&handle).await?;
+    timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+    let live = handle.live().context("expected the restarted torrent live")?;
+    let metadata = handle.metadata.load_full().context("expected metadata")?;
+    anyhow::ensure!(
+        !live.streams.wanted_ranges(metadata.lengths()).is_empty(),
+        "the restarted torrent does not see the stream that is still open"
+    );
+    Ok(())
+}

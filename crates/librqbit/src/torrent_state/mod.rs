@@ -221,6 +221,13 @@ pub struct ManagedTorrentShared {
     pub(crate) connector: Arc<StreamConnector>,
     pub(crate) storage_factory: BoxStorageFactory,
     pub(crate) session: Weak<Session>,
+    /// The open streams of this torrent. Here, and not only on the paused and live
+    /// states, because a `FileStream` keeps the one it registered in for as long as it
+    /// is open, across every change of state -- including an error and the restart
+    /// after it, which build their states from scratch. A fresh set there left an open
+    /// stream in a set nobody looked at: its reader was never woken by a completed
+    /// piece, and `drop_pieces` could not see where it was reading.
+    pub(crate) streams: Arc<streaming::TorrentStreams>,
 
     // "dn" from magnet link
     pub(crate) magnet_name: Option<String>,

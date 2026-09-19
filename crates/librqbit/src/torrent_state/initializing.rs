@@ -405,7 +405,7 @@ impl TorrentStateInitializing {
             metadata: self.metadata.clone(),
             files: self.files.take()?,
             chunk_tracker,
-            streams: Arc::new(Default::default()),
+            streams: self.shared.streams.clone(),
         };
         Ok(paused)
     }

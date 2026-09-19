@@ -1459,6 +1459,7 @@ impl Session {
                 unadvertised_pieces: Default::default(),
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),
+                streams: Default::default(),
                 magnet_name: name,
                 client_name_and_version: self.client_name_and_version.clone(),
             });
