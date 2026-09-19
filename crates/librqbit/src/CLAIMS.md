@@ -211,7 +211,10 @@ took 6.5 s from the slow holder. With `retry_at` it asks again at 490 ms.
 
 A backstop of thirty seconds remains, and its firing is logged at `info`
 (`an idle request loop woke on the backstop`): nothing legitimate reaches
-it, so a line in a field log means a wake-up is missing somewhere.
+it, so a line in a field log means a wake-up is missing somewhere. With
+one exception, logged at `debug` instead: a peer told to come back later
+than the backstop itself -- a claim behind a request window at 50 kB/s is
+forty seconds off -- wakes early, asks once and goes back to sleep.
 
 ## What this replaced, so nobody rebuilds it
 

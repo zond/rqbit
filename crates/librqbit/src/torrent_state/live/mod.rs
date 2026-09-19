@@ -2736,8 +2736,12 @@ impl PeerHandler {
                     // did not have; and time, when the claim or the whole
                     // head piece it was turned away from has been in flight
                     // for its own round trip. Nothing else is worth waking
-                    // for, so the backstop is long and its firing is a bug
-                    // report.
+                    // for, so the backstop is long, and its firing is a bug
+                    // report -- except when the instant it was told is
+                    // further off than the backstop itself, which a slow
+                    // claim legitimately is (a request window at 50 kB/s is
+                    // forty seconds). Then waking early costs one ask and
+                    // says nothing, so it is logged as the non-event it is.
                     // No slot notify is a peer the live table does not
                     // hold right now (the e2e tests reach here between
                     // states): the other two wake-ups still apply.
@@ -2760,6 +2764,9 @@ impl PeerHandler {
                     // still alive when the test expected none.
                     let gone = self.tx.closed();
                     let mut peer_gone = false;
+                    let retry_is_further_off = retry_at.is_some_and(|at| {
+                        at.saturating_duration_since(std::time::Instant::now()) > IDLE_BACKSTOP
+                    });
                     aframe!(async {
                         tokio::select! {
                             _ = gone => peer_gone = true,
@@ -2767,10 +2774,16 @@ impl PeerHandler {
                             _ = new_piece_notify => debug!("the lookahead changed, asking again"),
                             _ = have_notify => debug!("the peer has a piece it did not, asking again"),
                             _ = retry => debug!("a claim we saw is ours to join now, asking again"),
-                            _ = tokio::time::sleep(IDLE_BACKSTOP) => info!(
-                                had_retry = retry_at.is_some(),
-                                "an idle request loop woke on the backstop: a wake-up is missing somewhere"
-                            ),
+                            _ = tokio::time::sleep(IDLE_BACKSTOP) => if retry_is_further_off {
+                                debug!(
+                                    "an idle request loop woke on the backstop: the claim it waits for is further off than that"
+                                )
+                            } else {
+                                info!(
+                                    had_retry = retry_at.is_some(),
+                                    "an idle request loop woke on the backstop: a wake-up is missing somewhere"
+                                )
+                            },
                         }
                     })
                     .await;
