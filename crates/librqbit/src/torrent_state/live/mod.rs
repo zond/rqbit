@@ -3585,7 +3585,9 @@ mod connection_tests {
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
     use tokio_util::sync::CancellationToken;
 
-    use super::{Ask, BF, Next, PeerHandler, TorrentStateLocked, WriterRequest};
+    use super::{
+        Ask, BF, Next, PeerHandler, PeerTx, TorrentStateLive, TorrentStateLocked, WriterRequest,
+    };
     use crate::{
         AddTorrent, CreateTorrentOptions, ManagedTorrentShared, Session, TorrentMetadata,
         create_torrent,
@@ -4650,6 +4652,234 @@ mod connection_tests {
         }
         drop(peer_rxs);
         Ok(())
+    }
+
+    /// **A refused peer wakes when the claim it was turned away from is
+    /// old enough to join** (review #34, the `retry_at` wiring). Every
+    /// share of the piece is held, and the peer that asks is told the
+    /// instant its own round trip has passed on the newest hold. Nothing
+    /// else will wake it -- it has nothing in flight, the lookahead does
+    /// not change, and the peer announces nothing -- so if the sleep is
+    /// not wired up it sits on the thirty-second backstop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_peer_wakes_when_the_claim_is_old_enough_to_join() -> anyhow::Result<()> {
+        setup_test_logging();
+        const CHUNKS_PER_PIECE: u32 = 32;
+        const PIECE_LEN: u32 = CHUNK_SIZE * CHUNKS_PER_PIECE;
+        let (live, handle, _session, _dir, _files) =
+            one_piece_torrent::<PIECE_LEN>("retry_at").await?;
+        let head = live.lengths.validate_piece_index(0).context("piece 0")?;
+        let _stream = handle.clone().stream(0).await?;
+
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1));
+        let (tx, mut requests) = unbounded_channel();
+        let handler = live_test_peer(&live, addr, tx)?;
+        // A round trip of its own: without one it outpaces nothing, whatever it
+        // waits, and there would be no instant to be told.
+        let chunk = live
+            .lengths
+            .chunk_info_from_received_data(head, 0, CHUNK_SIZE)
+            .context("a chunk")?;
+        live.peers.with_live_mut(addr, "test", |l| {
+            l.add_inflight_request(chunk);
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        live.peers.with_live_mut(addr, "test", |l| {
+            l.remove_inflight_request(&chunk);
+        });
+
+        // Another peer takes every share of the only piece, just now.
+        {
+            let mut g = live.lock_write("test");
+            let TorrentStateLocked {
+                pieces,
+                file_priorities,
+                ..
+            } = &mut **g;
+            let pieces = pieces.as_mut().context("no chunk tracker")?;
+            for _ in 0..2 {
+                match pieces.acquire_piece(crate::piece_tracker::AcquireRequest {
+                    peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 2)),
+                    connection: 0,
+                    now: std::time::Instant::now(),
+                    peer_avg_time: None,
+                    last_latency: None,
+                    priority_pieces: std::iter::once(head),
+                    file_priorities: &file_priorities,
+                    file_infos: &live.metadata.file_infos,
+                    peer_has_piece: |_| true,
+                    can_steal: |_| true,
+                }) {
+                    crate::piece_tracker::AcquireResult::Reserved { .. } => {}
+                    other => anyhow::bail!("expected a share for the holder, got {other:?}"),
+                }
+            }
+        }
+
+        let requester = tokio::spawn(async move { handler.task_peer_chunk_requester().await });
+        let sent = next_request_within(&mut requests, Duration::from_secs(10)).await;
+        requester.abort();
+        sent.context("the refused peer never woke to ask again")?;
+        Ok(())
+    }
+
+    /// **A refused peer wakes when shares appear in a pool** (review #34,
+    /// the `pool_changed` wiring). A piece held whole is cut by a peer that
+    /// outpaces it, and what that leaves in the pool is work for peers that
+    /// were turned away from it -- including ones with no round trip of
+    /// their own, which are told no instant to come back at. Nothing else
+    /// says the pool has filled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_peer_wakes_when_a_cut_fills_the_pool() -> anyhow::Result<()> {
+        setup_test_logging();
+        const CHUNKS_PER_PIECE: u32 = 64;
+        const PIECE_LEN: u32 = CHUNK_SIZE * CHUNKS_PER_PIECE;
+        let (live, handle, _session, _dir, _files) =
+            one_piece_torrent::<PIECE_LEN>("pool_changed").await?;
+        let head = live.lengths.validate_piece_index(0).context("piece 0")?;
+        let _stream = handle.clone().stream(0).await?;
+
+        // Held whole, and held a while: old enough for a peer with a round trip
+        // to cut it, which is what fills the pool.
+        {
+            let mut g = live.lock_write("test");
+            let pieces = g.get_pieces_mut()?;
+            pieces.reserve_whole_for_test(
+                head,
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+                std::time::Instant::now() - Duration::from_secs(2),
+            );
+        }
+
+        // The peer that waits: fresh, so it can neither cut nor join, and is
+        // told no instant to come back at.
+        let waiting_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1));
+        let (tx, mut requests) = unbounded_channel();
+        let waiting = live_test_peer(&live, waiting_addr, tx)?;
+        let requester = tokio::spawn(async move { waiting.task_peer_chunk_requester().await });
+        anyhow::ensure!(
+            next_request_within(&mut requests, Duration::from_millis(300))
+                .await
+                .is_none(),
+            "the piece was whole and held: there was nothing for this peer to ask for"
+        );
+
+        // The peer that cuts: one round trip, shorter than the piece is old.
+        let cutter_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 2));
+        let (cutter_tx, _cutter_rx) = unbounded_channel();
+        let cutter = live_test_peer(&live, cutter_addr, cutter_tx)?;
+        let chunk = live
+            .lengths
+            .chunk_info_from_received_data(head, 0, CHUNK_SIZE)
+            .context("a chunk")?;
+        live.peers.with_live_mut(cutter_addr, "test", |l| {
+            l.add_inflight_request(chunk);
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        live.peers.with_live_mut(cutter_addr, "test", |l| {
+            l.remove_inflight_request(&chunk);
+        });
+        match cutter.acquire_next_piece(Ask::Anything)? {
+            Some(Next::Share(piece, _)) => anyhow::ensure!(piece == head, "cut piece {piece}"),
+            other => anyhow::bail!("expected the cutter to take a share, got {other:?}"),
+        }
+
+        let sent = next_request_within(&mut requests, Duration::from_secs(10)).await;
+        requester.abort();
+        let sent = sent.context("the waiting peer was not told the pool had filled")?;
+        anyhow::ensure!(
+            sent.index == head.get(),
+            "the waiting peer asked for something else: {sent:?}"
+        );
+        Ok(())
+    }
+
+    /// The next `Request` this peer sends, or `None` if it sends none within
+    /// `within`. Anything else it says on the way (Interested, and so on) is
+    /// not what these tests are about.
+    async fn next_request_within(
+        requests: &mut UnboundedReceiver<WriterRequest>,
+        within: Duration,
+    ) -> Option<peer_binary_protocol::Request> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            match tokio::time::timeout_at(deadline, requests.recv()).await {
+                Ok(Some(WriterRequest::Message(peer_binary_protocol::Message::Request(r)))) => {
+                    return Some(r);
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => return None,
+            }
+        }
+    }
+
+    /// A client with one piece of `PIECE_LEN` and nothing on disk.
+    async fn one_piece_torrent<const PIECE_LEN: u32>(
+        prefix: &str,
+    ) -> anyhow::Result<(
+        Arc<TorrentStateLive>,
+        crate::torrent_state::ManagedTorrentHandle,
+        Arc<Session>,
+        TempDir,
+        TempDir,
+    )> {
+        let files = create_default_random_dir_with_torrents(1, PIECE_LEN as usize, Some(prefix));
+        let torrent = create_torrent(
+            files.path(),
+            CreateTorrentOptions {
+                piece_length: Some(PIECE_LEN),
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await?;
+        let dir = TempDir::with_prefix(format!("{prefix}_client"))?;
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            crate::SessionOptions {
+                dht: None,
+                persistence: None,
+                peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.as_bytes()?.to_vec()),
+                Some(crate::AddTorrentOptions {
+                    overwrite: true,
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        tokio::time::timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+        let live = handle.live().context("expected a live torrent")?;
+        Ok((live, handle, session, dir, files))
+    }
+
+    /// A live peer in the table that has everything, with a handler for it.
+    fn live_test_peer(
+        live: &Arc<TorrentStateLive>,
+        addr: SocketAddr,
+        tx: PeerTx,
+    ) -> anyhow::Result<PeerHandler> {
+        live.peers
+            .add_if_not_seen(addr)
+            .context("a fresh address")?;
+        let _ = live
+            .peers
+            .mark_peer_connecting(addr, CancellationToken::new())?;
+        live.peers.with_peer_mut(addr, "test", |p| {
+            p.connecting_to_live(Id20::new([0u8; 20]), &live.peers, ConnectionKind::Tcp);
+        });
+        live.peers.with_live_mut(addr, "test", |l| {
+            l.bitfield = BF::from_boxed_slice(vec![0xffu8].into_boxed_slice());
+        });
+        Ok(PeerHandler::for_test(live.clone(), addr, tx))
     }
 
     /// **A peer asks for the gaps in its claim, not for the claim.**

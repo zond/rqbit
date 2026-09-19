@@ -271,8 +271,9 @@ Built 2026-09-14 (`a31258c0`), rebuilt on the piece's age 2026-09-15 after
 two field logs; the head-at-every-slot ask and the newest-holder rule for
 joining a claim added the same day after the fourth log. The depth became
 the embedder's setting, with the completion median beside it, on
-2026-09-17 after the phone reproduced the television's stalls. Every rule and the three wiring points are proven by a test
-that fails under mutation. The first log on the latency rules (xtremio
+2026-09-17 after the phone reproduced the television's stalls. Every rule and every wiring point -- the write path's stamp, the
+`pool_changed` pulse and the `retry_at` sleep among them -- is proven by
+a test that fails under mutation. The first log on the latency rules (xtremio
 `a58f5f0`) had 24- and 30-second head-piece blocks; the second (`ef6ac8c`,
 with the claims probe) showed why: ten of sixteen shares of piece 0 sitting
 in the pool while three peers each held two, and whole pieces held by
