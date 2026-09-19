@@ -77,6 +77,10 @@ pub struct TorrentStateInitializing {
     /// a torrent that reaches `Live` with no peer adder never fetches a
     /// byte and cannot be repaired: `start` on a live torrent bails.
     peer_rx: parking_lot::Mutex<Option<crate::type_aliases::PeerStream>>,
+    /// Run by the check's continuation once the check has returned, before it
+    /// decides anything: the one place a test can land an event in between.
+    #[cfg(test)]
+    pub(crate) after_check_for_test: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl TorrentStateInitializing {
@@ -97,6 +101,8 @@ impl TorrentStateInitializing {
             pause_requested: AtomicBool::new(false),
             check_running: AtomicBool::new(false),
             previously_errored,
+            #[cfg(test)]
+            after_check_for_test: Default::default(),
         }
     }
 

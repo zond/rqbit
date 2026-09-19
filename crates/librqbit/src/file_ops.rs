@@ -3,7 +3,7 @@ use std::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use buffers::{ByteBuf, ByteBufOwned};
 use librqbit_core::{
     lengths::{ChunkInfo, ValidPieceIndex},
@@ -47,6 +47,23 @@ pub fn update_hash_from_file<Sha1: ISha1>(
     }
     Ok(())
 }
+
+
+/// The initial check stopped because a pause asked it to, as opposed to failing.
+///
+/// Its continuation tells the two apart by this type rather than by the pause flag:
+/// an unpause can clear the flag between the check stopping and the continuation
+/// reading it, and that check has not failed -- it has to run again.
+#[derive(Debug)]
+pub(crate) struct InitialCheckPaused;
+
+impl std::fmt::Display for InitialCheckPaused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("initial check paused")
+    }
+}
+
+impl std::error::Error for InitialCheckPaused {}
 
 pub(crate) struct FileOps<'a> {
     torrent: &'a ValidatedTorrentMetaV1Info<ByteBufOwned>,
@@ -109,7 +126,7 @@ impl<'a> FileOps<'a> {
 
         for piece_info in self.torrent.lengths().iter_piece_infos() {
             if pause_requested.load(Ordering::Relaxed) {
-                bail!("initial check paused");
+                return Err(InitialCheckPaused.into());
             }
 
             piece_files.clear();

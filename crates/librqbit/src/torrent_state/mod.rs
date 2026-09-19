@@ -816,6 +816,10 @@ impl ManagedTorrent {
                                 .context("bug: concurrent init semaphore was closed")?;
 
                             let check_result = init.check().await;
+                            #[cfg(test)]
+                            if let Some(hook) = init.after_check_for_test.lock().take() {
+                                hook();
+                            }
 
                             match check_result {
                                 Ok(paused) => {
@@ -848,15 +852,41 @@ impl ManagedTorrent {
                                     _start(&t, peer_rx, session, Some(g), token)
                                 }
                                 Err(err) => {
+                                    // Under the lock, like the Ok arm: the intent is
+                                    // what `pause`/`unpause` leave there, and they
+                                    // change it under this lock.
+                                    let mut g = t.locked.write();
                                     init.finish_check();
                                     if init.is_pause_requested() {
                                         debug!("initial check paused");
                                         t.state_change_notify.notify_waiters();
                                         return Ok(());
                                     }
+                                    // Stopped by a pause that an unpause has since taken
+                                    // back: between the check stopping and this lock, the
+                                    // unpause found a check still running, left it to
+                                    // this continuation and cleared the request. The
+                                    // check did not fail and the torrent is meant to run,
+                                    // so run it again -- as the unpause would have, had it
+                                    // come a moment later.
+                                    if err.is::<crate::file_ops::InitialCheckPaused>() {
+                                        let same_check = matches!(
+                                            &g.state,
+                                            ManagedTorrentState::Initializing(i) if Arc::ptr_eq(i, &init)
+                                        );
+                                        let Some(session) = session.upgrade() else {
+                                            return Ok(());
+                                        };
+                                        if !same_check {
+                                            return Ok(());
+                                        }
+                                        debug!("initial check paused and unpaused, checking again");
+                                        let peer_rx = init.take_peer_stream().or(peer_rx);
+                                        return _start(&t, peer_rx, session, Some(g), token);
+                                    }
 
                                     let result = anyhow::anyhow!("{:?}", err);
-                                    t.locked.write().state = ManagedTorrentState::Error(err);
+                                    g.state = ManagedTorrentState::Error(err);
                                     t.state_change_notify.notify_waiters();
                                     Err(result)
                                 }

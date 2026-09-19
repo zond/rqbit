@@ -608,3 +608,80 @@ async fn a_running_initial_check_does_not_keep_a_dropped_session_alive() -> anyh
     drop(handle);
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pause_undone_before_the_check_reports_runs_the_check_again() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        a_pause_undone_before_the_check_reports_runs_the_check_again_inner(),
+    )
+    .await?
+}
+
+/// review #7. A pause stops the check between pieces; an unpause landing
+/// after the check stopped but before its continuation ran found a check
+/// still running, left it to that continuation and cleared the pause
+/// request -- and the continuation, finding no pause requested, took the
+/// pause's "initial check paused" for a failure and put the torrent in the
+/// error state, with the intent saying run.
+async fn a_pause_undone_before_the_check_reports_runs_the_check_again_inner() -> anyhow::Result<()>
+{
+    setup_test_logging();
+    let (dir, torrent_bytes) = complete_torrent_on_disk("rqbit_pause_unpause_race").await?;
+    let gate = Arc::new(Gate::default());
+    let _open = OpenOnDrop(gate.clone());
+
+    let session = Session::new_with_opts(dir.path().into(), session_opts(None, None)).await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent_bytes),
+            Some(add_opts(&dir, false, &gate)),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    gate.wait_until_check_started().await?;
+
+    // Hold the continuation between the check returning and its decision.
+    let returned = Arc::new(AtomicBool::new(false));
+    let go_on = Arc::new(AtomicBool::new(false));
+    handle.with_state(|s| match s {
+        crate::ManagedTorrentState::Initializing(init) => {
+            let (returned, go_on) = (returned.clone(), go_on.clone());
+            *init.after_check_for_test.lock() = Some(Box::new(move || {
+                returned.store(true, Ordering::SeqCst);
+                while !go_on.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }));
+            Ok(())
+        }
+        other => bail!("expected the check to be running, the torrent is {}", other.name()),
+    })?;
+
+    session.pause(&handle).await?;
+    gate.open();
+    wait_until(
+        || match returned.load(Ordering::SeqCst) {
+            true => Ok(()),
+            false => bail!("waiting for the paused check to return"),
+        },
+        WAIT,
+    )
+    .await?;
+    session.unpause(&handle).await?;
+    info!("unpaused after the check stopped, before its continuation decided");
+    go_on.store(true, Ordering::SeqCst);
+
+    wait_until(
+        || match handle.stats().state {
+            TorrentStatsState::Live => Ok(()),
+            other => bail!("waiting for the torrent to go live, it is {other:?}"),
+        },
+        WAIT,
+    )
+    .await
+    .context("the unpaused torrent did not run")?;
+    assert!(!handle.is_paused());
+    Ok(())
+}
