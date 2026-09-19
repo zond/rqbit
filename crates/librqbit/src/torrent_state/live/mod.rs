@@ -797,17 +797,27 @@ impl TorrentStateLive {
                 }
             };
 
+            // The session is held only for the synchronous checks, never across the wait
+            // for a slot below. A session stops when its owner drops it, and that wait
+            // lasts as long as the torrent is at its cap -- held there, it kept a dropped
+            // session and every one of its tasks alive for as long as nobody left.
+            {
+                let session = state
+                    .shared
+                    .session
+                    .upgrade()
+                    .ok_or(Error::SessionDestroyed)?;
+                if !state.worth_dialling(&session, addr) {
+                    continue;
+                }
+            }
+
+            let permit = PeerPermit::acquire(&state).await?;
             let session = state
                 .shared
                 .session
                 .upgrade()
                 .ok_or(Error::SessionDestroyed)?;
-
-            if !state.worth_dialling(&session, addr) {
-                continue;
-            }
-
-            let permit = PeerPermit::acquire(&state).await?;
             // The wait for that slot is as long as the cap is low, which on a backgrounded
             // app is however long it stays in the background -- and what ends it is the
             // raise, which asks for every peer it parked back before it hands a slot out.
