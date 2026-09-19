@@ -167,7 +167,9 @@ async fn a_stream_open_across_an_error_and_restart_is_still_seen() -> anyhow::Re
     handle.stop_with_error(anyhow::anyhow!("simulated fatal error"));
     session.unpause(&handle).await?;
     timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
-    let live = handle.live().context("expected the restarted torrent live")?;
+    let live = handle
+        .live()
+        .context("expected the restarted torrent live")?;
     let metadata = handle.metadata.load_full().context("expected metadata")?;
     anyhow::ensure!(
         !live.streams.wanted_ranges(metadata.lengths()).is_empty(),

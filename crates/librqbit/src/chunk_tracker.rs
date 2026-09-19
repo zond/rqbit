@@ -1883,7 +1883,10 @@ mod piece_reclaim_tests {
             .unwrap();
         ct.requeue_piece_keeping_chunks(p0);
 
-        assert!(!ct.is_piece_queued(p0), "a dropped piece is still not wanted");
+        assert!(
+            !ct.is_piece_queued(p0),
+            "a dropped piece is still not wanted"
+        );
         assert!(!ct.any_chunk_arrived(p0));
         assert_eq!(ct.drop_pieces(&fi, [p0], |_| false).unwrap(), [p0]);
     }

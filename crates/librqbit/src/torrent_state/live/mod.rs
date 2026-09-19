@@ -1264,13 +1264,16 @@ impl TorrentStateLive {
         excluded
             .into_iter()
             .filter(|(piece, writers)| {
-                self.peers.states.iter().any(|e| match e.value().get_state() {
-                    PeerState::Live(l) => {
-                        !writers.contains(e.key())
-                            && l.bitfield.get(piece.get() as usize).map(|v| *v) == Some(true)
-                    }
-                    _ => false,
-                })
+                self.peers
+                    .states
+                    .iter()
+                    .any(|e| match e.value().get_state() {
+                        PeerState::Live(l) => {
+                            !writers.contains(e.key())
+                                && l.bitfield.get(piece.get() as usize).map(|v| *v) == Some(true)
+                        }
+                        _ => false,
+                    })
             })
             .map(|(piece, _)| piece)
             .collect()
@@ -3335,7 +3338,8 @@ impl PeerHandler {
                         // The piece is ours: nobody wrote a bad byte into it after all,
                         // and nobody is left out of the next one.
                         pieces.take_writers(chunk_info.piece_index);
-                        pieces.mark_piece_hash_ok(chunk_info.piece_index, &state.metadata.file_infos);
+                        pieces
+                            .mark_piece_hash_ok(chunk_info.piece_index, &state.metadata.file_infos);
                         // Under the same lock as the have-bit: drop_pieces() subtracts
                         // from this under that lock, and must not get there first.
                         state
@@ -4371,7 +4375,9 @@ mod connection_tests {
             .with_live(addr, |l| l.inflight_requests().copied().collect())
             .context("the peer is still live")?;
         anyhow::ensure!(
-            outstanding.iter().all(|c| !first.contains(&c.chunk_index) || c.piece_index != head),
+            outstanding
+                .iter()
+                .all(|c| !first.contains(&c.chunk_index) || c.piece_index != head),
             "requests for the retired claim are still out: {outstanding:?}"
         );
         let mut cancelled = 0;
@@ -4622,9 +4628,7 @@ mod connection_tests {
         // Both fill their share; one of them with rubbish, and which one is
         // exactly what the hash cannot say.
         let rubbish = vec![0xa5u8; CHUNK_SIZE as usize];
-        for (handler, claim, good_bytes) in
-            [(good, first, true), (bad, second.clone(), false)]
-        {
+        for (handler, claim, good_bytes) in [(good, first, true), (bad, second.clone(), false)] {
             for chunk in live.lengths.iter_chunk_infos_in(target, claim) {
                 live.peers.with_live_mut(handler.addr, "test", |l| {
                     l.add_inflight_request(chunk);
@@ -4729,7 +4733,7 @@ mod connection_tests {
                     peer_avg_time: None,
                     last_latency: None,
                     priority_pieces: std::iter::once(head),
-                    file_priorities: &file_priorities,
+                    file_priorities,
                     file_infos: &live.metadata.file_infos,
                     peer_has_piece: |_| true,
                     can_steal: |_| true,

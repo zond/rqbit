@@ -656,7 +656,10 @@ async fn a_pause_undone_before_the_check_reports_runs_the_check_again_inner() ->
             }));
             Ok(())
         }
-        other => bail!("expected the check to be running, the torrent is {}", other.name()),
+        other => bail!(
+            "expected the check to be running, the torrent is {}",
+            other.name()
+        ),
     })?;
 
     session.pause(&handle).await?;

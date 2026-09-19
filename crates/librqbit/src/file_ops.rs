@@ -48,7 +48,6 @@ pub fn update_hash_from_file<Sha1: ISha1>(
     Ok(())
 }
 
-
 /// The initial check stopped because a pause asked it to, as opposed to failing.
 ///
 /// Its continuation tells the two apart by this type rather than by the pause flag:
@@ -572,7 +571,12 @@ mod tests {
             Ok(())
         }
 
-        fn pread_exact(&self, _file_id: usize, _offset: u64, _buf: &mut [u8]) -> anyhow::Result<()> {
+        fn pread_exact(
+            &self,
+            _file_id: usize,
+            _offset: u64,
+            _buf: &mut [u8],
+        ) -> anyhow::Result<()> {
             bail!("not used")
         }
 
