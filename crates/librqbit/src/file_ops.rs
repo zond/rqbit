@@ -395,7 +395,15 @@ impl<'a> FileOps<'a> {
                             file_info.relative_filename
                         )
                     })?;
-                debug_assert_eq!(written, to_write);
+                // A short count is a chunk partly on disk, reported as written. Left to
+                // a debug assertion it passed silently in release: the piece failed its
+                // hash, was fetched again, and nothing said why -- on a full disk, which
+                // is how a vectored write comes back short, again and again.
+                anyhow::ensure!(
+                    written == to_write,
+                    "short write to file {file_idx} (\"{:?}\"): {written} of {to_write} bytes",
+                    file_info.relative_filename
+                );
             }
             data.advance(to_write);
             if data.is_empty() {
@@ -549,6 +557,74 @@ mod tests {
         fn has_piece(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<bool> {
             bail!("no idea")
         }
+    }
+
+    // A storage whose vectored write stops one byte short, as pwritev does when the disk
+    // fills up part way through.
+    struct ShortWriter;
+
+    impl TorrentStorage for ShortWriter {
+        fn init(
+            &mut self,
+            _shared: &ManagedTorrentShared,
+            _metadata: &TorrentMetadata,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn pread_exact(&self, _file_id: usize, _offset: u64, _buf: &mut [u8]) -> anyhow::Result<()> {
+            bail!("not used")
+        }
+
+        fn pwrite_all(&self, _file_id: usize, _offset: u64, _buf: &[u8]) -> anyhow::Result<()> {
+            bail!("not used")
+        }
+
+        fn pwrite_all_vectored(
+            &self,
+            _file_id: usize,
+            _offset: u64,
+            bufs: [std::io::IoSlice<'_>; 2],
+        ) -> anyhow::Result<usize> {
+            Ok((bufs[0].len() + bufs[1].len()).saturating_sub(1))
+        }
+
+        fn remove_file(&self, _file_id: usize, _filename: &Path) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn remove_directory_if_empty(&self, _path: &Path) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn ensure_file_length(&self, _file_id: usize, _length: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+            bail!("not used")
+        }
+    }
+
+    // review #41: a write the storage reports as short is an error, not a chunk written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_short_write_is_an_error() {
+        let (metadata, _bytes) = torrent().await;
+        let lengths = metadata.lengths();
+        let piece = lengths.validate_piece_index(0).unwrap();
+        let chunk = lengths
+            .chunk_info_from_received_data(piece, 0, CHUNK_SIZE)
+            .unwrap();
+        let block = vec![0u8; CHUNK_SIZE as usize];
+        let data = peer_binary_protocol::Piece::from_data(0, 0, &block[..]);
+        let err = FileOps::new(&metadata.info, &ShortWriter, &metadata.file_infos)
+            .write_chunk(
+                std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+                &data,
+                &chunk,
+            )
+            .expect_err("a short write was reported as a chunk written");
+        assert!(format!("{err:#}").contains("short write"), "{err:#}");
     }
 
     // A real torrent, so that the hashes are real: NUM_PIECES pieces of random bytes in
