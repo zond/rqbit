@@ -202,8 +202,12 @@ async fn pause_stops_fetching_and_unpause_keeps_the_have_set_inner() {
         progress_paused,
         "a paused torrent fetches nothing"
     );
-    // Pausing a paused torrent is an error, not a no-op.
-    assert!(client.pause(handle).await.is_err());
+    // Pausing a paused torrent used to be an error. Upstream's 193a5bd8 made it
+    // succeed instead, because the call now has work to do whatever the state: it
+    // gives the file handles back, and a torrent that was paused before that landed --
+    // restored from persistence, say -- is still holding them.
+    client.pause(handle).await.unwrap();
+    assert!(handle.is_paused(), "and it is still paused afterwards");
     info!(progress_paused, "paused");
 
     // Unpause. The have-set is exactly what the pause left: carried through
