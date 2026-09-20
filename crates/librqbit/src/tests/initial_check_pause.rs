@@ -49,6 +49,8 @@ const FILE_SIZE: usize = 512 * 1024;
 struct Gate {
     reads: AtomicUsize,
     open: AtomicBool,
+    /// How many times `release_files()` reached the storage.
+    released: AtomicUsize,
 }
 
 impl Gate {
@@ -65,6 +67,10 @@ impl Gate {
 
     fn reads(&self) -> usize {
         self.reads.load(Ordering::SeqCst)
+    }
+
+    fn released(&self) -> usize {
+        self.released.load(Ordering::SeqCst)
     }
 
     /// Returns once a check is inside `hold`: it has started, and it cannot get past
@@ -108,6 +114,7 @@ impl StorageFactory for GatedStorageFactory {
         Ok(GatedStorage {
             inner: Box::new(self.inner.create(shared, metadata)?),
             gate: self.gate.clone(),
+            gated_reads: true,
         })
     }
 
@@ -129,6 +136,8 @@ impl StorageFactory for GatedStorageFactory {
 struct GatedStorage {
     inner: Box<dyn TorrentStorage>,
     gate: Arc<Gate>,
+    /// Whether reads stop at the gate. Only the check's copy does; see `take`.
+    gated_reads: bool,
 }
 
 impl TorrentStorage for GatedStorage {
@@ -141,7 +150,9 @@ impl TorrentStorage for GatedStorage {
     }
 
     fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
-        self.gate.hold();
+        if self.gated_reads {
+            self.gate.hold();
+        }
         self.inner.pread_exact(file_id, offset, buf)
     }
 
@@ -161,10 +172,20 @@ impl TorrentStorage for GatedStorage {
         self.inner.ensure_file_length(file_id, length)
     }
 
-    // The gate is for the check only: what the torrent runs on afterwards is the
-    // ungated storage underneath.
+    // The gate is for the check only: what the torrent runs on afterwards reads
+    // straight through. It stays wrapped all the same, because the storage a paused
+    // torrent holds is this one and the counting below is about that storage.
     fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
-        self.inner.take()
+        Ok(Box::new(GatedStorage {
+            inner: self.inner.take()?,
+            gate: self.gate.clone(),
+            gated_reads: false,
+        }))
+    }
+
+    fn release_files(&self) -> anyhow::Result<()> {
+        self.gate.released.fetch_add(1, Ordering::SeqCst);
+        self.inner.release_files()
     }
 }
 
@@ -809,5 +830,58 @@ async fn a_pause_while_a_torrent_is_being_added_is_not_lost() -> anyhow::Result<
     .await
     .context("a torrent paused while it was being added ran anyway")?;
     assert!(handle.live().is_none());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_check_that_lands_on_a_paused_torrent_releases_the_files() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        a_check_that_lands_on_a_paused_torrent_releases_the_files_inner(),
+    )
+    .await?
+}
+
+/// A torrent added paused still runs the initial check, which opens every file to hash
+/// it. When the check lands on a torrent that stays paused, those handles are of no
+/// further use and have to be given back -- on Android and Windows an idle torrent
+/// holding a file descriptor per file is what the caller paused to avoid.
+///
+/// Which torrents stay paused this fork reads from the intent on the guard rather than
+/// from an argument captured before the check (`start_with_intent`), so this is also
+/// what keeps the release on the same side of that question as the decision not to go
+/// live.
+async fn a_check_that_lands_on_a_paused_torrent_releases_the_files_inner() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (dir, torrent_bytes) = complete_torrent_on_disk("rqbit_paused_check_releases").await?;
+    let gate = Arc::new(Gate::default());
+    // Nothing to hold here: this test wants the check to run all the way through.
+    gate.open();
+
+    let session = Session::new_with_opts(dir.path().into(), session_opts(None, None)).await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent_bytes),
+            Some(add_opts(&dir, true, &gate)),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+
+    wait_until(
+        || match handle.stats().state {
+            TorrentStatsState::Paused => Ok(()),
+            other => bail!("waiting for the check to finish on a paused torrent, it is {other:?}"),
+        },
+        WAIT,
+    )
+    .await?;
+
+    // The release happens under the same write guard that publishes Paused, so by the
+    // time stats() could read that state it has already happened.
+    assert!(
+        gate.released() > 0,
+        "the initial check left the torrent paused but kept every file handle open"
+    );
     Ok(())
 }

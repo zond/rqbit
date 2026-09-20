@@ -872,6 +872,24 @@ impl ManagedTorrent {
                                     }
 
                                     g.state = ManagedTorrentState::Paused(paused);
+                                    // Upstream releases the handles when a check
+                                    // lands on a torrent that stays paused. Which
+                                    // that is, this fork reads from `g.paused` under
+                                    // the lock rather than from an argument captured
+                                    // before the check (f21c3a3e) -- the same source
+                                    // `_start`'s Paused arm reads to decide not to go
+                                    // live.
+                                    if g.paused
+                                        && let ManagedTorrentState::Paused(paused) = &g.state
+                                        && let Err(error) = paused.files.release_files()
+                                    {
+                                        warn!(
+                                            id=?t.shared.id,
+                                            info_hash=?t.shared.info_hash,
+                                            error=?error,
+                                            "error releasing files after paused initial check"
+                                        );
+                                    }
                                     t.state_change_notify.notify_waiters();
                                     // Whatever a `start` during the check left
                                     // is newer than what this one captured, and
@@ -887,6 +905,14 @@ impl ManagedTorrent {
                                     let mut g = t.locked.write();
                                     init.finish_check();
                                     if init.is_pause_requested() {
+                                        if let Err(error) = init.files.release_files() {
+                                            warn!(
+                                                id=?init.shared.id,
+                                                info_hash=?init.shared.info_hash,
+                                                error=?error,
+                                                "error releasing files after paused initial check"
+                                            );
+                                        }
                                         debug!("initial check paused");
                                         t.state_change_notify.notify_waiters();
                                         return Ok(());
@@ -985,6 +1011,7 @@ impl ManagedTorrent {
         match &g.state {
             ManagedTorrentState::Live(live) => {
                 let paused = live.pause()?;
+                paused.files.release_files()?;
                 g.state = ManagedTorrentState::Paused(paused);
                 g.paused = true;
                 self.state_change_notify.notify_waiters();
@@ -1006,7 +1033,12 @@ impl ManagedTorrent {
                 Ok(())
             }
             ManagedTorrentState::Paused(_) => {
-                bail!("torrent is already paused");
+                let paused = g.state.take().assert_paused();
+                paused.files.release_files()?;
+                g.state = ManagedTorrentState::Paused(paused);
+                g.paused = true;
+                self.state_change_notify.notify_waiters();
+                Ok(())
             }
             ManagedTorrentState::Error(_) => {
                 bail!("can't pause torrent in error state")

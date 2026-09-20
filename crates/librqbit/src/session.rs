@@ -777,7 +777,7 @@ impl Session {
 
             let blocklist = if let Some(blocklist_url) = opts.blocklist_url {
                 info!(url = blocklist_url, "loading p2p blocklist");
-                let bl = IpRanges::load_from_url(&blocklist_url)
+                let bl = IpRanges::load_from_url(&reqwest_client, &blocklist_url)
                     .await
                     .with_context(|| format!("error reading blocklist from {blocklist_url}"))?;
                 info!(len = bl.len(), "loaded blocklist");
@@ -788,7 +788,7 @@ impl Session {
 
             let allowlist = if let Some(allowlist_url) = opts.allowlist_url {
                 info!(url = allowlist_url, "loading p2p allowlist");
-                let al = IpRanges::load_from_url(&allowlist_url)
+                let al = IpRanges::load_from_url(&reqwest_client, &allowlist_url)
                     .await
                     .with_context(|| format!("error reading allowlist from {allowlist_url}"))?;
                 info!(len = al.len(), "loaded allowlist");
@@ -1064,6 +1064,7 @@ impl Session {
                         warn!(?addr, ?kind, "error handing over incoming connection: {e:#}");
                     }
                 },
+                else => continue,
             }
         }
     }
