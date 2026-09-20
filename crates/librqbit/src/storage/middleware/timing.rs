@@ -152,6 +152,10 @@ impl<U: TorrentStorage> TorrentStorage for TimingStorage<U> {
     fn has_piece(&self, piece_index: ValidPieceIndex) -> anyhow::Result<bool> {
         self.underlying.has_piece(piece_index)
     }
+
+    fn release_files(&self) -> anyhow::Result<()> {
+        self.underlying.release_files()
+    }
 }
 
 #[cfg(test)]

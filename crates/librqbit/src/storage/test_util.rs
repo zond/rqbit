@@ -32,6 +32,8 @@ pub(crate) struct Probe {
     pub completed: Mutex<Vec<u32>>,
     /// The vectored writes that arrived as one call, as (offset, total length).
     pub vectored: Mutex<Vec<(u64, usize)>>,
+    /// How many times release_files() reached the storage.
+    pub released: Mutex<usize>,
 }
 
 impl TorrentStorage for Probe {
@@ -88,6 +90,11 @@ impl TorrentStorage for Probe {
     fn has_piece(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<bool> {
         Ok(false)
     }
+
+    fn release_files(&self) -> anyhow::Result<()> {
+        *self.released.lock() += 1;
+        Ok(())
+    }
 }
 
 // Everything a wrapper has to pass through to the storage it wraps and can't decide on
@@ -104,6 +111,14 @@ pub(crate) fn assert_forwards_defaults<S: TorrentStorage>(storage: &S, probe: &P
         !storage.has_piece(piece(1)).unwrap(),
         "has_piece() didn't reach the storage: it answered the default yes over a piece \
          the storage says is gone"
+    );
+
+    storage.release_files().unwrap();
+    assert_eq!(
+        *probe.released.lock(),
+        1,
+        "release_files() didn't reach the storage: the default said yes over a storage \
+         that still holds every file handle open while the torrent is paused"
     );
 
     let (a, b) = (&[1u8; 4][..], &[2u8; 6][..]);
