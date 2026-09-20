@@ -118,6 +118,13 @@ pub enum Error {
     #[error("file is None, torrent was probably paused")]
     FsFileIsNone,
 
+    #[error("error reopening {path}: {source:#}")]
+    FsReopen {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("session is dead")]
     SessionDestroyed,
 

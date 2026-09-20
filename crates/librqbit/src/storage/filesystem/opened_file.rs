@@ -1,5 +1,5 @@
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
     io::IoSlice,
     ops::{Deref, DerefMut},
     path::PathBuf,
@@ -132,7 +132,6 @@ fn pwrite_all_unvectored(
 
 #[derive(Default, Debug)]
 struct OpenedFileLocked {
-    #[allow(unused)]
     path: PathBuf,
     fd: Option<File>,
     #[cfg(windows)]
@@ -183,6 +182,8 @@ impl OpenedFile {
         })
     }
 
+    /// Give the handle back, keeping the path so the next use can take it again.
+    /// This is what a pause does; see [`OpenedFile::reopen`].
     pub fn close(&self) {
         let mut g = self.file.write();
         g.fd = None;
@@ -192,7 +193,47 @@ impl OpenedFile {
         }
     }
 
+    /// Open again what [`OpenedFile::close`] gave back.
+    ///
+    /// Upstream closes a paused torrent's files and nothing reopens them: an unpause
+    /// goes straight from `TorrentStatePaused` to live on the same storage object, and
+    /// `init()` -- the only thing that ever opened these -- is not run again. Without
+    /// this the first read or write after an unpause fails with
+    /// [`Error::FsFileIsNone`] and the torrent never recovers.
+    ///
+    /// It only reopens what has a path. A padding file never had one, and the storage
+    /// `take_clone()` emptied lost its path along with its handle -- so the copy a
+    /// pause took from stays as useless as it was meant to be, which is what
+    /// [`Error::FsFileIsNone`] goes on meaning.
+    ///
+    /// The file is opened without `create`: by the time anything reopens, `init()` has
+    /// created it. If it is gone from under us, that is worth an error rather than an
+    /// empty file that reads as a hole.
+    fn reopen(&self) -> crate::Result<()> {
+        let mut g = self.file.write();
+        if g.fd.is_some() {
+            return Ok(());
+        }
+        if g.path.as_os_str().is_empty() {
+            return Err(Error::FsFileIsNone);
+        }
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&g.path)
+            .map_err(|source| Error::FsReopen {
+                path: g.path.display().to_string(),
+                source,
+            })?;
+        g.fd = Some(f);
+        Ok(())
+    }
+
     pub fn lock_read(&self) -> crate::Result<impl Deref<Target = File>> {
+        if let Ok(g) = RwLockReadGuard::try_map(self.file.read(), |f| f.as_ref()) {
+            return Ok(g);
+        }
+        self.reopen()?;
         RwLockReadGuard::try_map(self.file.read(), |f| f.as_ref())
             .ok()
             .ok_or(Error::FsFileIsNone)
@@ -209,12 +250,15 @@ impl OpenedFile {
     pub fn try_mark_sparse(&self) -> crate::Result<impl Deref<Target = File>> {
         {
             let g = self.file.read();
-            if g.tried_marking_sparse {
+            if g.tried_marking_sparse && g.fd.is_some() {
                 return RwLockReadGuard::try_map(g, |f| f.fd.as_ref())
                     .ok()
                     .ok_or(Error::FsFileIsNone);
             }
         }
+        // A close() cleared the flag along with the handle, so this path also covers
+        // "reopen and mark it again".
+        self.reopen()?;
         let mut g = self.file.write();
         if !g.tried_marking_sparse {
             g.tried_marking_sparse = true;
