@@ -68,7 +68,8 @@ These changes apply to every user, opted in or not:
   - `wait_until_completed` no longer misses a completion that lands just as it starts waiting;
   - a pause or an unpause that arrives during a torrent's initial check lands on the check's own pause intent, instead of being swallowed and leaving the torrent settled the other way;
   - `wait_until_initialized` no longer waits forever on a check that a pause bailed out of; it fails the wait instead;
-  - vectored writes past 2 GiB on 32-bit targets.
+  - vectored writes past 2 GiB on 32-bit targets;
+  - a file that a pause closed is opened again when it is next used. Upstream gives a paused torrent's file handles back and nothing reopens them, so on that version the first read or write after an unpause fails with "file is None" and the torrent never recovers.
 - **Storage implementers:** an error from `on_piece_completed` is now fatal to the torrent, and the call comes before the piece is marked have. Upstream called it afterwards and logged errors at debug level. `has_piece` (default `Ok(true)`) is asked at startup. The wrappers forward the methods listed above.
 - **Persistence format:** JSON records gain a `piece_reclaim` field (a missing field reads as false). Postgres gets a `piece_reclaim BOOLEAN NOT NULL DEFAULT FALSE` column, added with `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` when the store opens.
 - **TLS under `rust-tls`:** a CA installed on the device, such as a corporate proxy or mitmproxy, no longer verifies rqbit's HTTPS. A root that Mozilla adds after the build is not trusted until you rebuild. Under `default-tls`, which the `rqbit` binary uses by default, nothing changes.
