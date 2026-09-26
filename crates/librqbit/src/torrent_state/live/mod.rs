@@ -273,6 +273,9 @@ pub struct TorrentStateLive {
     // Permits a lowered cap could not take from the semaphore because peers held them: each
     // is forgotten instead of released when its peer dies (`release_peer_permit`).
     peer_permits_to_forget: AtomicUsize,
+    /// How many dead peers a fresh sighting has brought forward this minute: see
+    /// [`Self::bring_forward_if_starving`].
+    bring_forward: Mutex<BringForward>,
 
     // The queue for peer manager to connect to them.
     peer_queue_tx: UnboundedSender<SocketAddr>,
@@ -392,6 +395,7 @@ impl TorrentStateLive {
             peer_semaphore: Arc::new(Semaphore::new(peer_limit)),
             peer_limit: AtomicUsize::new(peer_limit),
             peer_permits_to_forget: AtomicUsize::new(0),
+            bring_forward: Mutex::new(BringForward::default()),
             new_pieces_notify: Notify::new(),
             hash_failure_exclusions: Mutex::new(HashMap::new()),
             peer_queue_tx,
@@ -964,10 +968,14 @@ impl TorrentStateLive {
         let _ = self.have_broadcast_tx.send(index);
     }
 
+    /// Queues `addr` to be dialled if the table has never seen it. An address the
+    /// table already holds is left alone -- except a proven peer that is dead and
+    /// waiting while the torrent starves, which this sighting brings forward
+    /// ([`Self::bring_forward_if_starving`]). Answers whether a dial was queued.
     pub(crate) fn add_peer_if_not_seen(&self, addr: SocketAddr) -> crate::Result<bool> {
         match self.peers.add_if_not_seen(addr) {
             Some(handle) => handle,
-            None => return Ok(false),
+            None => return self.bring_forward_if_starving(addr),
         };
 
         self.peer_queue_tx
@@ -975,6 +983,91 @@ impl TorrentStateLive {
             .ok()
             .ok_or(Error::TorrentIsNotLive)?;
         Ok(true)
+    }
+
+    /// Whether this torrent is short of sources: it still wants pieces and has fewer
+    /// live peers than [`ManagedTorrentShared::starving_peer_floor`]. What switches a
+    /// proven peer's reconnect onto the flat retry (`PeerStats::next_wait`) and lets a
+    /// fresh sighting bring one forward. Read at each decision, so a torrent that is fed
+    /// again in between falls back to the ordinary schedule on the next death.
+    pub fn is_starving(&self) -> bool {
+        let live = self.peers.stats.live.load(Ordering::Relaxed) as usize;
+        live < self.shared.starving_peer_floor() && !self.is_finished()
+    }
+
+    /// A tracker, the DHT or PEX has just named `addr`, and the table already holds it.
+    /// If the torrent is starving and the peer is a proven one waiting out a dead wait,
+    /// it is queued now instead: a peer that has just announced itself is likelier alive
+    /// than one last heard from minutes ago, and it is the kind of address a thin swarm
+    /// is short of. Capped at [`BRING_FORWARD_PER_MINUTE`] per torrent, so a tracker
+    /// reply that names every dead peer at once is a few dials and not a burst.
+    /// Anything else -- a live, connecting or queued peer, one we decided we do not
+    /// need, an unproven one, a fed torrent -- is left exactly as it was.
+    fn bring_forward_if_starving(&self, addr: SocketAddr) -> crate::Result<bool> {
+        let candidate = self
+            .peers
+            .with_peer(addr, |peer| {
+                matches!(peer.get_state(), PeerState::Dead) && peer.stats.proven()
+            })
+            .unwrap_or(false);
+        if !candidate || !self.is_starving() {
+            return Ok(false);
+        }
+        if !self.bring_forward.lock().take_one() {
+            debug!(
+                peer = %addr,
+                "a sighting of a dead proven peer; the bring-forward budget is spent"
+            );
+            return Ok(false);
+        }
+        // Decided again under the entry's lock: the wait task can have re-queued it, or
+        // a dial can have taken it, since the read above.
+        let brought = self
+            .peers
+            .with_peer_mut(addr, "bring_forward", |peer| {
+                if !matches!(peer.get_state(), PeerState::Dead) {
+                    return false;
+                }
+                peer.stats.retry_taken();
+                // A new generation: the sleep the death spawned finds it and does nothing.
+                peer.stats.retry_generation = peer.stats.retry_generation.wrapping_add(1);
+                peer.set_state(PeerState::Queued, &self.peers);
+                true
+            })
+            .unwrap_or(false);
+        if !brought {
+            return Ok(false);
+        }
+        debug!(peer = %addr, "a sighting brought a dead proven peer forward");
+        // The proven queue, which the adder drains first.
+        self.peer_requeue_tx
+            .send(addr)
+            .ok()
+            .ok_or(Error::TorrentIsNotLive)?;
+        Ok(true)
+    }
+
+    /// What a stall report needs about the peers we are waiting to dial again: how many
+    /// proven peers are dead and waiting, and how long until the soonest of those waits
+    /// ends. Walks the table; a report every few seconds, not a stats poll.
+    pub fn retry_summary(&self) -> RetrySummary {
+        let now = Instant::now();
+        let mut summary = RetrySummary::default();
+        for entry in self.peers.states.iter() {
+            let peer = entry.value();
+            if !matches!(peer.get_state(), PeerState::Dead) {
+                continue;
+            }
+            summary.dead += 1;
+            if peer.stats.proven() {
+                summary.proven_dead += 1;
+            }
+            if let Some(at) = peer.stats.retry_at {
+                let left = at.saturating_duration_since(now);
+                summary.next_retry = Some(summary.next_retry.map_or(left, |n| n.min(left)));
+            }
+        }
+        summary
     }
 
     pub fn stats_snapshot(&self) -> StatsSnapshot {
@@ -1736,9 +1829,13 @@ impl TorrentStateLive {
     /// entry from under it would leave the adder with a slot and nothing to spend it on.
     /// So a torrent left at a low cap in a busy swarm does still accumulate `Queued`
     /// entries -- a few hundred bytes each -- for as long as it stays live.
+    ///
+    /// A **proven** dead peer is kept: it has delivered a piece, it is waiting to be
+    /// dialled again, and in a thin swarm it is the only address the torrent has that is
+    /// known to be a source. A few hundred bytes each, and there are few of them by
+    /// definition. The parked (`NotNeeded`) peers go as before.
     pub fn forget_disconnected_peers(&self) -> usize {
-        let is_disconnected =
-            |peer: &Peer| matches!(peer.get_state(), PeerState::Dead | PeerState::NotNeeded);
+        let is_disconnected = is_forgettable;
         let candidates: Vec<SocketAddr> = self
             .peers
             .states
@@ -2351,7 +2448,24 @@ impl PeerHandler {
             return Ok(());
         }
 
-        let backoff = pe.value_mut().stats.backoff.next();
+        // The flat retry while the torrent starves and this peer has served it; the
+        // exponential schedule otherwise. Decided here, where the death is, and written
+        // down on the peer for the wait task and the stall report.
+        let starving_retry = self
+            .state
+            .is_starving()
+            .then(|| self.state.shared.starving_retry());
+        let (backoff, generation, proven) = {
+            let stats = &mut pe.value_mut().stats;
+            let wait = stats.next_wait(starving_retry);
+            (wait, stats.retry_generation, stats.proven())
+        };
+        debug!(
+            proven,
+            starving = starving_retry.is_some(),
+            wait = ?backoff,
+            "peer dead; scheduling the next dial"
+        );
 
         // Prevent deadlocks.
         drop(pe);
@@ -2377,7 +2491,14 @@ impl PeerHandler {
                         .peers
                         .with_peer_mut(handle, "dead_to_queued", |peer| {
                             match peer.get_state() {
+                                // A later death, or a sighting that brought the peer
+                                // forward, scheduled its own dial: this sleep is stale.
+                                PeerState::Dead if peer.stats.retry_generation != generation => {
+                                    trace!("a newer wait owns this peer, skipping requeue");
+                                    false
+                                }
                                 PeerState::Dead => {
+                                    peer.stats.retry_taken();
                                     peer.set_state(PeerState::Queued, &self.state.peers);
                                     true
                                 }
@@ -3548,6 +3669,65 @@ fn sub_saturating(counter: &AtomicUsize, by: usize) -> usize {
 /// the only shape that covers all of them; a permit returned to the pool without paying
 /// the debt lets the adder dial one more peer than the cap allows, until some unrelated
 /// death happens to pay it instead.
+/// What [`TorrentStateLive::forget_disconnected_peers`] may drop: a parked peer, or a
+/// dead one that never delivered a piece. A dead peer that has delivered is waiting to
+/// be dialled again and stays.
+fn is_forgettable(peer: &Peer) -> bool {
+    match peer.get_state() {
+        PeerState::NotNeeded => true,
+        PeerState::Dead => !peer.stats.proven(),
+        PeerState::Queued | PeerState::Connecting(_) | PeerState::Live(_) => false,
+    }
+}
+
+/// How many dead peers a sighting may bring forward per torrent per minute
+/// ([`TorrentStateLive::bring_forward_if_starving`]).
+pub const BRING_FORWARD_PER_MINUTE: u32 = 4;
+
+/// The bring-forward budget: a count within a one-minute window.
+#[derive(Debug)]
+struct BringForward {
+    window: Instant,
+    used: u32,
+}
+
+impl Default for BringForward {
+    fn default() -> Self {
+        Self {
+            window: Instant::now(),
+            used: 0,
+        }
+    }
+}
+
+impl BringForward {
+    /// Spends one of the minute's dials, or answers `false` when they are spent.
+    fn take_one(&mut self) -> bool {
+        let now = Instant::now();
+        if now.duration_since(self.window) >= Duration::from_secs(60) {
+            self.window = now;
+            self.used = 0;
+        }
+        if self.used >= BRING_FORWARD_PER_MINUTE {
+            return false;
+        }
+        self.used += 1;
+        true
+    }
+}
+
+/// The dead peers a torrent is waiting to dial again: see
+/// [`TorrentStateLive::retry_summary`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RetrySummary {
+    /// Peers in the dead state, waiting out a backoff or a flat retry.
+    pub dead: u32,
+    /// Of those, the ones that have delivered a verified piece.
+    pub proven_dead: u32,
+    /// How long until the soonest of those waits ends; `None` with nobody waiting.
+    pub next_retry: Option<Duration>,
+}
+
 pub(crate) struct PeerPermit {
     state: Arc<TorrentStateLive>,
     permit: Option<OwnedSemaphorePermit>,
@@ -5948,8 +6128,11 @@ mod tests {
 
     use librqbit_core::{hash_id::Id20, lengths::Lengths};
 
+    use std::time::{Duration, Instant};
+
     use super::{
-        BF, Ordering, Peer, PeerState, WriterRequest, clamp_piece_range, has_any_needed_piece,
+        BF, BRING_FORWARD_PER_MINUTE, BringForward, Ordering, Peer, PeerState, WriterRequest,
+        clamp_piece_range, has_any_needed_piece, is_forgettable,
         peer::{LivePeerState, PeerTx},
         surplus_rank,
     };
@@ -6107,6 +6290,47 @@ mod tests {
         assert_eq!(&order[..3], &[5, 3, 4], "{ranked:?}");
         let kept: Vec<u16> = order[3..].to_vec();
         assert!(kept.contains(&1) && kept.contains(&2), "{kept:?}");
+    }
+
+    /// Going lean forgets the disconnected -- except a dead peer that has delivered,
+    /// which is waiting to be dialled again and is what a thin swarm has for sources.
+    #[test]
+    fn going_lean_keeps_a_proven_dead_peer() {
+        let addr = |port: u16| SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let dead_unproven = Peer::new_in_state_for_test(addr(1), PeerState::Dead);
+        let dead_proven = Peer::new_in_state_for_test(addr(2), PeerState::Dead);
+        dead_proven
+            .stats
+            .counters
+            .downloaded_and_checked_pieces
+            .fetch_add(1, Ordering::Relaxed);
+        let parked_proven = Peer::new_in_state_for_test(addr(3), PeerState::NotNeeded);
+        parked_proven
+            .stats
+            .counters
+            .downloaded_and_checked_pieces
+            .fetch_add(1, Ordering::Relaxed);
+        let queued = Peer::new_in_state_for_test(addr(4), PeerState::Queued);
+        assert!(is_forgettable(&dead_unproven));
+        assert!(
+            !is_forgettable(&dead_proven),
+            "a source waiting to be dialled"
+        );
+        assert!(is_forgettable(&parked_proven), "parked by us, as before");
+        assert!(!is_forgettable(&queued));
+    }
+
+    /// A tracker reply naming every dead peer at once is a few dials, not a burst.
+    #[test]
+    fn a_sighting_burst_is_capped_per_minute() {
+        let mut budget = BringForward::default();
+        for _ in 0..BRING_FORWARD_PER_MINUTE {
+            assert!(budget.take_one());
+        }
+        assert!(!budget.take_one(), "the minute's dials are spent");
+        // A minute on: the window rolls.
+        budget.window = Instant::now() - Duration::from_secs(61);
+        assert!(budget.take_one());
     }
 
     /// Between two peers that are equally useful, the one that moved bytes lately beats

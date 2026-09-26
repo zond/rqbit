@@ -144,6 +144,14 @@ fn backoff() -> ExponentialBackoff {
 pub(crate) struct PeerStats {
     pub counters: Arc<PeerCountersAtomic>,
     pub backoff: ExponentialBackoff,
+    /// When the wait scheduled by the last death ends, while the peer is `Dead`; `None`
+    /// once it has been re-queued or dropped. What a stall report reads to say how long
+    /// until the next dial.
+    pub retry_at: Option<Instant>,
+    /// Bumped on every death. The wait task spawned by a death carries the value it saw
+    /// and re-queues only if it is unchanged, so a peer brought forward and dead again
+    /// since is not re-queued twice by a stale sleep.
+    pub retry_generation: u64,
 }
 
 impl Default for PeerStats {
@@ -151,6 +159,8 @@ impl Default for PeerStats {
         Self {
             counters: Arc::new(Default::default()),
             backoff: backoff(),
+            retry_at: None,
+            retry_generation: 0,
         }
     }
 }
@@ -158,5 +168,109 @@ impl Default for PeerStats {
 impl PeerStats {
     pub fn reset_backoff(&mut self) {
         self.backoff = backoff();
+    }
+
+    /// Whether this peer has ever handed us a piece that verified. The one fact that
+    /// separates an address that is a source from one that is a guess: a tracker's list
+    /// is mostly peers behind NAT and peers long gone, and a schedule that treats a peer
+    /// that served us like one that never answered is what leaves a thin swarm silent
+    /// for the third step of the backoff -- six minutes -- after its one source hangs up.
+    pub fn proven(&self) -> bool {
+        self.counters
+            .downloaded_and_checked_pieces
+            .load(Ordering::Relaxed)
+            > 0
+    }
+
+    /// The wait before this peer is dialled again, and the bookkeeping of it.
+    ///
+    /// With `starving_retry` set -- the torrent still wants pieces and has fewer live
+    /// peers than its floor -- a proven peer waits exactly that long, every time, and its
+    /// exponential schedule is left where it was: the flat retry is a state of the
+    /// *torrent*, and when the torrent is fed again the peer resumes the schedule it had.
+    /// Anything else -- an unproven peer, or a torrent with peers enough -- takes the
+    /// next step of the exponential schedule, and `None` when that is exhausted.
+    pub fn next_wait(&mut self, starving_retry: Option<Duration>) -> Option<Duration> {
+        let wait = match starving_retry {
+            Some(retry) if self.proven() => Some(retry),
+            _ => self.backoff.next(),
+        };
+        self.retry_generation = self.retry_generation.wrapping_add(1);
+        self.retry_at = wait.map(|wait| Instant::now() + wait);
+        wait
+    }
+
+    /// The peer is being dialled again: nothing is scheduled any more.
+    pub fn retry_taken(&mut self) {
+        self.retry_at = None;
+    }
+}
+
+#[cfg(test)]
+mod starving_schedule_tests {
+    use super::*;
+
+    fn deliver(stats: &PeerStats) {
+        stats
+            .counters
+            .downloaded_and_checked_pieces
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A proven peer under starvation waits the flat retry, every death, and the
+    /// exponential schedule underneath is untouched by it.
+    #[test]
+    fn a_proven_peer_of_a_starving_torrent_waits_the_flat_retry() {
+        let retry = Duration::from_secs(60);
+        let mut stats = PeerStats::default();
+        deliver(&stats);
+        for _ in 0..4 {
+            assert_eq!(stats.next_wait(Some(retry)), Some(retry));
+        }
+        // Fed again: the first exponential step, not the fifth.
+        let first = stats.next_wait(None).expect("the schedule has steps left");
+        assert!(first < Duration::from_secs(20), "{first:?}");
+    }
+
+    /// A peer that never delivered keeps the exponential schedule, starving or not:
+    /// those are the addresses that cost a thin swarm its dials.
+    #[test]
+    fn an_unproven_peer_keeps_the_exponential_schedule_while_starving() {
+        let retry = Duration::from_secs(60);
+        let mut stats = PeerStats::default();
+        let first = stats.next_wait(Some(retry)).unwrap();
+        let second = stats.next_wait(Some(retry)).unwrap();
+        let third = stats.next_wait(Some(retry)).unwrap();
+        assert!(
+            first < second && second < third,
+            "{first:?} {second:?} {third:?}"
+        );
+        assert!(
+            third > Duration::from_secs(120),
+            "the third step is minutes: {third:?}"
+        );
+    }
+
+    /// A proven peer of a torrent that is not starving is on the ordinary schedule.
+    #[test]
+    fn a_proven_peer_of_a_fed_torrent_keeps_the_exponential_schedule() {
+        let mut stats = PeerStats::default();
+        deliver(&stats);
+        let first = stats.next_wait(None).unwrap();
+        let second = stats.next_wait(None).unwrap();
+        assert!(second > first, "{first:?} {second:?}");
+    }
+
+    /// Every death is a new generation, and the wait is written down for the report.
+    #[test]
+    fn a_death_bumps_the_generation_and_records_the_wait() {
+        let mut stats = PeerStats::default();
+        let before = stats.retry_generation;
+        let wait = stats.next_wait(None).unwrap();
+        assert_eq!(stats.retry_generation, before + 1);
+        let until = stats.retry_at.expect("a wait is recorded");
+        assert!(until <= Instant::now() + wait);
+        stats.retry_taken();
+        assert!(stats.retry_at.is_none());
     }
 }

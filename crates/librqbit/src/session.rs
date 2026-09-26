@@ -1457,6 +1457,13 @@ impl Session {
                         .unwrap_or(crate::torrent_state::DEFAULT_PEER_LIMIT),
                 ),
                 deadline_pieces: AtomicUsize::new(crate::piece_tracker::DEFAULT_DEADLINE_PIECES),
+                starving_peer_floor: AtomicUsize::new(
+                    crate::torrent_state::DEFAULT_STARVING_PEER_FLOOR,
+                ),
+                starving_retry_ms: std::sync::atomic::AtomicU64::new(
+                    u64::try_from(crate::torrent_state::DEFAULT_STARVING_RETRY.as_millis())
+                        .unwrap_or(u64::MAX),
+                ),
                 unadvertised_pieces: Default::default(),
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),

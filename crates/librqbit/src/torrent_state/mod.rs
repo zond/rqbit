@@ -11,7 +11,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Weak;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -201,6 +201,15 @@ pub struct ManagedTorrentShared {
     /// [`ManagedTorrent::set_deadline_pieces`] changes it. Read when the torrent goes
     /// live, and forwarded to the live tracker when it already is.
     pub(crate) deadline_pieces: AtomicUsize,
+    /// Below how many live peers a torrent that still wants pieces counts as *starving*
+    /// ([`crate::torrent_state::live::TorrentStateLive::is_starving`]):
+    /// [`DEFAULT_STARVING_PEER_FLOOR`] until [`ManagedTorrent::set_starving_retry`]
+    /// changes it. Read at every decision, never copied.
+    pub(crate) starving_peer_floor: AtomicUsize,
+    /// How long a peer that has delivered a piece waits before it is dialled again while
+    /// the torrent starves, in milliseconds: [`DEFAULT_STARVING_RETRY`] until
+    /// [`ManagedTorrent::set_starving_retry`] changes it.
+    pub(crate) starving_retry_ms: AtomicU64,
     /// Whether [`ManagedTorrent::set_pieces_advertised`] has anything held back, so the
     /// Have path can answer "announce it" without taking the state lock when it doesn't.
     ///
@@ -244,7 +253,28 @@ impl ManagedTorrentShared {
     pub fn peer_limit(&self) -> usize {
         self.peer_limit.load(Ordering::Relaxed)
     }
+
+    /// See [`ManagedTorrentShared::starving_peer_floor`].
+    pub fn starving_peer_floor(&self) -> usize {
+        self.starving_peer_floor.load(Ordering::Relaxed)
+    }
+
+    /// See [`ManagedTorrentShared::starving_retry_ms`].
+    pub fn starving_retry(&self) -> Duration {
+        Duration::from_millis(self.starving_retry_ms.load(Ordering::Relaxed))
+    }
 }
+
+/// Fewer live peers than this, on a torrent that still wants pieces, is starving. Four:
+/// a client unchokes four or five peers at a time, and below that one hang-up is a
+/// visible share of the download.
+pub const DEFAULT_STARVING_PEER_FLOOR: usize = 4;
+
+/// The flat wait before a proven peer of a starving torrent is dialled again. Sixty
+/// seconds is what libtorrent waits before any reconnect (`min_reconnect_time`) and is
+/// not considered aggressive; the ordinary schedule's third step is six minutes and its
+/// fourth thirty-six, which is the silence this replaces.
+pub const DEFAULT_STARVING_RETRY: Duration = Duration::from_secs(60);
 
 pub struct ManagedTorrent {
     // Static torrent configuration that doesn't change.
@@ -668,6 +698,23 @@ impl ManagedTorrent {
         if let Some(live) = self.live() {
             live.set_deadline_pieces(pieces);
         }
+    }
+
+    /// Sets when this torrent counts as starving -- fewer than `peer_floor` live peers
+    /// while it still wants pieces -- and how long a peer that has delivered a piece then
+    /// waits before it is dialled again. Both are read at each decision, so they take
+    /// effect at the next death, live or not. See
+    /// [`crate::torrent_state::live::TorrentStateLive::is_starving`] and
+    /// `PeerStats::next_wait` for what they change; [`DEFAULT_STARVING_PEER_FLOOR`] and
+    /// [`DEFAULT_STARVING_RETRY`] are what they start as.
+    pub fn set_starving_retry(&self, peer_floor: usize, retry: Duration) {
+        self.shared
+            .starving_peer_floor
+            .store(peer_floor, Ordering::Relaxed);
+        self.shared.starving_retry_ms.store(
+            u64::try_from(retry.as_millis()).unwrap_or(u64::MAX).max(1),
+            Ordering::Relaxed,
+        );
     }
 
     /// How many pieces at the head of a stream's lookahead are split right now: the
