@@ -245,7 +245,15 @@ async fn e2e_piece_reclaim() -> anyhow::Result<()> {
     info!("dropped, now re-selecting");
 
     assert_eq!(handle.reselect_pieces(DROP)?, DROP.len());
-    assert!(!handle.stats().finished);
+    // Unfinished again -- unless the seeder already sent them back, which re-selecting is
+    // allowed to do before the next line runs: it wakes a connected peer, three 16 KiB
+    // pieces from a local seeder take a few milliseconds, and a Windows runner deschedules
+    // a thread for about 15. Either way the pieces are wanted again, which is the claim.
+    let back_already = handle.with_chunk_tracker(|ct| {
+        let have = ct.get_have_pieces();
+        DROP.clone().all(|id| have.as_slice()[id as usize])
+    })?;
+    assert!(!handle.stats().finished || back_already);
 
     timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
 
