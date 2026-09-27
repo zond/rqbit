@@ -71,7 +71,7 @@ impl IpRanges {
 
         // The caller passes the session's client, which starts from
         // crate::http_client_builder() -- so this fetch gets both the
-        // session's proxy and this crate's TLS trust policy.
+        // session's proxy and rqbit's TLS trust policy.
         let response = client
             .get(parsed_url)
             .send()

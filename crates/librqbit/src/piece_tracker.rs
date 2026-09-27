@@ -149,10 +149,13 @@ pub struct Participant {
     pub connection: u64,
     /// Chunk indices *within the piece* this participant is fetching.
     pub chunks: Range<u32>,
-    /// When this participant took the claim. How long we have waited on a
-    /// holder that has delivered nothing here yet ([`Activity::outpaces`]),
-    /// and the tie-break in [`InflightPiece::stalled_claim`], which ranks
-    /// on how much of a claim is still missing first.
+    /// When this participant took the claim: the hand-out clock. The newest
+    /// hand-out among a claim's holders is what a peer asking to join it
+    /// must outpace ([`InflightPiece::stalled_claim`], [`Activity::outpaces`]),
+    /// whether or not they have delivered since; the oldest breaks the tie
+    /// there, after how much of a claim is still missing; and a whole
+    /// piece's only holder is stolen from on how long it has held it
+    /// ([`PieceTracker::steal_piece`]).
     started: Instant,
     /// When this holder last delivered a chunk of this piece, stamped by
     /// the write path ([`PieceTracker::note_delivery`]); `None` until it
@@ -179,7 +182,7 @@ impl Participant {
 /// nobody took the claim over. Note that `waited` is not what the rules
 /// compare: a takeover is measured against the piece's age (a cut, a share
 /// beyond two) or the claim's newest hand-out (a join), never against a
-/// holder'"'"'s last delivery.
+/// holder's last delivery.
 #[derive(Debug, Clone)]
 pub struct ClaimSnapshot {
     pub peer: PeerHandle,
@@ -758,9 +761,10 @@ pub struct PieceTracker {
     /// Who has written into each piece that is not on disk yet, stamped by
     /// the write path ([`Self::note_delivery`]). Outlives the in-flight
     /// entry, because the chunks do: a piece re-queued keeping its chunks
-    /// carries what earlier peers put in it. Read when the piece's hash
-    /// fails, which is the only thing that asks who filled it; see
-    /// [`Self::take_writers`].
+    /// carries what earlier peers put in it -- and goes when they are wiped,
+    /// or the next fill would inherit names that wrote none of it. Read when
+    /// the piece's hash fails, which is the only thing that asks who filled
+    /// it; see [`Self::take_writers`].
     writers: HashMap<ValidPieceIndex, Vec<PeerHandle>>,
 }
 
@@ -964,16 +968,15 @@ impl PieceTracker {
         }
 
         // 2. Then check naturally ordered queued pieces
-        // Note: iter_queued_pieces only returns pieces in queue_pieces (not in-flight)
-        let queued: Vec<_> = self
+        // Note: iter_queued_pieces only returns pieces in queue_pieces (not in-flight).
+        // The first one this peer can take, found without collecting the queue: this
+        // runs under the torrent's state write lock, and the queue is every piece left.
+        let queued = self
             .chunks
             .iter_queued_pieces(req.file_priorities, req.file_infos)
-            .collect();
-
-        for piece in queued {
-            if (req.peer_has_piece)(piece) && !self.chunks.is_releasing(piece) {
-                return self.reserve_piece(piece, req.peer, req.connection, false, req.now);
-            }
+            .find(|piece| (req.peer_has_piece)(*piece) && !self.chunks.is_releasing(*piece));
+        if let Some(piece) = queued {
+            return self.reserve_piece(piece, req.peer, req.connection, false, req.now);
         }
 
         // 3. Nothing left to reserve: take the piece that has been in flight longest off
@@ -990,11 +993,11 @@ impl PieceTracker {
     }
 
     /// **The head of the lookahead, offered before every chunk sent
-    /// elsewhere.** The two pieces a read is blocked on or about to block
-    /// on ([`Self::deadline_pieces`]) -- reserved split if nobody has them, cut if
-    /// one peer holds one whole, a pool share or another copy of a lagging
-    /// claim if they are in flight; the same rules as [`Self::acquire_piece`]
-    /// over the same two pieces, and nothing past them: no whole piece
+    /// elsewhere.** The pieces a read is blocked on or about to block on
+    /// ([`Self::deadline_pieces`], two by default) -- reserved split if nobody
+    /// has them, cut if one peer holds one whole, a pool share or another copy
+    /// of a lagging claim if they are in flight; the same rules as
+    /// [`Self::acquire_piece`] over the same pieces, and nothing past them: no whole piece
     /// deeper in, nothing off the ordinary queue, no steal.
     ///
     /// The request loop asks this before each chunk of work it took from
@@ -1385,14 +1388,42 @@ impl PieceTracker {
     }
 
     /// Mark piece as failed after hash verification failure - requeues the piece.
+    ///
+    /// Its chunks are wiped, and who wrote them goes with them. A failed hash has
+    /// taken the writers already ([`Self::take_writers`]); a check that could not be
+    /// read has not, and the next fill of the piece would inherit them -- a single
+    /// peer's bad piece then looks like several peers' and blames nobody.
     pub fn mark_piece_hash_failed(&mut self, piece: ValidPieceIndex) {
         self.chunks.mark_piece_broken_if_not_have(piece);
+        self.forget_writers_if_wiped(piece);
+    }
+
+    /// Forgets who wrote into `piece` if none of what they wrote is left: the
+    /// writers are of the chunks, and a piece whose chunks were wiped is filled
+    /// afresh by whoever comes next.
+    fn forget_writers_if_wiped(&mut self, piece: ValidPieceIndex) {
+        if !self.chunks.any_chunk_arrived(piece) {
+            self.writers.remove(&piece);
+        }
+    }
+
+    /// [`Self::forget_writers_if_wiped`] for every piece with writers, after a
+    /// call into the chunk tracker that may have wiped pieces it does not name.
+    /// Not needed after `reselect_pieces`: what it wipes is a dropped piece, and
+    /// a dropped piece's chunks -- writers with them -- went when its last
+    /// holder left ([`Self::release_pieces_owned_by`]).
+    fn forget_writers_of_wiped_pieces(&mut self) {
+        let chunks = &self.chunks;
+        self.writers
+            .retain(|piece, _| chunks.any_chunk_arrived(*piece));
     }
 
     /// Release all pieces one connection to a peer owns (on its death, or a choke).
     ///
-    /// Moves all pieces owned by the peer from IN_FLIGHT back to QUEUED.
-    /// Returns the number of pieces released.
+    /// Each of its shares goes back to its piece's unclaimed pool
+    /// ([`InflightPiece::release`]); a piece left with no participant leaves
+    /// the in-flight map and goes back to the queue, keeping the chunks that
+    /// arrived (below). Returns the number of pieces it held shares of.
     ///
     /// By connection and not by address alone: a task that is winding down asks after its
     /// address has been dialled again, and the address alone would hand back the new
@@ -1431,7 +1462,7 @@ impl PieceTracker {
             //
             // The piece is re-queued either way. What it keeps is the work:
             // requests are filtered against `chunk_status`
-            // (`PeerConnection`'s request loop), so whoever picks it up
+            // (`PeerHandler::chunks_to_send`), so whoever picks it up
             // next asks for the chunks that are missing rather than for the
             // piece. A dropped piece is the exception: it goes back to no
             // queue, so nobody picks it up, and its chunks are wiped after all
@@ -1441,6 +1472,8 @@ impl PieceTracker {
             } else {
                 self.chunks.mark_piece_broken_if_not_have(piece);
             }
+            // A dropped piece was wiped above even though it was asked to keep.
+            self.forget_writers_if_wiped(piece);
         }
         count
     }
@@ -1498,7 +1531,7 @@ impl PieceTracker {
     }
 
     /// True if the piece was dropped and the caller hasn't finished releasing its storage.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_releasing(&self, piece: ValidPieceIndex) -> bool {
         self.chunks.is_releasing(piece)
     }
@@ -1521,10 +1554,14 @@ impl PieceTracker {
         new_only_files: &HashSet<usize>,
     ) -> anyhow::Result<crate::chunk_tracker::HaveNeededSelected> {
         let inflight = &self.inflight;
-        self.chunks
+        let hns = self
+            .chunks
             .update_only_files(file_infos, new_only_files, |piece| {
                 inflight.contains_key(&piece)
-            })
+            });
+        // It requeues -- and wipes -- the pieces of files selected again.
+        self.forget_writers_of_wiped_pieces();
+        hns
     }
 
     /// Hold pieces back from what we announce, or stop holding them back: see
@@ -3879,6 +3916,98 @@ mod tests {
             peer_has_piece: |_| true,
             can_steal: |_| true,
         })
+    }
+
+    /// **Wiped chunks take their writers with them** (review 2026-09-27
+    /// #8). A check that cannot be read breaks the piece without asking
+    /// who filled it; if the writers outlived that, the next fill -- one
+    /// peer's, start to finish -- would come to its hash check with two
+    /// names on it and a bad piece from that one peer would blame nobody.
+    #[test]
+    fn an_unreadable_check_forgets_who_wrote_the_piece() {
+        let file_infos = make_test_file_infos(5);
+        let file_priorities = make_default_file_priorities(&file_infos);
+        let mut tracker = PieceTracker::new(make_test_chunk_tracker(5));
+        let AcquireResult::Reserved { piece: p, chunks } =
+            acquire(&mut tracker, &file_infos, &file_priorities, None)
+        else {
+            panic!("expected a reservation");
+        };
+        delivered_by(&mut tracker, p, chunks.clone(), 1, Instant::now());
+        tracker.take_inflight(p);
+
+        // The check could not be read: broken, and nobody asked who wrote it.
+        tracker.mark_piece_hash_failed(p);
+
+        // Peer 2 alone fills it again.
+        tracker.reserve_whole_for_test(p, peer(2), Instant::now());
+        delivered_by(&mut tracker, p, chunks, 2, Instant::now());
+        tracker.take_inflight(p);
+        assert_eq!(tracker.take_writers(p), vec![peer(2)]);
+    }
+
+    /// The same for the last holder of a dropped piece leaving it: asked to
+    /// keep its chunks, the tracker wipes them anyway because nobody is
+    /// queued to come for them (`ChunkTracker::requeue_piece`), and the
+    /// writers must go with them.
+    #[test]
+    fn a_dropped_piece_released_forgets_who_wrote_it() {
+        let file_infos = reclaim_file_infos(3);
+        let file_priorities = make_default_file_priorities(&file_infos);
+        let mut tracker = make_reclaim_tracker(3);
+        let p0 = piece(&tracker, 0);
+        let dropped = tracker.drop_pieces(&file_infos, [p0]).unwrap();
+        tracker.finish_release(dropped);
+
+        // A stream pulls it back in without the queue, and a chunk lands.
+        let AcquireResult::Reserved { piece, .. } =
+            acquire(&mut tracker, &file_infos, &file_priorities, Some(p0))
+        else {
+            panic!("expected the dropped piece reserved from the priority path");
+        };
+        assert_eq!(piece, p0);
+        delivered_by(&mut tracker, p0, 0..1, 1, Instant::now());
+
+        assert_eq!(tracker.release_pieces_owned_by(peer(1), 0), 1);
+        assert!(!tracker.chunks().any_chunk_arrived(p0), "dropped: wiped");
+        assert_eq!(tracker.take_writers(p0), vec![]);
+    }
+
+    /// And for a file selected again: its pieces are requeued from scratch,
+    /// including one a choke put back in the queue keeping what it had.
+    #[test]
+    fn a_file_selected_again_forgets_who_wrote_its_pieces() {
+        let file_infos = reclaim_file_infos(2);
+        let file_priorities = make_default_file_priorities(&file_infos);
+        let lengths = Lengths::new(RECLAIM_PIECE_LEN as u64 * 2, RECLAIM_PIECE_LEN).unwrap();
+        let bf_len = lengths.piece_bitfield_bytes();
+        let have = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        let mut selected = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        selected.get_mut(0..2).unwrap().fill(true);
+        let chunks = ChunkTracker::new(have.into_dyn(), selected, lengths, &file_infos).unwrap();
+        let mut tracker = PieceTracker::new(chunks);
+
+        let AcquireResult::Reserved { piece: p, .. } =
+            acquire(&mut tracker, &file_infos, &file_priorities, None)
+        else {
+            panic!("expected a reservation");
+        };
+        delivered_by(&mut tracker, p, 0..1, 1, Instant::now());
+        // The holder is choked: the piece goes back to the queue with its chunk.
+        assert_eq!(tracker.release_pieces_owned_by(peer(1), 0), 1);
+        assert!(tracker.chunks().any_chunk_arrived(p));
+
+        tracker
+            .update_only_files(&file_infos, &HashSet::new())
+            .unwrap();
+        tracker
+            .update_only_files(&file_infos, &HashSet::from_iter([0]))
+            .unwrap();
+        assert!(
+            !tracker.chunks().any_chunk_arrived(p),
+            "requeued from scratch"
+        );
+        assert_eq!(tracker.take_writers(p), vec![]);
     }
 
     // reselect_pieces() is the only caller of mark_piece_broken_if_not_have() that cannot

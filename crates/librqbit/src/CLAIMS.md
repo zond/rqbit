@@ -15,7 +15,8 @@ the first one's mistake again.
   or from the ordinary queue -- is whole. This is vanilla rqbit: stealable
   at 10x, and `peer_avg_time` is honest because one peer fetched all of it.
 - **Split.** Cut into `CLAIM_CHUNKS` (16) claims, each held by one peer,
-  unclaimed claims in a pool. Only the two head pieces are ever split. The
+  unclaimed claims in a pool. Only the deadline pieces at the head of the
+  lookahead (`deadline_pieces`, two by default) are ever split. The
   work is disjoint, so splitting costs nothing in duplication. What it costs
   is that the piece is done when its *slowest* claim is done.
 - **Doubled.** One claim of a split piece with more than one holder. The
@@ -60,9 +61,10 @@ hand-out predates the piece.
 is made at. A peer asks whenever it has a request slot free, and a slot
 frees when a chunk lands -- which is exactly when its latency was
 re-measured. So before every chunk it sends for work it took from deeper
-in the window, a peer offers itself to the two head pieces first
-(`acquire_head_share`): the same rules over the same two pieces, and
-nothing past them. What the head gives it, it sends first, then resumes
+in the window, a peer offers itself to the deadline pieces first
+(`acquire_head_share`): the same rules over the same pieces, and
+nothing past them -- asked only while a stream is open, since the head is
+the streams' lookahead and without one it is empty. What the head gives it, it sends first, then resumes
 what it was on. Without this, a peer turned away from a head piece a few
 milliseconds old was handed a whole piece and sent all 256 of its chunks
 before asking again -- two request windows -- and by the time the head
@@ -76,7 +78,7 @@ The walk goes over the lookahead in playback order, `deep` counting the
 pieces this peer could actually take.
 
 1. **Cut a whole piece at the head** (`InflightPiece::split_whole`). At
-   depth < 2, a piece held whole is cut if the asker -- never its own
+   depth < `deadline_pieces`, a piece held whole is cut if the asker -- never its own
    holder -- outpaces the piece:
    the holder keeps the claim it is currently delivering into (the first
    with anything missing), claims already on disk need nobody, and every
@@ -265,9 +267,14 @@ forty seconds off -- wakes early, asks once and goes back to sleep.
 ## Cost of being wrong
 
 Cutting a healthy holder: one window of duplicate tail, but a healthy
-holder is nearly impossible to outpace. Doubling a healthy claim:
-impossible by construction, it has delivered something. Refusing a fast
-peer: it waits one chunk arrival, not a timer.
+holder is nearly impossible to outpace. Doubling a healthy claim: not
+barred by what it has delivered any more (rule 3), but a healthy holder
+finishes sixteen chunks within one of its round trips, so only a peer
+faster than it can join before the claim is done -- and then the copy
+that lands first is the faster one's. Refusing a fast peer: it waits for
+the first of a chunk of its own landing, the lookahead changing, or
+`retry_at`, the instant time lifts the refusal -- never a flat timer, and
+the thirty-second backstop only when none of those is coming.
 
 ## Status
 

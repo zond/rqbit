@@ -195,11 +195,13 @@ impl OpenedFile {
 
     /// Open again what [`OpenedFile::close`] gave back.
     ///
-    /// Upstream closes a paused torrent's files and nothing reopens them: an unpause
-    /// goes straight from `TorrentStatePaused` to live on the same storage object, and
-    /// `init()` -- the only thing that ever opened these -- is not run again. Without
-    /// this the first read or write after an unpause fails with
-    /// [`Error::FsFileIsNone`] and the torrent never recovers.
+    /// This fork closes a paused torrent's files (`TorrentStorage::release_files`,
+    /// upstream's 193a5bd8, which upstream has since reverted in d7bfc7b0 and this fork
+    /// keeps), and nothing else reopens them: an unpause goes straight from
+    /// `TorrentStatePaused` to live on the same storage object, and `init()` -- the only
+    /// thing that ever opened these -- is not run again. Without this the first read or
+    /// write after an unpause fails with [`Error::FsFileIsNone`] and the torrent never
+    /// recovers.
     ///
     /// It only reopens what has a path. A padding file never had one, and the storage
     /// `take_clone()` emptied lost its path along with its handle -- so the copy a

@@ -6,7 +6,8 @@ use crate::{
 };
 
 use super::{
-    ManagedTorrentShared, TorrentMetadata, live::clamp_piece_range, streaming::TorrentStreams,
+    ManagedTorrentShared, TorrentMetadata,
+    live::{droppable_pieces_in, valid_pieces_in},
 };
 
 pub struct TorrentStatePaused {
@@ -14,7 +15,6 @@ pub struct TorrentStatePaused {
     pub(crate) metadata: Arc<TorrentMetadata>,
     pub(crate) files: FileStorage,
     pub(crate) chunk_tracker: ChunkTracker,
-    pub(crate) streams: Arc<TorrentStreams>,
 }
 
 impl TorrentStatePaused {
@@ -38,10 +38,8 @@ impl TorrentStatePaused {
     /// it honest across a crash is the storage's has_piece(), as it is for a live drop.
     pub(crate) fn drop_pieces(&mut self, pieces: Range<u32>) -> anyhow::Result<Vec<u32>> {
         let lengths = *self.chunk_tracker.get_lengths();
-        let wanted = self.streams.wanted_ranges(&lengths);
-        let candidates = clamp_piece_range(pieces, &lengths)
-            .filter(|id| !wanted.iter().any(|r| r.contains(id)))
-            .filter_map(|id| lengths.validate_piece_index(id));
+        let wanted = self.shared.streams.wanted_ranges(&lengths);
+        let candidates = droppable_pieces_in(pieces, &lengths, &wanted);
         let dropped =
             self.chunk_tracker
                 .drop_pieces(&self.metadata.file_infos, candidates, |_| false)?;
@@ -52,8 +50,7 @@ impl TorrentStatePaused {
     /// Nothing to wake up: unpausing picks the queue up as it finds it.
     pub(crate) fn reselect_pieces(&mut self, pieces: Range<u32>) -> anyhow::Result<usize> {
         let lengths = *self.chunk_tracker.get_lengths();
-        let pieces =
-            clamp_piece_range(pieces, &lengths).filter_map(|id| lengths.validate_piece_index(id));
+        let pieces = valid_pieces_in(pieces, &lengths);
         Ok(self
             .chunk_tracker
             .reselect_pieces(pieces, |_| false)?
@@ -74,8 +71,7 @@ impl TorrentStatePaused {
         advertised: bool,
     ) -> (usize, bool) {
         let lengths = *self.chunk_tracker.get_lengths();
-        let pieces =
-            clamp_piece_range(pieces, &lengths).filter_map(|id| lengths.validate_piece_index(id));
+        let pieces = valid_pieces_in(pieces, &lengths);
         let changed = self.chunk_tracker.set_pieces_advertised(pieces, advertised);
         (changed, self.chunk_tracker.has_unadvertised_pieces())
     }

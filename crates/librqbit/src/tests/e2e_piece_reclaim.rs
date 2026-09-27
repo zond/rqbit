@@ -15,14 +15,11 @@ use tokio::{
 use tracing::info;
 
 use crate::{
-    AddTorrent, CreateTorrentOptions, DroppedPieces, Session, create_torrent,
-    spawn_utils::BlockingSpawner,
+    AddTorrent, DroppedPieces, Session,
     storage::{StorageFactoryExt, examples::inmemory::InMemoryPieceStorageFactory},
-    tests::test_util::{TestPeerMetadata, setup_test_logging},
+    tests::test_util::{TestPeerMetadata, read_back, seeder, setup_test_logging},
     torrent_state::live::peer::stats::snapshot::{PeerStatsFilter, PeerStatsFilterState},
 };
-
-use super::test_util::create_default_random_dir_with_torrents;
 
 const PIECE_LEN: u32 = CHUNK_SIZE;
 const TOTAL_PIECES: u32 = 16;
@@ -90,67 +87,13 @@ async fn seeding_server(
     std::sync::Arc<Session>,
     std::net::SocketAddr,
 )> {
-    let files = create_default_random_dir_with_torrents(1, file_size, Some(prefix));
-    let torrent = create_torrent(
-        files.path(),
-        CreateTorrentOptions {
-            name: None,
-            piece_length: Some(PIECE_LEN),
-            ..Default::default()
-        },
-        &BlockingSpawner::new(1),
-    )
-    .await?;
-    let torrent_bytes = torrent.as_bytes()?;
-
-    let server_session = Session::new_with_opts(
-        files.path().into(),
-        crate::SessionOptions {
-            dht: None,
-            peer_id: Some(TestPeerMetadata::good().as_peer_id()),
-            persistence: None,
-            listen: Some(crate::listen::ListenerOptions {
-                listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-    )
-    .await
-    .context("error creating server session")?;
-
-    timeout(
-        Duration::from_secs(30),
-        server_session
-            .add_torrent(
-                AddTorrent::from_bytes(torrent_bytes.clone()),
-                Some(crate::AddTorrentOptions {
-                    paused: false,
-                    output_folder: Some(files.path().to_str().unwrap().to_owned()),
-                    overwrite: true,
-                    ..Default::default()
-                }),
-            )
-            .await?
-            .into_handle()
-            .context("expected a handle")?
-            .wait_until_completed(),
-    )
-    .await?
-    .context("error adding torrent to server")?;
-
-    let peer = server_session
-        .listen_addr()
-        .context("expected listen_addr to be set")?;
-    Ok((files, torrent_bytes.to_vec(), server_session, peer))
-}
-
-// Read the file back through the torrent, which is what a consumer of these pieces does.
-async fn read_back(handle: std::sync::Arc<crate::ManagedTorrent>) -> anyhow::Result<Vec<u8>> {
-    let mut stream = handle.stream(0).await?;
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
-    Ok(buf)
+    let seeder = seeder(prefix, file_size, PIECE_LEN, Default::default()).await?;
+    Ok((
+        seeder.files,
+        seeder.torrent_bytes,
+        seeder.session,
+        seeder.addr,
+    ))
 }
 
 async fn e2e_piece_reclaim() -> anyhow::Result<()> {
@@ -314,24 +257,15 @@ async fn e2e_piece_reclaim() -> anyhow::Result<()> {
 
     // "Everything from here on" is a natural way to ask for a tail, and the range is the
     // caller's, not ours. It has to be clamped to the torrent: walking it to the end of
-    // u32 takes ~26 seconds in a debug build, all of it blocking the executor.
-    let started = Instant::now();
+    // u32 takes ~26 seconds in a debug build, all of it blocking the executor. The clamp
+    // itself is `test_clamp_piece_range`; wall-clock bounds on it here, in a debug e2e run
+    // on a loaded machine, would be a flake and not a check. What this asserts is that
+    // both calls answer for the torrent's pieces and nothing past them.
     let dropped = handle.drop_pieces(TOTAL_PIECES - 2..u32::MAX)?;
-    let elapsed = started.elapsed();
     assert_eq!(dropped.pieces(), [TOTAL_PIECES - 2, TOTAL_PIECES - 1]);
     drop(dropped);
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "drop_pieces to u32::MAX took {elapsed:?}"
-    );
 
-    let started = Instant::now();
     assert_eq!(handle.reselect_pieces(0..u32::MAX)?, 2);
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "reselect_pieces to u32::MAX took {elapsed:?}"
-    );
 
     Ok(())
 }
@@ -925,10 +859,11 @@ async fn e2e_piece_reclaim_a_full_window_keeps_its_seeder() -> anyhow::Result<()
         "half the file is missing, so the torrent is not finished"
     );
     // Two things hang up on a seeder once the torrent is finished: the piece that finishes
-    // it, at once, and the seeder's own request loop, the next time it wakes to look for
-    // work - which, with nothing to ask for, is on a five-second timer. So watched for
-    // longer than that.
-    let deadline = Instant::now() + Duration::from_secs(6);
+    // it, at once, and the seeder's own request loop at the top of its next round - which
+    // comes as soon as the last chunk it asked for lands, since a loop with nothing to ask
+    // for waits on exactly that. Neither is on a timer, so a second is ample: with the old
+    // notion of finished put back into the loop's check, this catches the hang-up at once.
+    let deadline = Instant::now() + Duration::from_secs(1);
     while Instant::now() < deadline {
         assert_eq!(
             live.stats_snapshot().peer_stats.live,
@@ -970,9 +905,9 @@ async fn test_e2e_piece_reclaim_a_full_window_keeps_its_seeder() -> anyhow::Resu
 
 // A stream that seeks out of the window, into a piece that was dropped. The stream pulls
 // it in through its priority window, which is not the queue, and the seeder's request loop
-// found nothing to ask for when the window filled: it sleeps until a piece is queued or
-// its five-second timer fires. Nothing queues a dropped piece, so the read waited out the
-// timer.
+// found nothing to ask for when the window filled: it waits for the lookahead to change,
+// or its thirty-second backstop. Nothing queues a dropped piece, and a seek announces
+// nothing, so unless the read wakes it the read waits out the backstop.
 async fn e2e_piece_reclaim_a_seek_out_of_the_window_wakes_the_seeder() -> anyhow::Result<()> {
     setup_test_logging();
     let (files, torrent_bytes, _server_session, peer) =
@@ -1022,7 +957,8 @@ async fn test_e2e_piece_reclaim_a_seek_out_of_the_window_wakes_the_seeder() -> a
 // A stream parked on a piece whose storage a claim is still releasing. The seeder's
 // request loop passes over a piece under a claim, finds nothing else, and goes to sleep.
 // The release is what makes the piece available, and it woke the peers only for pieces it
-// put back in the queue - which a dropped piece is not, so the read waited out the timer.
+// put back in the queue - which a dropped piece is not, so the read waited out the
+// request loop's backstop.
 async fn e2e_piece_reclaim_a_release_under_a_parked_read_wakes_the_seeder() -> anyhow::Result<()> {
     setup_test_logging();
     let (files, torrent_bytes, _server_session, peer) =

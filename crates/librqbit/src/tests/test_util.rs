@@ -216,3 +216,94 @@ pub async fn wait_until_i_am_the_last_task() -> anyhow::Result<()> {
     )
     .await
 }
+
+/// A session that has the whole of a fresh torrent and serves it: one file of random
+/// content, `file_size` bytes in pieces of `piece_len`, a good peer id, no DHT and no
+/// persistence, listening on localhost. The seeder half of the two-session e2e tests.
+pub struct Seeder {
+    /// The directory the torrent was made from, which the seeder serves in place.
+    pub files: TempDir,
+    pub torrent_bytes: Vec<u8>,
+    pub session: Arc<crate::Session>,
+    pub handle: Arc<crate::ManagedTorrent>,
+    /// Where to dial it.
+    pub addr: std::net::SocketAddr,
+}
+
+/// See [`Seeder`]. `ratelimits` is the seeder session's, for a test that needs its upload
+/// slow enough to act mid-transfer.
+pub async fn seeder(
+    prefix: &str,
+    file_size: usize,
+    piece_len: u32,
+    ratelimits: crate::limits::LimitsConfig,
+) -> anyhow::Result<Seeder> {
+    use anyhow::Context;
+
+    let files = create_default_random_dir_with_torrents(1, file_size, Some(prefix));
+    let torrent_bytes = crate::create_torrent(
+        files.path(),
+        crate::CreateTorrentOptions {
+            name: None,
+            piece_length: Some(piece_len),
+            ..Default::default()
+        },
+        &crate::spawn_utils::BlockingSpawner::new(1),
+    )
+    .await?
+    .as_bytes()?
+    .to_vec();
+
+    let session = crate::Session::new_with_opts(
+        files.path().into(),
+        crate::SessionOptions {
+            dht: None,
+            persistence: None,
+            peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+            listen: Some(crate::listen::ListenerOptions {
+                listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                ..Default::default()
+            }),
+            ratelimits,
+            ..Default::default()
+        },
+    )
+    .await
+    .context("error creating seeder session")?;
+
+    let handle = session
+        .add_torrent(
+            crate::AddTorrent::from_bytes(torrent_bytes.clone()),
+            Some(crate::AddTorrentOptions {
+                output_folder: Some(files.path().to_str().unwrap().to_owned()),
+                overwrite: true,
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    tokio::time::timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
+
+    let addr = session
+        .listen_addr()
+        .context("the seeder is not listening")?;
+    Ok(Seeder {
+        files,
+        torrent_bytes,
+        session,
+        handle,
+        addr,
+    })
+}
+
+/// The torrent's first file read back through a stream, which is what a consumer of
+/// its pieces does.
+pub async fn read_back(handle: Arc<crate::ManagedTorrent>) -> anyhow::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut stream = handle.stream(0).await?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await?;
+    Ok(buf)
+}

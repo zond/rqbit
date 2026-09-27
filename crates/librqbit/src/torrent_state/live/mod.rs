@@ -115,7 +115,6 @@ use self::{
 use super::{
     ManagedTorrentShared, TorrentMetadata,
     paused::TorrentStatePaused,
-    streaming::TorrentStreams,
     utils::{TimedExistence, timeit},
 };
 
@@ -129,6 +128,27 @@ fn make_piece_bitfield(lengths: &Lengths) -> BF {
 pub(crate) fn clamp_piece_range(pieces: Range<u32>, lengths: &Lengths) -> Range<u32> {
     let end = pieces.end.min(lengths.total_pieces());
     pieces.start.min(end)..end
+}
+
+/// The pieces of the caller's range that are pieces of this torrent, clamped first
+/// ([`clamp_piece_range`]). What every range-taking call on a live or paused torrent
+/// walks.
+pub(crate) fn valid_pieces_in(
+    pieces: Range<u32>,
+    lengths: &Lengths,
+) -> impl Iterator<Item = ValidPieceIndex> + '_ {
+    clamp_piece_range(pieces, lengths).filter_map(|id| lengths.validate_piece_index(id))
+}
+
+/// [`valid_pieces_in`], less the pieces a live reader is about to want (`wanted`, from
+/// `TorrentStreams::wanted_ranges`): dropping one of those would only have it fetched
+/// again at once, and stall the reader meanwhile.
+pub(crate) fn droppable_pieces_in<'a>(
+    pieces: Range<u32>,
+    lengths: &'a Lengths,
+    wanted: &'a [Range<u32>],
+) -> impl Iterator<Item = ValidPieceIndex> + 'a {
+    valid_pieces_in(pieces, lengths).filter(|id| !wanted.iter().any(|r| r.contains(&id.get())))
 }
 
 pub(crate) struct TorrentStateLocked {
@@ -303,7 +323,6 @@ pub struct TorrentStateLive {
 
     session_stats: Arc<SessionStats>,
 
-    pub(crate) streams: Arc<TorrentStreams>,
     have_broadcast_tx: tokio::sync::broadcast::Sender<ValidPieceIndex>,
 
     ratelimit_upload_tx: tokio::sync::mpsc::UnboundedSender<(
@@ -311,9 +330,9 @@ pub struct TorrentStateLive {
         ChunkInfo,
     )>,
     ratelimits: Limits,
-    /// The session's upload switch ([`Session::set_upload_enabled`]), or `None` for a
-    /// torrent whose session was gone when it went live, which uploads.
-    upload_enabled: Option<tokio::sync::watch::Receiver<bool>>,
+    /// The session's upload switch ([`Session::set_upload_enabled`]). Always there: a
+    /// torrent whose session is gone does not go live at all (`TorrentStateLive::new`).
+    upload_enabled: tokio::sync::watch::Receiver<bool>,
 }
 
 impl TorrentStateLive {
@@ -358,11 +377,7 @@ impl TorrentStateLive {
             ChunkInfo,
         )>();
         let ratelimits = Limits::new(paused.shared.options.ratelimits);
-        let upload_enabled = paused
-            .shared
-            .session
-            .upgrade()
-            .map(|session| session.upload_enabled.subscribe());
+        let upload_enabled = session.upload_enabled.subscribe();
 
         let state = Arc::new(TorrentStateLive {
             shared: paused.shared.clone(),
@@ -406,7 +421,6 @@ impl TorrentStateLive {
             cancellation_token,
             have_broadcast_tx,
             session_stats,
-            streams: paused.streams,
             per_piece_locks: (0..lengths.total_pieces())
                 .map(|_| RwLock::new(()))
                 .collect(),
@@ -599,6 +613,55 @@ impl TorrentStateLive {
         Ok(())
     }
 
+    /// The handler of one connection to `addr`, accepted or dialled; the two differ
+    /// only in `incoming` and in which token cancels it.
+    fn new_peer_handler(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        incoming: bool,
+        tx: PeerTx,
+        counters: Arc<AtomicPeerCounters>,
+        cancel_token: CancellationToken,
+    ) -> PeerHandler {
+        PeerHandler {
+            connection: next_connection(),
+            addr,
+            incoming,
+            on_bitfield_notify: Default::default(),
+            flow_control: Mutex::new(PeerFlowControl::default()),
+            state: self.clone(),
+            tx,
+            counters,
+            first_message_received: AtomicBool::new(false),
+            cancel_token,
+            client_name_and_version: self.shared.client_name_and_version().to_owned(),
+        }
+    }
+
+    /// The wire side of the connection `handler` speaks for: this torrent's identity,
+    /// its peer timeouts, and the session's upload switch.
+    fn new_peer_connection<'h>(
+        &self,
+        addr: SocketAddr,
+        handler: &'h PeerHandler,
+    ) -> PeerConnection<&'h PeerHandler> {
+        let options = PeerConnectionOptions {
+            connect_timeout: self.shared.options.peer_connect_timeout,
+            read_write_timeout: self.shared.options.peer_read_write_timeout,
+            ..Default::default()
+        };
+        PeerConnection::new(
+            addr,
+            self.shared.info_hash,
+            self.shared.peer_id,
+            handler,
+            Some(options),
+            self.shared.spawner.clone(),
+            self.shared.connector.clone(),
+        )
+        .with_upload_switch(Some(self.upload_enabled.clone()))
+    }
+
     async fn task_manage_incoming_peer(
         self: Arc<Self>,
         checked_peer: CheckedIncomingConnection,
@@ -607,35 +670,15 @@ impl TorrentStateLive {
         rx: PeerRx,
         permit: PeerPermit,
     ) -> crate::Result<()> {
-        let handler = PeerHandler {
-            connection: next_connection(),
-            addr: checked_peer.addr,
-            incoming: true,
-            on_bitfield_notify: Default::default(),
-            flow_control: Mutex::new(PeerFlowControl::default()),
-            state: self.clone(),
+        let handler = self.new_peer_handler(
+            checked_peer.addr,
+            true,
             tx,
             counters,
-            first_message_received: AtomicBool::new(false),
-            cancel_token: self.cancellation_token.child_token(),
-            client_name_and_version: self.shared.client_name_and_version().to_owned(),
-        };
+            self.cancellation_token.child_token(),
+        );
         let _token_guard = handler.cancel_token.clone().drop_guard();
-        let options = PeerConnectionOptions {
-            connect_timeout: self.shared.options.peer_connect_timeout,
-            read_write_timeout: self.shared.options.peer_read_write_timeout,
-            ..Default::default()
-        };
-        let peer_connection = PeerConnection::new(
-            checked_peer.addr,
-            self.shared.info_hash,
-            self.shared.peer_id,
-            &handler,
-            Some(options),
-            self.shared.spawner.clone(),
-            self.shared.connector.clone(),
-        )
-        .with_upload_switch(self.upload_enabled.clone());
+        let peer_connection = self.new_peer_connection(checked_peer.addr, &handler);
         let requester = handler.task_peer_chunk_requester();
 
         let res = tokio::select! {
@@ -671,36 +714,9 @@ impl TorrentStateLive {
         dial_cancel: CancellationToken,
     ) -> crate::Result<()> {
         let state = self;
-        let handler = PeerHandler {
-            connection: next_connection(),
-            addr,
-            incoming: false,
-            on_bitfield_notify: Default::default(),
-            flow_control: Mutex::new(PeerFlowControl::default()),
-            state: state.clone(),
-            tx,
-            counters,
-            first_message_received: AtomicBool::new(false),
-            cancel_token: dial_cancel,
-            client_name_and_version: state.shared.client_name_and_version().to_owned(),
-        };
+        let handler = state.new_peer_handler(addr, false, tx, counters, dial_cancel);
         let _token_guard = handler.cancel_token.clone().drop_guard();
-
-        let options = PeerConnectionOptions {
-            connect_timeout: state.shared.options.peer_connect_timeout,
-            read_write_timeout: state.shared.options.peer_read_write_timeout,
-            ..Default::default()
-        };
-        let peer_connection = PeerConnection::new(
-            addr,
-            state.shared.info_hash,
-            state.shared.peer_id,
-            &handler,
-            Some(options),
-            state.shared.spawner.clone(),
-            state.shared.connector.clone(),
-        )
-        .with_upload_switch(state.upload_enabled.clone());
+        let peer_connection = state.new_peer_connection(addr, &handler);
         let requester = aframe!(
             handler
                 .task_peer_chunk_requester()
@@ -1134,7 +1150,6 @@ impl TorrentStateLive {
             metadata: self.metadata.clone(),
             files: self.files.take()?,
             chunk_tracker,
-            streams: self.streams.clone(),
         })
     }
 
@@ -1165,10 +1180,8 @@ impl TorrentStateLive {
         // What is left racing is a seek concurrent with this very iteration, and that one
         // is harmless: the picker's priority path ignores "dropped", so the reader pulls
         // the piece back in by itself.
-        let wanted = self.streams.wanted_ranges(&self.lengths);
-        let candidates = clamp_piece_range(pieces, &self.lengths)
-            .filter(|id| !wanted.iter().any(|r| r.contains(id)))
-            .filter_map(|id| self.lengths.validate_piece_index(id));
+        let wanted = self.shared.streams.wanted_ranges(&self.lengths);
+        let candidates = droppable_pieces_in(pieces, &self.lengths, &wanted);
         let (dropped, freed) = {
             let pieces = locked.get_pieces_mut()?;
             let have_before = pieces.chunks().get_hns().have_bytes;
@@ -1230,10 +1243,7 @@ impl TorrentStateLive {
         pieces: Range<u32>,
         advertised: bool,
     ) -> anyhow::Result<(usize, bool)> {
-        let ids = || {
-            clamp_piece_range(pieces.clone(), &self.lengths)
-                .filter_map(|id| self.lengths.validate_piece_index(id))
-        };
+        let ids = || valid_pieces_in(pieces.clone(), &self.lengths);
         let mut g = self.lock_write("set_pieces_advertised");
         let pt = g.get_pieces_mut()?;
         // Collected before the change, while "held back" is still readable. Only the
@@ -1291,8 +1301,10 @@ impl TorrentStateLive {
     /// The caller is done releasing the storage of these pieces: they may be downloaded
     /// again. See [`crate::DroppedPieces`].
     ///
-    /// Called with the torrent's state lock held, which is what makes the piece tracker
-    /// certain to be here: pausing takes that lock before it takes the tracker.
+    /// Called with `ManagedTorrent::locked` held (write) by
+    /// `ManagedTorrent::finish_release`, which is what makes the piece tracker certain
+    /// to be here: pausing takes that lock before it takes the tracker. Not this
+    /// state's own lock, which it takes below.
     pub(crate) fn finish_release(&self, pieces: &[u32]) {
         let queued = match self.lock_write("finish_release").get_pieces_mut() {
             Ok(pt) => pt.finish_release(
@@ -1318,7 +1330,7 @@ impl TorrentStateLive {
         // its priority window, and the peers passed over it while it was held. Nothing
         // else wakes them for it.
         let wanted_by_a_stream = || {
-            let wanted = self.streams.wanted_ranges(&self.lengths);
+            let wanted = self.shared.streams.wanted_ranges(&self.lengths);
             pieces
                 .iter()
                 .any(|id| wanted.iter().any(|range| range.contains(id)))
@@ -1381,8 +1393,7 @@ impl TorrentStateLive {
     /// Make previously dropped pieces wanted again. Returns how many pieces stopped being
     /// dropped.
     pub(crate) fn reselect_pieces(&self, pieces: Range<u32>) -> anyhow::Result<usize> {
-        let pieces = clamp_piece_range(pieces, &self.lengths)
-            .filter_map(|id| self.lengths.validate_piece_index(id));
+        let pieces = valid_pieces_in(pieces, &self.lengths);
         let res = self
             .lock_write("reselect_pieces")
             .get_pieces_mut()?
@@ -1434,7 +1445,8 @@ impl TorrentStateLive {
             Ok(c) => c,
             Err(_) => return false,
         };
-        self.streams
+        self.shared
+            .streams
             .streamed_file_ids()
             .any(|file_id| !chunks.is_file_finished(&self.metadata.file_infos[file_id]))
     }
@@ -1452,7 +1464,8 @@ impl TorrentStateLive {
         let mut g = self.lock_write("on_piece_completed");
         let locked = &mut **g;
 
-        self.streams
+        self.shared
+            .streams
             .wake_streams_on_piece_completed(id, self.metadata.lengths());
 
         locked.unflushed_bitv_bytes += self.metadata.lengths().piece_length(id) as u64;
@@ -2300,9 +2313,9 @@ const IDLE_BACKSTOP: Duration = Duration::from_secs(30);
 enum Ask {
     /// Anything: the lookahead, the ordinary queue, a steal.
     Anything,
-    /// A share of the two pieces at the head of the lookahead, or nothing
-    /// (`PieceTracker::acquire_head_share`). Asked before every chunk of
-    /// work taken from deeper in.
+    /// A share of the deadline pieces at the head of the lookahead, or
+    /// nothing (`PieceTracker::acquire_head_share`). Asked before every chunk
+    /// of work taken from deeper in, while a stream is open.
     Head,
 }
 
@@ -2535,17 +2548,18 @@ impl PeerHandler {
         Ok(())
     }
 
-    /// Acquire a piece for this peer. [`Ask::Anything`] tries, in order: the
-    /// stream lookahead (a free piece, or a share of one in flight), a steal of
-    /// the first lookahead piece it could not join from a peer 10x slower, the
-    /// ordinary queue, and a steal from a peer 3x slower. [`Ask::Head`] tries
-    /// only the two head pieces of the lookahead.
+    /// The next share of a piece for this peer to fetch. [`Ask::Anything`]
+    /// tries, in order: the stream lookahead (a free piece, or a share of one
+    /// in flight), a steal of the first lookahead piece it could not join from
+    /// a peer 10x slower, the ordinary queue, and a steal from a peer 3x
+    /// slower. [`Ask::Head`] tries only the deadline pieces at the head of the
+    /// lookahead (`PieceTracker::deadline_pieces`).
     ///
-    /// Returns the piece index to download, or None if no pieces are available.
-    /// The next share of a piece to fetch: the piece, and which of its
-    /// chunks this peer claimed. A piece a stream waits on is split, so the
-    /// claim is part of it and the same piece is handed to other peers at
-    /// the same time; anything else is claimed whole.
+    /// [`Next::Share`] is the piece and which of its chunks this peer claimed:
+    /// a deadline piece is split, so the claim is part of it and the same
+    /// piece is handed to other peers at the same time; anything else is
+    /// claimed whole. [`Next::Wait`] is nothing for now, with when to ask
+    /// again. `None` is a peer that has us choked.
     fn acquire_next_piece(&self, ask: Ask) -> crate::Result<Option<Next>> {
         if self.is_choked() {
             debug!("we are choked, can't acquire piece");
@@ -2583,7 +2597,11 @@ impl PeerHandler {
                     // The one reading of the clock on this path; see
                     // `AcquireRequest::now`.
                     now: std::time::Instant::now(),
-                    priority_pieces: self.state.streams.iter_next_pieces(&self.state.lengths),
+                    priority_pieces: self
+                        .state
+                        .shared
+                        .streams
+                        .iter_next_pieces(&self.state.lengths),
                     file_priorities,
                     file_infos: &self.state.metadata.file_infos,
                     peer_has_piece: |p| {
@@ -2651,12 +2669,7 @@ impl PeerHandler {
         // this point a request is validated (and one for a piece we no longer have
         // hangs up on the peer), queued on the upload scheduler, and paid for in upload
         // tokens, only for the writer to throw it away behind the Choke.
-        if self
-            .state
-            .upload_enabled
-            .as_ref()
-            .is_some_and(|enabled| !*enabled.borrow())
-        {
+        if !*self.state.upload_enabled.borrow() {
             trace!(?request, "upload is switched off, dropping the request");
             return Ok(());
         }
@@ -2929,12 +2942,27 @@ impl PeerHandler {
                 }
                 None => {
                     // Choked: nothing to ask for until the peer unchokes us,
-                    // which arrives on its own message.
+                    // which arrives on its own message -- and
+                    // `on_i_am_unchoked` announces it on the request-slot
+                    // notify, not `new_pieces_notify`. The choke landed
+                    // between the slot wait above and the ask, so the slot
+                    // notify armed before the ask is the one that hears the
+                    // unchoke; waiting on the lookahead alone sat out the
+                    // five seconds after an unchoke that came at once.
                     debug!("choked, nothing to request");
-                    let _ = aframe!(tokio::time::timeout(
-                        Duration::from_secs(5),
-                        new_piece_notify
-                    ))
+                    let freed = async move {
+                        match slot_freed {
+                            Some(freed) => freed.await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    };
+                    aframe!(async {
+                        tokio::select! {
+                            _ = freed => debug!("unchoked or a slot freed, asking again"),
+                            _ = new_piece_notify => {},
+                            _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+                        }
+                    })
                     .await;
                     continue;
                 }
@@ -2960,17 +2988,27 @@ impl PeerHandler {
                 // frees when a chunk lands, which is when this peer's latency
                 // was re-measured -- the event the one comparison
                 // (`CLAIMS.md`) is about -- so this is the moment to ask
-                // whether the two pieces the reader is waiting on have a share
-                // for it: a pool share now that the piece is older than its
-                // round trip, or a lagging claim to copy. What it is given it
-                // sends first, and comes back to this share after. Before
+                // whether the deadline pieces the reader is waiting on have a
+                // share for it: a pool share now that the piece is older than
+                // its round trip, or a lagging claim to copy. What it is given
+                // it sends first, and comes back to this share after. Before
                 // this, a peer turned away from a head piece a few
                 // milliseconds old was handed a whole piece deeper in and sent
                 // all 256 chunks of it before asking again: the field of
                 // 2026-09-15 had ten of sixteen shares of the head piece
                 // unclaimed for two seconds with the peers that outpaced it
                 // all committed elsewhere, and a 5.4 s read.
+                //
+                // **No stream, no head.** The head is the streams' lookahead
+                // and nothing else, so with none open the ask can only come
+                // back empty -- after taking this peer's entry in the peer
+                // table and the torrent-wide state write lock, once per 16 KiB
+                // request on a plain download. Skipping it leaves nothing
+                // uncollected: the pool and retired-claim flags an ask drains
+                // are only set by the acquisition that drains them. A stream
+                // opened after this check is asked for at the next slot.
                 if ask_head
+                    && !self.state.shared.streams.is_empty()
                     && let Some(Next::Share(piece, chunks)) = self.acquire_next_piece(Ask::Head)?
                 {
                     let head = ShareWork {
@@ -3091,20 +3129,25 @@ impl PeerHandler {
     /// still unclaimed, and this peer comes back round for one of those
     /// when it is done here.
     fn chunks_to_send(&self, piece: ValidPieceIndex, claimed: Range<u32>) -> VecDeque<ChunkInfo> {
-        let mut to_request = {
-            let g = self.state.lock_read("chunks already on disk");
-            g.get_chunks()
-                .map(|chunks| chunks.chunks_to_request(piece, &claimed))
-                .unwrap_or_default()
-                .into_iter()
-        };
+        // Read under the lock and walked under it, so nothing is collected
+        // but the answer: the shares are at most a piece of chunks.
+        let g = self.state.lock_read("chunks already on disk");
+        let mut to_request = g
+            .get_chunks()
+            .ok()
+            .map(|chunks| chunks.chunks_to_request(piece, &claimed));
         self.state
             .lengths
             .iter_chunk_infos_in(piece, claimed)
             // `true` for a chunk to ask for, and `true` for one this reading
             // could not answer for, which is how it behaved before there was
             // a reading.
-            .filter(|_| to_request.next().unwrap_or(true))
+            .filter(|_| {
+                to_request
+                    .as_mut()
+                    .and_then(|to_request| to_request.next())
+                    .unwrap_or(true)
+            })
             .collect()
     }
 
@@ -3659,16 +3702,6 @@ fn sub_saturating(counter: &AtomicUsize, by: usize) -> usize {
         .unwrap_or(0)
 }
 
-/// A live-peer slot, held for as long as the peer connection is.
-///
-/// Owning the permit is not enough on its own: a cap lowered while peers hold every
-/// permit cannot take the ones it wants off the semaphore, so it books them as a debt
-/// (`peer_permits_to_forget`) for the returning permits to pay. Which means a permit must
-/// be settled exactly once, on every way out of a peer task -- and there are many, `?`
-/// operators, a panic and the task being cancelled among them. Settling it in `Drop` is
-/// the only shape that covers all of them; a permit returned to the pool without paying
-/// the debt lets the adder dial one more peer than the cap allows, until some unrelated
-/// death happens to pay it instead.
 /// What [`TorrentStateLive::forget_disconnected_peers`] may drop: a parked peer, or a
 /// dead one that never delivered a piece. A dead peer that has delivered is waiting to
 /// be dialled again and stays.
@@ -3728,6 +3761,16 @@ pub struct RetrySummary {
     pub next_retry: Option<Duration>,
 }
 
+/// A live-peer slot, held for as long as the peer connection is.
+///
+/// Owning the permit is not enough on its own: a cap lowered while peers hold every
+/// permit cannot take the ones it wants off the semaphore, so it books them as a debt
+/// (`peer_permits_to_forget`) for the returning permits to pay. Which means a permit must
+/// be settled exactly once, on every way out of a peer task -- and there are many, `?`
+/// operators, a panic and the task being cancelled among them. Settling it in `Drop` is
+/// the only shape that covers all of them; a permit returned to the pool without paying
+/// the debt lets the adder dial one more peer than the cap allows, until some unrelated
+/// death happens to pay it instead.
 pub(crate) struct PeerPermit {
     state: Arc<TorrentStateLive>,
     permit: Option<OwnedSemaphorePermit>,
@@ -4883,7 +4926,10 @@ mod connection_tests {
         let (tx, mut requests) = unbounded_channel();
         let handler = live_test_peer(&live, addr, tx)?;
         // A round trip of its own: without one it outpaces nothing, whatever it
-        // waits, and there would be no instant to be told.
+        // waits, and there would be no instant to be told. Long enough that its
+        // first ask, a spawn after the holder's claim, is surely refused -- a
+        // round trip shorter than that gap would join at once and prove nothing
+        // about the wake-up -- and no longer: the test waits it out once more.
         let chunk = live
             .lengths
             .chunk_info_from_received_data(head, 0, CHUNK_SIZE)
@@ -4891,7 +4937,7 @@ mod connection_tests {
         live.peers.with_live_mut(addr, "test", |l| {
             l.add_inflight_request(chunk);
         });
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
         live.peers.with_live_mut(addr, "test", |l| {
             l.remove_inflight_request(&chunk);
         });

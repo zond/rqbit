@@ -724,22 +724,28 @@ impl ChunkTracker {
     /// answer and the request going out, which costs exactly what every
     /// chunk cost before. Out of range answers "ask for all of it", which
     /// is what the loop did before this existed.
-    pub(crate) fn chunks_to_request(
-        &self,
+    ///
+    /// One answer per chunk of the claim, in order, read as the caller walks
+    /// the claim: an iterator and not a collection, because the request loop
+    /// asks this for every share it is handed.
+    pub(crate) fn chunks_to_request<'a>(
+        &'a self,
         piece: ValidPieceIndex,
         claim: &Range<u32>,
-    ) -> Vec<bool> {
+    ) -> impl Iterator<Item = bool> + use<'a> {
         let want = (claim.end.saturating_sub(claim.start)) as usize;
         let piece_range = self.lengths.chunk_range(piece);
         let start = piece_range.start + claim.start as usize;
         let end = piece_range.start + claim.end as usize;
-        if end > piece_range.end {
-            return vec![true; want];
-        }
-        match self.chunk_status.get(start..end) {
-            Some(bits) => bits.iter().map(|arrived| !*arrived).collect(),
-            None => vec![true; want],
-        }
+        let bits = if end > piece_range.end {
+            None
+        } else {
+            self.chunk_status.get(start..end)
+        };
+        let unknown = if bits.is_none() { want } else { 0 };
+        bits.into_iter()
+            .flat_map(|bits| bits.iter().map(|arrived| !*arrived))
+            .chain(std::iter::repeat_n(true, unknown))
     }
 
     /// Whether any chunk of `index` is on disk.
@@ -1023,9 +1029,17 @@ impl ChunkTracker {
         // Every selected piece we still want is had, so what is left is whether a selected
         // piece is one we stopped wanting - and those we lack: a drop clears the have-bit,
         // a completion undrops. Without reclaim there are none.
-        self.reclaim
-            .as_ref()
-            .is_none_or(|r| r.dropped.iter_ones().all(|id| !self.selected[id]))
+        //
+        // A byte at a time rather than a bit: the request loop asks this at the top of
+        // every round, and a bounded window keeps most of the torrent dropped. Both sets
+        // are sized from `piece_bitfield_bytes` and set only at valid piece indices, so
+        // the bytes line up and the tail bits are zero in both.
+        self.reclaim.as_ref().is_none_or(|r| {
+            !r.dropped
+                .domain()
+                .zip(self.selected.domain())
+                .any(|(dropped, selected)| dropped & selected != 0)
+        })
     }
 
     pub fn per_file_have_bytes(&self) -> &[u64] {
@@ -1439,7 +1453,7 @@ mod tests {
         let claim = 0..3;
 
         assert_eq!(
-            ct.chunks_to_request(piece, &claim),
+            ct.chunks_to_request(piece, &claim).collect::<Vec<_>>(),
             vec![true, true, true],
             "nothing has arrived, so every chunk is still to ask for"
         );
@@ -1447,7 +1461,7 @@ mod tests {
         recv_chunk(&mut ct, 1, 0, CHUNK_SIZE as usize);
         recv_chunk(&mut ct, 1, 2, 1);
         assert_eq!(
-            ct.chunks_to_request(piece, &claim),
+            ct.chunks_to_request(piece, &claim).collect::<Vec<_>>(),
             vec![false, true, false],
             "the chunks already on disk were asked for again"
         );
@@ -1455,7 +1469,7 @@ mod tests {
         // A claim this reading cannot answer for is asked for whole, which
         // is what the request loop did before there was a reading.
         assert_eq!(
-            ct.chunks_to_request(piece, &(0..99)),
+            ct.chunks_to_request(piece, &(0..99)).collect::<Vec<_>>(),
             vec![true; 99],
             "an out-of-range claim must not silence the requests"
         );

@@ -7,12 +7,12 @@
 // So what makes a torrent persistable is a promise its storage makes - see
 // StorageFactory::ensure_persistable - and not which storage it happens to be.
 
-use std::{net::Ipv4Addr, time::Duration};
+use std::time::Duration;
 
 use anyhow::Context;
 use librqbit_core::constants::CHUNK_SIZE;
 use tempfile::TempDir;
-use tokio::{io::AsyncReadExt, time::timeout};
+use tokio::time::timeout;
 
 use crate::{
     AddTorrent, CreateTorrentOptions, Session, create_torrent,
@@ -21,7 +21,7 @@ use crate::{
         StorageFactoryExt,
         examples::inmemory::{InMemoryExampleStorageFactory, InMemoryPieceStorageFactory},
     },
-    tests::test_util::{TestPeerMetadata, setup_test_logging},
+    tests::test_util::{TestPeerMetadata, read_back, seeder, setup_test_logging},
     type_aliases::BF,
 };
 
@@ -42,59 +42,13 @@ async fn seeding_server(
     std::sync::Arc<Session>,
     std::net::SocketAddr,
 )> {
-    let files = create_default_random_dir_with_torrents(1, FILE_SIZE, Some(prefix));
-    let torrent = create_torrent(
-        files.path(),
-        CreateTorrentOptions {
-            name: None,
-            piece_length: Some(PIECE_LEN),
-            ..Default::default()
-        },
-        &BlockingSpawner::new(1),
-    )
-    .await?;
-    let torrent_bytes = torrent.as_bytes()?;
-
-    let server_session = Session::new_with_opts(
-        files.path().into(),
-        crate::SessionOptions {
-            dht: None,
-            peer_id: Some(TestPeerMetadata::good().as_peer_id()),
-            persistence: None,
-            listen: Some(crate::listen::ListenerOptions {
-                listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-    )
-    .await
-    .context("error creating server session")?;
-
-    timeout(
-        Duration::from_secs(30),
-        server_session
-            .add_torrent(
-                AddTorrent::from_bytes(torrent_bytes.clone()),
-                Some(crate::AddTorrentOptions {
-                    paused: false,
-                    output_folder: Some(files.path().to_str().unwrap().to_owned()),
-                    overwrite: true,
-                    ..Default::default()
-                }),
-            )
-            .await?
-            .into_handle()
-            .context("expected a handle")?
-            .wait_until_completed(),
-    )
-    .await?
-    .context("error adding torrent to server")?;
-
-    let peer = server_session
-        .listen_addr()
-        .context("expected listen_addr to be set")?;
-    Ok((files, torrent_bytes.to_vec(), server_session, peer))
+    let seeder = seeder(prefix, FILE_SIZE, PIECE_LEN, Default::default()).await?;
+    Ok((
+        seeder.files,
+        seeder.torrent_bytes,
+        seeder.session,
+        seeder.addr,
+    ))
 }
 
 // A client session with persistence and fastresume on, so that a second one over the same
@@ -132,14 +86,6 @@ async fn resume_data(persistence_folder: &std::path::Path) -> anyhow::Result<BF>
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Ok(last)
-}
-
-// Read the file back through the torrent, which is what a consumer of it does.
-async fn read_back(handle: std::sync::Arc<crate::ManagedTorrent>) -> anyhow::Result<Vec<u8>> {
-    let mut stream = handle.stream(0).await?;
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
-    Ok(buf)
 }
 
 // The default path, asserted rather than assumed: the filesystem storage promises what

@@ -87,6 +87,11 @@ impl TorrentStreams {
         self.next_stream_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Whether no stream is open, which is a lookahead with nothing in it.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.streams.is_empty()
+    }
+
     fn register_waker(&self, stream_id: StreamId, waker: Waker) {
         if let Some(mut s) = self.streams.get_mut(&stream_id) {
             let vm = s.value_mut();
@@ -241,10 +246,11 @@ impl AsyncRead for FileStream {
             // (TorrentStateLive::on_piece_completed), and a stream that was already open
             // then is the one thing that can want a piece again afterwards, by seeking
             // into a range that has since been dropped. And a peer still connected that
-            // found nothing to ask for sleeps until a piece is queued or its timer fires,
-            // five seconds on, while a dropped piece comes in through the stream's
-            // priority window and is never queued. So a read that has to wait brings the
-            // first back and wakes the second. Only a read about to park gets this far,
+            // found nothing to ask for waits for the lookahead to change
+            // (`new_pieces_notify`) or for one of its own events, behind a thirty-second
+            // backstop, while a dropped piece comes in through the stream's priority
+            // window and is never queued, which announces nothing. So a read that has to
+            // wait brings the first back and wakes the second. Only a read about to park gets this far,
             // and for a finished file it does nothing; otherwise each idle requester
             // wakes, looks once, and sleeps again.
             self.torrent
@@ -352,14 +358,6 @@ impl ManagedTorrent {
         })
     }
 
-    fn streams(&self) -> anyhow::Result<Arc<TorrentStreams>> {
-        self.with_state(|s| match s {
-            crate::ManagedTorrentState::Paused(p) => Ok(p.streams.clone()),
-            crate::ManagedTorrentState::Live(l) => Ok(l.streams.clone()),
-            s => anyhow::bail!("streams: invalid state {}", s.name()),
-        })
-    }
-
     fn maybe_reconnect_needed_peers_for_file(&self, file_id: usize) -> bool {
         // If we have the full file, don't bother.
         if self.is_file_finished(file_id) {
@@ -368,10 +366,11 @@ impl ManagedTorrent {
         self.with_state(|state| {
             if let crate::ManagedTorrentState::Live(l) = &state {
                 l.reconnect_all_not_needed_peers();
-                // And the peers still connected. One that found nothing to ask for sleeps
-                // until a piece is queued or its timer fires, five seconds on; a piece a
-                // stream wants is not queued when it was dropped, so a reader that seeked
-                // into a dropped range waited out that timer before anyone asked for it.
+                // And the peers still connected. One that found nothing to ask for waits
+                // for `new_pieces_notify`, one of its own events or a thirty-second
+                // backstop; a piece a stream wants is not queued when it was dropped, so
+                // nothing else pulses the notify, and a reader that seeked into a dropped
+                // range waited out the backstop before anyone asked for it.
                 l.wake_idle_requesters();
             }
         });
@@ -412,7 +411,10 @@ impl ManagedTorrent {
             |_fd, fi| (fi.len, fi.offset_in_torrent),
             &metadata,
         )?;
-        let streams = self.streams()?;
+        // The set on the shared part, which outlives every state; see
+        // `ManagedTorrentShared::streams`. The state was checked just above:
+        // a stream opens on a paused or live torrent only.
+        let streams = self.shared().streams.clone();
         let blocking_permit = self.shared().spawner.semaphore().acquire_owned().await?;
         let s = FileStream {
             stream_id: streams.next_id(),
@@ -519,6 +521,36 @@ mod tests {
             (0..10).filter(|id| wanted(*id)).collect::<Vec<_>>(),
             vec![0, 1, 6, 7, 8]
         );
+    }
+
+    /// The request loop skips the head ask on `is_empty` (a plain download
+    /// has no lookahead to ask about), so it must be true exactly while no
+    /// stream is registered -- and the lookahead empty with it.
+    #[test]
+    fn is_empty_tracks_the_open_streams() {
+        let lengths = Lengths::new(10 * 1024, 1024).unwrap();
+        let streams = TorrentStreams::default();
+        assert!(streams.is_empty());
+        assert_eq!(streams.iter_next_pieces(&lengths).count(), 0);
+
+        let id = streams.next_id();
+        streams.streams.insert(
+            id,
+            StreamState {
+                file_id: 0,
+                file_len: lengths.total_length(),
+                file_abs_offset: 0,
+                position: 0,
+                lookahead_bytes: 2 * 1024,
+                waker: None,
+            },
+        );
+        assert!(!streams.is_empty());
+        assert_eq!(streams.iter_next_pieces(&lengths).count(), 2);
+
+        streams.drop_stream(id);
+        assert!(streams.is_empty());
+        assert_eq!(streams.iter_next_pieces(&lengths).count(), 0);
     }
 
     #[test]

@@ -172,7 +172,11 @@ async fn a_stream_open_across_an_error_and_restart_is_still_seen() -> anyhow::Re
         .context("expected the restarted torrent live")?;
     let metadata = handle.metadata.load_full().context("expected metadata")?;
     anyhow::ensure!(
-        !live.streams.wanted_ranges(metadata.lengths()).is_empty(),
+        !live
+            .shared
+            .streams
+            .wanted_ranges(metadata.lengths())
+            .is_empty(),
         "the restarted torrent does not see the stream that is still open"
     );
     Ok(())

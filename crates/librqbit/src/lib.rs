@@ -57,7 +57,6 @@ pub mod http_api;
 pub mod http_api_client;
 #[cfg(any(feature = "http-api", feature = "http-api-client"))]
 pub mod http_api_types;
-mod http_client;
 mod ip_ranges;
 pub mod limits;
 mod listen;
@@ -84,7 +83,11 @@ mod vectored_traits;
 pub mod watch;
 
 pub use error::{Error, Result};
-pub use http_client::http_client_builder;
+/// The one place that decides what rqbit's HTTPS trusts; it lives in
+/// `librqbit-upnp`, which builds HTTP clients of its own and which this crate
+/// depends on, and follows this crate's `rust-tls` / `default-tls` features
+/// because they are forwarded there.
+pub use librqbit_upnp::http_client_builder;
 
 pub use api::Api;
 pub use api_error::{ApiError, WithStatus, WithStatusError};

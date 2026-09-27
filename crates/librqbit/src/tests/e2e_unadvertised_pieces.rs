@@ -15,13 +15,12 @@ use tokio::{io::AsyncReadExt, time::timeout};
 use tracing::info;
 
 use crate::{
-    AddTorrent, CreateTorrentOptions, ManagedTorrent, ManagedTorrentState, Session, create_torrent,
-    spawn_utils::BlockingSpawner,
+    AddTorrent, ManagedTorrent, ManagedTorrentState, Session,
     tests::test_util::{TestPeerMetadata, setup_test_logging},
     torrent_state::live::peer::stats::snapshot::{PeerStatsFilter, PeerStatsFilterState},
 };
 
-use super::test_util::create_default_random_dir_with_torrents;
+use super::test_util;
 
 const PIECE_LEN: u32 = CHUNK_SIZE;
 const TOTAL_PIECES: u32 = 16;
@@ -42,55 +41,19 @@ async fn seeder_of(
     prefix: &str,
     pieces: u32,
 ) -> anyhow::Result<(TempDir, Vec<u8>, Client, std::net::SocketAddr)> {
-    let files =
-        create_default_random_dir_with_torrents(1, (PIECE_LEN * pieces) as usize, Some(prefix));
-    let torrent = create_torrent(
-        files.path(),
-        CreateTorrentOptions {
-            name: None,
-            piece_length: Some(PIECE_LEN),
-            ..Default::default()
-        },
-        &BlockingSpawner::new(1),
+    let seeder = test_util::seeder(
+        prefix,
+        (PIECE_LEN * pieces) as usize,
+        PIECE_LEN,
+        Default::default(),
     )
     .await?;
-    let torrent_bytes = torrent.as_bytes()?.to_vec();
-
-    let session = Session::new_with_opts(
-        files.path().into(),
-        crate::SessionOptions {
-            dht: None,
-            persistence: None,
-            peer_id: Some(TestPeerMetadata::good().as_peer_id()),
-            listen: Some(crate::listen::ListenerOptions {
-                listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-    )
-    .await
-    .context("error creating seeder session")?;
-
-    let handle = session
-        .add_torrent(
-            AddTorrent::from_bytes(torrent_bytes.clone()),
-            Some(crate::AddTorrentOptions {
-                paused: false,
-                output_folder: Some(files.path().to_str().unwrap().to_owned()),
-                overwrite: true,
-                ..Default::default()
-            }),
-        )
-        .await?
-        .into_handle()
-        .context("expected a handle")?;
-    timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
-
-    let addr = session
-        .listen_addr()
-        .context("expected listen_addr to be set")?;
-    Ok((files, torrent_bytes, (session, handle), addr))
+    Ok((
+        seeder.files,
+        seeder.torrent_bytes,
+        (seeder.session, seeder.handle),
+        seeder.addr,
+    ))
 }
 
 // A session with nothing, that knows one peer and has no other way to find any: no DHT,

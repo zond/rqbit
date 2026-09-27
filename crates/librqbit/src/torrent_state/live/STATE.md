@@ -6,26 +6,41 @@ This document describes the shared state used during live torrent downloading an
 
 ### 1. `PieceTracker` (in `piece_tracker.rs`)
 
-Coordinates piece download state by wrapping `ChunkTracker` and `inflight_pieces`. Lives in `TorrentStateLocked`.
+Coordinates piece download state by wrapping `ChunkTracker` and the in-flight map. Lives in `TorrentStateLocked`.
 
 ```rust
 pub struct PieceTracker {
     chunks: ChunkTracker,
     inflight: HashMap<ValidPieceIndex, InflightPiece>,
+    deadline_pieces: usize,                            // how deep into the lookahead pieces are split
+    completions: VecDeque<Duration>,                   // recent piece times, for median_completion()
+    pool_changed: bool,                                // an ask put shares in a pool; see take_pool_changed()
+    retired: Vec<(ValidPieceIndex, Range<u32>)>,       // finished claims to cancel; see take_retired_claims()
+    writers: HashMap<ValidPieceIndex, Vec<PeerHandle>>, // who wrote into a piece not on disk yet
 }
 
 pub struct InflightPiece {
-    pub peer: PeerHandle,     // Which peer "owns" this piece
-    pub started: Instant,     // When download started (for steal threshold)
+    participants: Vec<Participant>,   // every peer fetching part of it; never empty
+    unclaimed: VecDeque<Range<u32>>,  // claims nobody has taken yet
+    started: Instant,                 // when the first participant started; a steal keeps it
+}
+
+pub struct Participant {
+    pub peer: PeerHandle,
+    pub connection: u64,              // which connection to `peer` holds it
+    pub chunks: Range<u32>,           // the claim: chunk indices within the piece
+    started: Instant,                 // when this participant took the claim
+    last_delivery: Option<Instant>,   // diagnostics only
 }
 ```
 
 Key methods that maintain invariants:
-- `acquire_piece()` - Reserve from queue or steal from slow peer
+- `acquire_piece()` - The lookahead, then the queue, then a steal from a slow peer
+- `acquire_head_share()` - The same over the deadline pieces only
 - `take_inflight()` - Remove from inflight (before hash check)
 - `mark_piece_hash_ok()` - Mark as completed after hash verification
-- `mark_piece_hash_failed()` - Requeue after hash failure
-- `release_pieces_owned_by()` - Release all pieces owned by a dead peer
+- `mark_piece_hash_failed()` - Requeue after hash failure (or a check that could not be read)
+- `release_pieces_owned_by()` - Release one connection's shares (its death, or a choke)
 
 ### 2. `ChunkTracker` (in `chunk_tracker.rs`)
 
@@ -40,19 +55,21 @@ Tracks piece/chunk download progress. Wrapped by `PieceTracker`.
 ### 3. `inflight_requests` (in `LivePeerState`)
 
 ```rust
-HashSet<ChunkInfo>  // aka InflightRequest
+HashMap<ChunkInfo, Instant>  // key aka InflightRequest; value: when it was sent
 
 struct ChunkInfo {
     piece_index: ValidPieceIndex,
     chunk_index: u32,
-    offset: u32,
+    absolute_index: u32,
     size: u32,
+    offset: u32,
 }
 ```
 
 Per-peer tracking of which chunks have been requested from this peer. Used for:
 - Knowing which chunks to expect from peer
 - Detecting unexpected data ("peer sent us a piece we did not ask")
+- Pricing an arrival: the time since its request is the peer's `last_latency`
 - Cleanup when peer dies
 
 ## Piece State Invariant
@@ -71,8 +88,10 @@ These are **disjoint** - a piece is never in multiple states simultaneously. Thi
 ### Chunk-Piece Consistency
 
 If `inflight_requests` contains chunks for piece P, then:
-- `inflight[P].peer` should equal this peer's address
-- OR the piece was just stolen (transient state during steal)
+- this connection holds a claim on P that covers them (`inflight[P].participants`)
+- OR the claim was just taken from it -- a steal, a cut, a choke's handback,
+  the piece completing, a claim retired -- and the Cancels for those
+  requests are on their way (transient)
 
 ## State Transitions
 
@@ -96,7 +115,8 @@ QUEUED → IN_FLIGHT → COMPLETED
 
 ### Split Pieces
 
-The two pieces at the head of a stream's lookahead (`DEADLINE_PIECES`) are
+The pieces at the head of a stream's lookahead -- `deadline_pieces` of them,
+`DEFAULT_DEADLINE_PIECES` (two) unless the embedder sets it -- are
 divided into claims of `CLAIM_CHUNKS`, and several peers hold one each: the
 wire asks for chunks, and `chunk_status` records them globally, so two peers
 filling different chunks of one piece was always safe. Only `inflight` made
@@ -166,7 +186,7 @@ deadline to spend the extra lock round-trips on, and single ownership is
 what lets a failed hash be blamed on the peer that sent it. A split piece
 that fails its hash blames nobody -- see "Failed hash" below.
 
-3. Data arrival (`on_incoming_piece`):
+3. Data arrival (`on_received_piece`):
    - Remove chunk from `inflight_requests`
    - Mark chunk complete in `chunk_status`
    - If all chunks done → verify hash
@@ -206,10 +226,14 @@ IN_FLIGHT (peer A) → IN_FLIGHT (peer B)
 ```
 
 `PieceTracker::acquire_piece()` with steal logic:
-1. Finds piece in `inflight` owned by slow peer (elapsed > threshold × avg_time)
-2. Updates `inflight[p].peer = self`
-3. Updates `inflight[p].started = now`
-4. Returns `AcquireResult::Stolen { piece, from_peer }`
+1. Finds a piece in `inflight` held whole by one participant -- a split
+   piece is never stolen -- that has held it longer than threshold × this
+   peer's average piece time (measured from that participant's `started`)
+2. Replaces that participant with this peer's connection, same claim,
+   `started = now`
+3. Leaves `inflight[p].started` alone: the piece's age is what the reader
+   has waited, and what the takeover rules and the completion median read
+4. Returns `AcquireResult::Stolen { piece, chunks, from_peer }`
 
 Caller then:
 5. Calls `peers.on_steal(from_peer, to_peer, piece)`:
@@ -224,20 +248,28 @@ Caller then:
 ### Peer Death Flow
 
 ```
-IN_FLIGHT → QUEUED (for pieces owned by dead peer)
+IN_FLIGHT → IN_FLIGHT, a share back in the pool (others still on the piece)
+IN_FLIGHT → QUEUED                               (it was the last participant)
 ```
 
-1. `on_peer_died()`:
+1. `on_peer_died()` (and a choke, which hands back the same way):
    - Takes `LivePeerState` (consumes it)
-   - Calls `PieceTracker::release_pieces_owned_by(peer_addr)`
+   - Calls `PieceTracker::release_pieces_owned_by(peer_addr, connection)` --
+     by connection, so a task winding down does not hand back what a fresh
+     dial to the same address has since reserved
 
-2. `release_pieces_owned_by()`:
-   - Removes all entries from `inflight` where `peer == dead_peer_addr`
-   - For each removed piece, calls `chunks.mark_piece_broken_if_not_have(piece)`
-   - This sets `queue_pieces[p] = true` and clears `chunk_status` for piece
-   - Returns count of released pieces
-
-This maintains the invariant: pieces transition cleanly from IN_FLIGHT → QUEUED.
+2. `release_pieces_owned_by()`: the partial release described under "Split
+   Pieces" above.
+   - Each of the connection's participants leaves its piece, and its claim
+     goes back to the unclaimed pool unless another holder is still
+     fetching it or it has all arrived
+   - A piece left with no participant leaves `inflight` and is re-queued:
+     `requeue_piece_keeping_chunks` if any chunk has arrived, so whoever
+     picks it up asks only for what is missing; `mark_piece_broken_if_not_have`
+     (which also clears `chunk_status`) if none has. A dropped piece is
+     wiped either way and not queued, and its writers are forgotten with its
+     chunks
+   - Returns the number of pieces the connection held shares of
 
 ### Checksum Failure Flow
 

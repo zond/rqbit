@@ -430,8 +430,11 @@ async fn forgetting_a_parked_peer_strands_none_of_its_pieces_inner() {
     );
     info!(at_risk, "forgot the peers the cap parked");
 
-    // Wait for those connections to close, seen from the other end, then let the tasks that
-    // owned them finish reporting their death.
+    // Wait for those connections to close, seen from the other end, then for the tasks
+    // that owned them to finish reporting their death: every piece handed back, which is
+    // what a task with no entry left to find must still do. Waited for rather than slept
+    // on -- a death reported in 50 ms passes at once, and a piece stranded for good fails
+    // on the timeout, as it did on the fixed sleep.
     wait_until(
         || match swarm.far_end_live() {
             LOWERED => Ok(()),
@@ -441,13 +444,19 @@ async fn forgetting_a_parked_peer_strands_none_of_its_pieces_inner() {
     )
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    let stranded = swarm.live.ownerless_inflight_pieces();
-    assert!(
-        stranded.is_empty(),
-        "pieces left in flight for peers the table no longer has: {stranded:?}"
-    );
+    wait_until(
+        || {
+            let stranded = swarm.live.ownerless_inflight_pieces();
+            anyhow::ensure!(
+                stranded.is_empty(),
+                "pieces left in flight for peers the table no longer has: {stranded:?}"
+            );
+            Ok(())
+        },
+        WAIT,
+    )
+    .await
+    .unwrap();
 
     swarm.unthrottle();
     swarm.handle.wait_until_completed().await.unwrap();

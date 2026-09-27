@@ -392,39 +392,28 @@ impl LivePeerState {
     }
 
     pub fn cancel_inflight_requests_for_piece(&mut self, piece: ValidPieceIndex) {
-        let tx = &self.tx;
-        let late_cancelled_request_tolerance = &mut self.late_cancelled_request_tolerance;
-        let before = self.inflight_requests.len();
-        self.inflight_requests.retain(|req, _| {
-            if req.piece_index == piece {
-                let _ = tx.send(WriterRequest::Message(Message::Cancel(Request {
-                    index: piece.get(),
-                    begin: req.offset,
-                    length: req.size,
-                })));
-                *late_cancelled_request_tolerance += 1;
-                false
-            } else {
-                true
-            }
-        });
-
-        if self.inflight_requests.len() != before {
-            self.request_slots_changed.notify_waiters();
-        }
+        self.cancel_inflight_requests_where(|req| req.piece_index == piece);
     }
 
     /// Cancel what we have out with this peer for `chunks` of `piece`: a claim it was
     /// retired from with its requests still on the wire (`PieceTracker::take_retired_claims`).
     /// Each is tolerated if it arrives anyway, like any late cancelled chunk.
     pub fn cancel_inflight_requests_in(&mut self, piece: ValidPieceIndex, chunks: &Range<u32>) {
+        self.cancel_inflight_requests_where(|req| {
+            req.piece_index == piece && chunks.contains(&req.chunk_index)
+        });
+    }
+
+    /// Send a Cancel for every request in flight that `cancel` picks, forget it, and
+    /// tolerate it if it arrives anyway, like any late cancelled chunk.
+    fn cancel_inflight_requests_where(&mut self, cancel: impl Fn(&ChunkInfo) -> bool) {
         let tx = &self.tx;
         let late_cancelled_request_tolerance = &mut self.late_cancelled_request_tolerance;
         let before = self.inflight_requests.len();
         self.inflight_requests.retain(|req, _| {
-            if req.piece_index == piece && chunks.contains(&req.chunk_index) {
+            if cancel(req) {
                 let _ = tx.send(WriterRequest::Message(Message::Cancel(Request {
-                    index: piece.get(),
+                    index: req.piece_index.get(),
                     begin: req.offset,
                     length: req.size,
                 })));

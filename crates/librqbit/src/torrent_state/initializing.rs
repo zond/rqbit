@@ -405,7 +405,6 @@ impl TorrentStateInitializing {
             metadata: self.metadata.clone(),
             files: self.files.take()?,
             chunk_tracker,
-            streams: self.shared.streams.clone(),
         };
         Ok(paused)
     }

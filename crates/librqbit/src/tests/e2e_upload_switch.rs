@@ -2,7 +2,7 @@
 //! that can see every piece we have gets none of them and we still download; on again, the
 //! same connection is unchoked and the peer finishes.
 
-use std::{net::Ipv4Addr, num::NonZeroU32, sync::Arc, time::Duration};
+use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
 use librqbit_core::constants::CHUNK_SIZE;
@@ -10,13 +10,9 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 
 use crate::{
-    AddTorrent, CreateTorrentOptions, ManagedTorrent, Session, SessionOptions, create_torrent,
+    AddTorrent, ManagedTorrent, Session, SessionOptions,
     limits::LimitsConfig,
-    listen::ListenerOptions,
-    spawn_utils::BlockingSpawner,
-    tests::test_util::{
-        TestPeerMetadata, create_default_random_dir_with_torrents, setup_test_logging, wait_until,
-    },
+    tests::test_util::{self, TestPeerMetadata, setup_test_logging, wait_until},
     torrent_state::live::peer::stats::snapshot::{PeerStatsFilter, PeerStatsFilterState},
 };
 
@@ -32,52 +28,13 @@ async fn seeder(
     prefix: &str,
     limits: LimitsConfig,
 ) -> anyhow::Result<(TempDir, Vec<u8>, Client, std::net::SocketAddr)> {
-    let files = create_default_random_dir_with_torrents(1, FILE_SIZE, Some(prefix));
-    let torrent_bytes = create_torrent(
-        files.path(),
-        CreateTorrentOptions {
-            name: None,
-            piece_length: Some(PIECE_LEN),
-            ..Default::default()
-        },
-        &BlockingSpawner::new(1),
-    )
-    .await?
-    .as_bytes()?
-    .to_vec();
-    let session = Session::new_with_opts(
-        files.path().into(),
-        SessionOptions {
-            dht: None,
-            persistence: None,
-            peer_id: Some(TestPeerMetadata::good().as_peer_id()),
-            listen: Some(ListenerOptions {
-                listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
-                ..Default::default()
-            }),
-            ratelimits: limits,
-            ..Default::default()
-        },
-    )
-    .await
-    .context("error creating seeder session")?;
-    let handle = session
-        .add_torrent(
-            AddTorrent::from_bytes(torrent_bytes.clone()),
-            Some(crate::AddTorrentOptions {
-                output_folder: Some(files.path().to_str().unwrap().to_owned()),
-                overwrite: true,
-                ..Default::default()
-            }),
-        )
-        .await?
-        .into_handle()
-        .context("expected a handle")?;
-    timeout(WAIT, handle.wait_until_completed()).await??;
-    let addr = session
-        .listen_addr()
-        .context("the seeder is not listening")?;
-    Ok((files, torrent_bytes, (session, handle), addr))
+    let seeder = test_util::seeder(prefix, FILE_SIZE, PIECE_LEN, limits).await?;
+    Ok((
+        seeder.files,
+        seeder.torrent_bytes,
+        (seeder.session, seeder.handle),
+        seeder.addr,
+    ))
 }
 
 // A session with nothing, that knows one peer and has no other way to find any.
@@ -214,7 +171,10 @@ async fn test_e2e_upload_switch_off_at_connect() -> anyhow::Result<()> {
 
 // A connection that is uploading stops when the switch goes off - including what the upload
 // scheduler had already queued for it - and starts again when it comes back on. The seeder's
-// upload is rate limited to about a piece a second so the switch lands mid-transfer.
+// upload is rate limited to about a piece a second so the switch lands mid-transfer, and
+// the limit is lifted before the switch goes back on: what is asserted after that is only
+// that the same connection finishes, and at a piece a second the rest of the torrent was
+// most of this test's run time.
 async fn e2e_upload_switch_off_mid_transfer() -> anyhow::Result<()> {
     setup_test_logging();
     let (_files, torrent_bytes, (seeder_session, seeder), addr) = seeder(
@@ -257,6 +217,7 @@ async fn e2e_upload_switch_off_mid_transfer() -> anyhow::Result<()> {
         "the switch landed after the transfer"
     );
 
+    seeder_session.ratelimits.set_upload_bps(None);
     seeder_session.set_upload_enabled(true);
     wait_for_completion(&leecher).await?;
     assert_eq!(

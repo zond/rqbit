@@ -33,7 +33,6 @@ rust-tls = [
     "sha1w/sha1-ring",
     "librqbit-core/sha1-ring",
     "librqbit-upnp/rust-tls",
-    "dep:webpki-root-certs",
 ]
 storage_middleware = ["lru"]
 storage_examples = []
@@ -79,7 +78,6 @@ itertools.workspace = true
 http.workspace = true
 regex.workspace = true
 reqwest = { workspace = true, features = ["json", "socks", "stream"] }
-webpki-root-certs = { workspace = true, optional = true }
 urlencoding.workspace = true
 byteorder.workspace = true
 bitvec.workspace = true

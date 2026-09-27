@@ -919,9 +919,11 @@ impl ManagedTorrent {
                                     }
 
                                     g.state = ManagedTorrentState::Paused(paused);
-                                    // Upstream releases the handles when a check
-                                    // lands on a torrent that stays paused. Which
-                                    // that is, this fork reads from `g.paused` under
+                                    // The handles are released when a check lands on
+                                    // a torrent that stays paused -- upstream's
+                                    // 193a5bd8, reverted there in d7bfc7b0 and kept
+                                    // here. Which torrent that is, this fork reads
+                                    // from `g.paused` under
                                     // the lock rather than from an argument captured
                                     // before the check (f21c3a3e) -- the same source
                                     // `_start`'s Paused arm reads to decide not to go
@@ -1168,11 +1170,10 @@ impl ManagedTorrent {
     /// with a message saying so, rather than polling forever (f498d4a6, which
     /// also moved `finish_check` under the state lock this loop reads).
     ///
-    /// An earlier attempt at the same bail was reverted because the pair is
-    /// also true while `Session::add_torrent` has published the handle and not
-    /// yet run `start()`: a `pause()` in that window looks the same. Whether
-    /// that window can still fail a wait on a torrent whose check then runs
-    /// normally has not been re-examined since.
+    /// An earlier attempt at the same bail was reverted because a `pause()`
+    /// while `Session::add_torrent` had published the handle and not yet run
+    /// `start()` left the same pair on a check that was about to run. It no
+    /// longer does: only a running check is asked to stop (fb22dddb).
     pub fn wait_until_initialized(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         async move {
             // TODO: rewrite, this polling is horrible
