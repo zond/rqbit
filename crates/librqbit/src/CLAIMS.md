@@ -1,11 +1,9 @@
 # Claims: how a piece a stream waits on is shared between peers
 
-Agreed with zond on 2026-09-14, after the read-pattern retention work and
-three field logs. This is the design `piece_tracker.rs` implements; if the
-code and this file disagree, one of them is wrong and it is probably the
-code. Written down because the previous version of these rules was worked
-out in conversation, rebuilt twice in one day, and the second rebuild made
-the first one's mistake again.
+This is the design `piece_tracker.rs` implements; if the code and this file
+disagree, one of them is wrong and it is probably the code. The rules that
+were tried and dropped are under "What this replaced", so that nobody
+rebuilds them.
 
 ## Three states of a piece
 
@@ -131,9 +129,9 @@ pieces this peer could actually take.
 
 8. **A failed hash on a piece several peers filled accuses nobody.** The
    hash is over the whole piece, so with more than one writer nothing
-   says whose bytes were bad -- and the peer that happened to deliver the
-   last chunk is the one that used to be disconnected for it. The piece
-   is wiped and queued as always, and fetched again from peers that had
+   says whose bytes were bad, least of all the peer that happened to
+   deliver the last chunk. The piece is wiped and queued as always, and
+   fetched again from peers that had
    no part in it (`hash_failure_exclusions`); if no other peer has it,
    the same ones may take it again rather than leave it unfetched. A
    piece with one writer is still that peer's doing, and it goes.
@@ -189,12 +187,11 @@ The request loop waits for whichever comes first, and for nothing else:
   `CLAIMS_PER_PEER`, is what makes a share of a crowded piece its.
 - **The lookahead changes** -- `new_pieces_notify`. Shares handed back by
   a choked or dead peer, a hash failure requeuing a piece, a stream or a
-  selection changing what is wanted, and, since the seventh field log
-  (2026-09-17 14:55), **shares put in a pool**: a piece reserved split at
-  the head, or a whole one cut there (`PieceTracker::take_pool_changed`,
-  pulsed by `acquire_next_piece` once the locks are down). An idle peer
-  with nothing it could join is waiting for exactly that, and nothing
-  else it waits on announced it.
+  selection changing what is wanted, and **shares put in a pool**: a piece
+  reserved split at the head, or a whole one cut there
+  (`PieceTracker::take_pool_changed`, pulsed by `acquire_next_piece` once
+  the locks are down). An idle peer with nothing it could join is waiting
+  for exactly that, and nothing else it waits on announces it.
 - **Time.** Every "only if the asker outpaces" rule -- cut a whole head
   piece, take a share beyond two, join a claim -- is `my_latency < now -
   since`, and the walk knows `since` when it says no. So it keeps the
@@ -204,13 +201,6 @@ The request loop waits for whichever comes first, and for nothing else:
   could ever join. Exact, per peer, one wake at the first useful moment,
   and no timer scanning the claims under the write lock.
 
-Before this, a refused peer slept a flat five seconds unless a chunk of
-its own landed. In the field log of 2026-09-17 14:55 the last claim of
-the tail piece sat with a holder of 6.9 s round trip while a peer of
-489 ms, nine claims of that piece already delivered, was refused at ~400
-ms of the claim's age -- not yet outpacing it -- and, with nothing in
-flight, slept through the moment it would have been let in; the piece
-took 6.5 s from the slow holder. With `retry_at` it asks again at 490 ms.
 
 A backstop of thirty seconds remains, and its firing is logged at `info`
 (`an idle request loop woke on the backstop`): nothing legitimate reaches
@@ -221,6 +211,13 @@ forty seconds off -- wakes early, asks once and goes back to sleep.
 
 ## What this replaced, so nobody rebuilds it
 
+- **A flat five-second sleep** for a refused peer with no chunk of its own
+  landing: in the field log of 2026-09-17 14:55 the last claim of the tail
+  piece sat with a holder of 6.9 s round trip while a peer of 489 ms was
+  refused at ~400 ms of the claim's age -- not yet outpacing it -- and,
+  with nothing in flight, slept through the moment it would have been let
+  in; the piece took 6.5 s from the slow holder. With `retry_at` it asks
+  again at 490 ms.
 - **Blind doubling** (any arriving peer could double any claim with the
   most missing): fetched the whole lookahead twice, 35% of all bytes
   unverified in the field.
@@ -268,7 +265,7 @@ forty seconds off -- wakes early, asks once and goes back to sleep.
 
 Cutting a healthy holder: one window of duplicate tail, but a healthy
 holder is nearly impossible to outpace. Doubling a healthy claim: not
-barred by what it has delivered any more (rule 3), but a healthy holder
+barred by what it has delivered (rule 3), but a healthy holder
 finishes sixteen chunks within one of its round trips, so only a peer
 faster than it can join before the claim is done -- and then the copy
 that lands first is the faster one's. Refusing a fast peer: it waits for
@@ -278,7 +275,7 @@ the thirty-second backstop only when none of those is coming.
 
 ## Status
 
-Built (`a31258c0`, rebuilt on the piece's age since), with the split depth
+Built, on the piece's age as the clock, with the split depth
 the embedder's setting (`set_deadline_pieces`) and the completion median
 beside it. Every rule and every wiring point -- the write path's stamp, the
 `pool_changed` pulse and the `retry_at` sleep among them -- is proven by a

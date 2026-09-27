@@ -2,10 +2,8 @@
 //!
 //! Its tasks are cancelled by a guard the session itself holds, so anything
 //! holding the session strongly while it waits keeps every one of those
-//! tasks running after the owner has let go. The download end-to-end tests
-//! saw exactly that as a flake: servers dialling each other kept each
-//! other's sessions alive through their listeners' handshake checks, and
-//! the test found dozens of tasks still running after it ended.
+//! tasks running after the owner has let go: sessions dialling each other
+//! would keep each other alive through their listeners' handshake checks.
 
 use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 
@@ -51,8 +49,8 @@ async fn a_silent_incoming_connection_does_not_keep_a_dropped_session_alive() {
 
     // Connects and says nothing, so the listener's check of it waits. The check takes a
     // handle on the session when it starts -- a weak one, which is the point -- so the
-    // session's handle count rising is the check having started, where a fixed sleep only
-    // guessed at it and could pass without the check ever running.
+    // session's handle count rising is the check having started, which a fixed sleep
+    // could only guess at, and could pass without the check ever running.
     let handles = |s: &Arc<Session>| Arc::strong_count(s) + Arc::weak_count(s);
     let before = handles(&session);
     let silent = TcpStream::connect(addr).await.unwrap();
@@ -83,7 +81,7 @@ async fn a_silent_incoming_connection_does_not_keep_a_dropped_session_alive() {
     drop(silent);
 }
 
-/// review #6. A torrent at its peer cap with addresses still to dial is the
+/// A torrent at its peer cap with addresses still to dial is the
 /// ordinary state of a swarm, and its peer adder waits for a slot for as
 /// long as that lasts. It must not hold the session while it does.
 #[tokio::test(flavor = "multi_thread")]

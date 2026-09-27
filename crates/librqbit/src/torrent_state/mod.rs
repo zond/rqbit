@@ -233,9 +233,9 @@ pub struct ManagedTorrentShared {
     /// The open streams of this torrent. Here, and not only on the paused and live
     /// states, because a `FileStream` keeps the one it registered in for as long as it
     /// is open, across every change of state -- including an error and the restart
-    /// after it, which build their states from scratch. A fresh set there left an open
-    /// stream in a set nobody looked at: its reader was never woken by a completed
-    /// piece, and `drop_pieces` could not see where it was reading.
+    /// after it, which build their states from scratch. A fresh set there would leave an
+    /// open stream in a set nobody looks at: its reader is never woken by a completed
+    /// piece, and `drop_pieces` cannot see where it is reading.
     pub(crate) streams: Arc<streaming::TorrentStreams>,
 
     // "dn" from magnet link
@@ -273,7 +273,7 @@ pub const DEFAULT_STARVING_PEER_FLOOR: usize = 4;
 /// The flat wait before a proven peer of a starving torrent is dialled again. Sixty
 /// seconds is what libtorrent waits before any reconnect (`min_reconnect_time`) and is
 /// not considered aggressive; the ordinary schedule's third step is six minutes and its
-/// fourth thirty-six, which is the silence this replaces.
+/// fourth thirty-six.
 pub const DEFAULT_STARVING_RETRY: Duration = Duration::from_secs(60);
 
 pub struct ManagedTorrent {
@@ -816,8 +816,8 @@ impl ManagedTorrent {
     /// For `Session::add_torrent`, which records the intent on the torrent it builds and
     /// only then publishes it and starts it. Between those two the handle is reachable
     /// through the session -- the persistence store is awaited in there -- so a `pause`
-    /// can land, and a start that wrote its own captured intent overwrote it: the caller
-    /// got Ok from a pause that did nothing and the torrent ran.
+    /// can land, and a start that wrote its own captured intent would overwrite it: the
+    /// caller would get Ok from a pause that did nothing, and the torrent would run.
     pub(crate) fn start_as_intended(
         self: &Arc<Self>,
         peer_rx: Option<PeerStream>,
@@ -856,7 +856,7 @@ impl ManagedTorrent {
                     // A check is already running; the intent this call
                     // recorded is what its continuation will land on, since
                     // that reads `g.paused` rather than an argument captured
-                    // a check ago (f21c3a3e). So both `pause` and `unpause`
+                    // a check ago. So both `pause` and `unpause`
                     // during a check are honoured by doing nothing here --
                     // except for the peer stream, which is this call's to
                     // hand over and the continuation's to use.
@@ -875,9 +875,9 @@ impl ManagedTorrent {
                     let token = token.clone();
                     // The session is held weakly across the waits below -- the queue of
                     // checks and the whole hash check, minutes on a large torrent. A
-                    // session stops when its owner drops it, and held here it lived on
-                    // with every one of its tasks, and the torrent went live under a
-                    // session nobody owned.
+                    // session stops when its owner drops it; held strongly here it would
+                    // live on with every one of its tasks, and the torrent would go live
+                    // under a session nobody owns.
                     let concurrent_init_semaphore = session.concurrent_initialize_semaphore.clone();
                     let session = Arc::downgrade(&session);
 
@@ -920,14 +920,12 @@ impl ManagedTorrent {
 
                                     g.state = ManagedTorrentState::Paused(paused);
                                     // The handles are released when a check lands on
-                                    // a torrent that stays paused -- upstream's
-                                    // 193a5bd8, reverted there in d7bfc7b0 and kept
-                                    // here. Which torrent that is, this fork reads
-                                    // from `g.paused` under
-                                    // the lock rather than from an argument captured
-                                    // before the check (f21c3a3e) -- the same source
-                                    // `_start`'s Paused arm reads to decide not to go
-                                    // live.
+                                    // a torrent that stays paused (the fork README,
+                                    // "Pauses release file handles"). Which torrent
+                                    // that is is read from `g.paused` under the lock
+                                    // rather than from an argument captured before
+                                    // the check -- the same source `_start`'s Paused
+                                    // arm reads to decide not to go live.
                                     if g.paused
                                         && let ManagedTorrentState::Paused(paused) = &g.state
                                         && let Err(error) = paused.files.release_files()
@@ -1073,8 +1071,8 @@ impl ManagedTorrent {
                 // as "a check stopped for good and only an unpause runs another"
                 // (`wait_until_initialized`). Set on a torrent whose check has not
                 // started -- a pause between `add_torrent` publishing the handle and
-                // starting it -- it made a waiter give up on a check that was about to
-                // run. `start` clears it either way; what it lands in is `g.paused`.
+                // starting it -- it would make a waiter give up on a check that is about
+                // to run. `start` clears it either way; what it lands in is `g.paused`.
                 if init.is_check_running() {
                     init.request_pause();
                 }
@@ -1167,13 +1165,9 @@ impl ManagedTorrent {
     /// bails, and the torrent is left `Initializing` with `check_running ==
     /// false`. Nothing moves that state on its own -- only an unpause starts a
     /// new check -- so the loop below recognises that pair and fails the wait
-    /// with a message saying so, rather than polling forever (f498d4a6, which
-    /// also moved `finish_check` under the state lock this loop reads).
-    ///
-    /// An earlier attempt at the same bail was reverted because a `pause()`
-    /// while `Session::add_torrent` had published the handle and not yet run
-    /// `start()` left the same pair on a check that was about to run. It no
-    /// longer does: only a running check is asked to stop (fb22dddb).
+    /// with a message saying so, rather than polling forever. `finish_check`
+    /// runs under the state lock this loop reads, and only a running check is
+    /// asked to stop, so the pair never stands for a check that is about to run.
     pub fn wait_until_initialized(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         async move {
             // TODO: rewrite, this polling is horrible

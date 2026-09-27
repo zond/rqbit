@@ -1434,17 +1434,15 @@ impl PieceTracker {
         }
         for piece in abandoned {
             self.inflight.remove(&piece);
-            // **An empty participant list is not an empty piece.** It was
-            // once: every peer on a piece stayed listed until it left, so
-            // the list emptying meant nothing had been delivered by anyone
-            // and the wipe was free. Claims retire from the list now -- a
-            // connection's fully-delivered shares go when it comes back for
-            // more -- so the list can empty over a piece that is most of
-            // the way to disk, and the last live holder merely being choked
-            // is enough to reach here. Wiping then throws away every chunk
-            // every other peer delivered, all of it already paid for, up to
-            // a whole piece an event; and it is a *choke*, not a death, so
-            // the same peers are still there to be asked for it again.
+            // **An empty participant list is not an empty piece.** Claims
+            // retire from the list -- a connection's fully-delivered shares
+            // go when it comes back for more -- so the list can empty over a
+            // piece that is most of the way to disk, and the last live
+            // holder merely being choked is enough to reach here. Wiping then
+            // throws away every chunk every other peer delivered, all of it
+            // already paid for, up to a whole piece an event; and it is a
+            // *choke*, not a death, so the same peers are still there to be
+            // asked for it again.
             //
             // The piece is re-queued either way. What it keeps is the work:
             // requests are filtered against `chunk_status`
@@ -2294,9 +2292,9 @@ mod tests {
     /// whatever it has delivered.**
     ///
     /// The one rule: the asker's last chunk took less time than the piece
-    /// has been in flight. A first version refused any claim with a chunk
-    /// on disk as "being fetched", and the field's 24- and 30-second
-    /// blocked reads were slow holders nobody was allowed to rescue.
+    /// has been in flight. Refusing any claim with a chunk on disk as
+    /// "being fetched" leaves slow holders nobody may rescue: the field's
+    /// 24- and 30-second blocked reads.
     #[test]
     fn a_claim_on_an_old_piece_is_doubled_whatever_it_has_delivered() {
         let (mut tracker, file_infos, priorities) = make_split_tracker(4);
@@ -3439,11 +3437,11 @@ mod tests {
         );
     }
 
-    /// **A cut pools only the claims still missing something** (review
-    /// #30). A piece handed out again keeps the chunks earlier peers left,
-    /// so a claim past the one its holder is delivering into can be on
-    /// disk already; the peer that cuts takes the next claim with work in
-    /// it, not that one.
+    /// **A cut pools only the claims still missing something.** A piece
+    /// handed out again keeps the chunks earlier peers left, so a claim
+    /// past the one its holder is delivering into can be on disk already;
+    /// the peer that cuts takes the next claim with work in it, not that
+    /// one.
     #[test]
     fn a_cut_does_not_pool_a_claim_already_on_disk() {
         let (mut tracker, file_infos, priorities) = make_split_tracker(6);

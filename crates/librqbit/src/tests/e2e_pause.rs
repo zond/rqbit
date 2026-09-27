@@ -202,10 +202,9 @@ async fn pause_stops_fetching_and_unpause_keeps_the_have_set_inner() {
         progress_paused,
         "a paused torrent fetches nothing"
     );
-    // Pausing a paused torrent used to be an error. Upstream's 193a5bd8 made it
-    // succeed instead, because the call now has work to do whatever the state: it
-    // gives the file handles back, and a torrent that was paused before that landed --
-    // restored from persistence, say -- is still holding them.
+    // Pausing a paused torrent succeeds, because the call has work to do whatever the
+    // state: it gives the file handles back, and a torrent that is already paused --
+    // restored from persistence, say -- may still be holding them.
     client.pause(handle).await.unwrap();
     assert!(handle.is_paused(), "and it is still paused afterwards");
     info!(progress_paused, "paused");
@@ -349,17 +348,15 @@ async fn a_pause_during_a_hash_check_does_not_strand_the_piece() {
 ///
 /// From the last chunk landing to the have-bit, a piece is in none of the tracker's sets:
 /// every chunk is marked, `take_inflight` has taken it out of the in-flight map so that
-/// nobody steals it mid-check, and it is not have yet. A pause right there used to carry
-/// it into the paused tracker like that, and after the unpause nothing ever asked for it
-/// again -- the picker skips a fully-downloaded piece because one is being checked, and
-/// the check that was died with the old live state. The download carried on around the
-/// hole and never finished: `pause_stops_fetching_and_unpause_keeps_the_have_set` hung in
-/// `wait_until_completed` on CI (run 34900118835, 2026-09-14) until its 180 s timeout,
-/// after its resume check had already passed. The window there is a few milliseconds --
-/// the seeder's first burst completes two pieces at once, and the test pauses on seeing
-/// the first -- so this test holds the check open instead: the storage's commit, which
-/// runs after the hash check and before the have-bit, blocks on the first piece until
-/// the pause is done.
+/// nobody steals it mid-check, and it is not have yet. A pause right there must not carry
+/// it into the paused tracker like that: after the unpause nothing would ask for it again
+/// -- the picker skips a fully-downloaded piece because one is being checked, and the
+/// check that was is gone with the old live state -- and the download would carry on
+/// around the hole and never finish. The window is a few milliseconds in
+/// `pause_stops_fetching_and_unpause_keeps_the_have_set` -- the seeder's first burst
+/// completes two pieces at once, and that test pauses on seeing the first -- so this test
+/// holds the check open instead: the storage's commit, which runs after the hash check
+/// and before the have-bit, blocks on the first piece until the pause is done.
 async fn a_pause_during_a_hash_check_does_not_strand_the_piece_inner() {
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -373,9 +370,8 @@ async fn a_pause_during_a_hash_check_does_not_strand_the_piece_inner() {
     let (client, handle) = (&t.client, &t.handle);
 
     // The first piece to pass its hash check is stuck in the commit that follows it --
-    // and with it the only connection, whose reader is the one doing the check, which is
-    // the shape of the CI run too: a pause arriving while the seeder's connection is
-    // inside a check.
+    // and with it the only connection, whose reader is the one doing the check: a pause
+    // arriving while the seeder's connection is inside a check.
     let held = tokio::time::timeout(WAIT, entered_rx)
         .await
         .expect("a piece reaches its commit")

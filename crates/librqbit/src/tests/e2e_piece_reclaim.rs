@@ -577,11 +577,10 @@ impl crate::storage::TorrentStorage for ReleasingStorage {
 
 // What survives a restart is the have-set, and the storage decides that. The want-set
 // doesn't, and can't be read off the storage: a piece the caller released and a piece it
-// never downloaded are the same hole. So a restored torrent wants every hole - and used to
-// come back without piece_reclaim at all, and with drop_pieces() refusing pieces we don't
-// have, so nothing could be done about it: every relaunch refilled the disk that reclaim
-// was keeping small. Now the flag is persisted, and the caller re-applies its want-set on
-// the restored torrent while it is still paused, so no peer gets a chance to fill a hole.
+// never downloaded are the same hole. So a restored torrent wants every hole. The flag is
+// persisted, drop_pieces() takes pieces we don't have, and the caller re-applies its
+// want-set on the restored torrent while it is still paused, so no peer gets a chance to
+// fill a hole and a relaunch does not refill the disk that reclaim keeps small.
 //
 // Paused is not the record's choice to make. The torrent here is live when the process
 // dies - a kill, a crash, the ENOSPC that ended the torrent - and its record says so; a
@@ -723,10 +722,10 @@ async fn test_e2e_piece_reclaim_want_set_is_reapplied_after_a_restart() -> anyho
 
 // When the torrent finishes under an open stream, the peers that have all of it are sent
 // away (there is nothing left to want from them). Dropping pieces keeps the torrent
-// finished, so nothing brings them back when that same stream then seeks into the dropped
-// range: the read parked forever. A stream opened after the drop was fine - creating one
-// reconnects peers when its file is unfinished - and so is a reselect; it is the long-lived
-// reader that seeks, exactly what a player does, that hung. A parked read now asks for the
+// finished, so nothing else brings them back when that same stream then seeks into the
+// dropped range. A stream opened after the drop is fine - creating one reconnects peers
+// when its file is unfinished - and so is a reselect; it is the long-lived reader that
+// seeks, exactly what a player does, that would park forever. A parked read asks for the
 // peers back itself.
 async fn e2e_piece_reclaim_seek_back_after_finishing() -> anyhow::Result<()> {
     setup_test_logging();
@@ -774,7 +773,7 @@ async fn e2e_piece_reclaim_seek_back_after_finishing() -> anyhow::Result<()> {
     release(&storage, &handle, DROP)?;
     assert!(handle.stats().finished);
 
-    // The player seeks back to the start and reads. Without the fix this parks forever.
+    // The player seeks back to the start and reads.
     Pin::new(&mut stream).start_seek(SeekFrom::Start(0))?;
     let mut piece = vec![0u8; PIECE_LEN as usize];
     timeout(Duration::from_secs(30), stream.read_exact(&mut piece))
@@ -849,10 +848,10 @@ async fn windowed_client(
 
 // A caller keeping a bounded window drops what is outside it before it arrives, and
 // wants it again as the window moves. The moment the window is in, the torrent wants
-// nothing - and has half of its file. It used to call that finished and hang up on the
-// seeder it was downloading from, as a finished torrent does, so the reselect that moved
-// the window had to dial it all over again: a connect, a handshake and a bitfield per
-// window, with no stream open to keep the seeder around.
+// nothing - and has half of its file. That is not finished: a finished torrent hangs up
+// on the seeder it was downloading from, and the reselect that moves the window would
+// have to dial it all over again, a connect, a handshake and a bitfield per window, with
+// no stream open to keep the seeder around.
 async fn e2e_piece_reclaim_a_full_window_keeps_its_seeder() -> anyhow::Result<()> {
     setup_test_logging();
     let (files, torrent_bytes, _server_session, peer) =
@@ -869,8 +868,9 @@ async fn e2e_piece_reclaim_a_full_window_keeps_its_seeder() -> anyhow::Result<()
     // Two things hang up on a seeder once the torrent is finished: the piece that finishes
     // it, at once, and the seeder's own request loop at the top of its next round - which
     // comes as soon as the last chunk it asked for lands, since a loop with nothing to ask
-    // for waits on exactly that. Neither is on a timer, so a second is ample: with the old
-    // notion of finished put back into the loop's check, this catches the hang-up at once.
+    // for waits on exactly that. Neither is on a timer, so a second is ample: with
+    // wanting nothing counted as finished in the loop's check, this catches the hang-up
+    // at once.
     let deadline = Instant::now() + Duration::from_secs(1);
     while Instant::now() < deadline {
         assert_eq!(
@@ -913,7 +913,7 @@ async fn test_e2e_piece_reclaim_a_full_window_keeps_its_seeder() -> anyhow::Resu
 
 // A stream that seeks out of the window, into a piece that was dropped. The stream pulls
 // it in through its priority window, which is not the queue, and the seeder's request loop
-// found nothing to ask for when the window filled: it waits for the lookahead to change,
+// finds nothing to ask for when the window fills: it waits for the lookahead to change,
 // or its thirty-second backstop. Nothing queues a dropped piece, and a seek announces
 // nothing, so unless the read wakes it the read waits out the backstop.
 async fn e2e_piece_reclaim_a_seek_out_of_the_window_wakes_the_seeder() -> anyhow::Result<()> {
@@ -964,8 +964,8 @@ async fn test_e2e_piece_reclaim_a_seek_out_of_the_window_wakes_the_seeder() -> a
 
 // A stream parked on a piece whose storage a claim is still releasing. The seeder's
 // request loop passes over a piece under a claim, finds nothing else, and goes to sleep.
-// The release is what makes the piece available, and it woke the peers only for pieces it
-// put back in the queue - which a dropped piece is not, so the read waited out the
+// The release is what makes the piece available, and it has to wake the peers for it
+// although a dropped piece is not put back in the queue, or the read waits out the
 // request loop's backstop.
 async fn e2e_piece_reclaim_a_release_under_a_parked_read_wakes_the_seeder() -> anyhow::Result<()> {
     setup_test_logging();
@@ -1167,11 +1167,11 @@ impl crate::storage::TorrentStorage for RefusingCommitStorage {
 }
 
 // on_piece_completed() is the storage's word that the piece is there to stay, and a
-// storage that stages pieces gives it by moving the piece into place. It used to be asked
-// after the have-bit was set, and a refusal was logged at debug and ignored: the torrent
-// finished, advertised every piece and served them, over bytes has_piece() said it didn't
-// have. A refused commit is a disk failure like a failed write, and ends the torrent the
-// same way, before the piece is anyone's.
+// storage that stages pieces gives it by moving the piece into place. It is asked before
+// the have-bit is set. A refused commit is a disk failure like a failed write, and ends
+// the torrent the same way, before the piece is anyone's; ignored, the torrent would
+// finish, advertise every piece and serve them over bytes has_piece() says it doesn't
+// have.
 async fn e2e_refused_commit_is_fatal() -> anyhow::Result<()> {
     setup_test_logging();
     let (_files, torrent_bytes, _server_session, peer) =
@@ -1291,8 +1291,7 @@ async fn e2e_piece_reclaim_resume_data_is_intersected_with_storage() -> anyhow::
     // Polled until it says every piece. wait_until_completed answers from the have-set,
     // which the last piece joins a moment before its completion flushes the file, so a
     // read straight after it can miss that piece -- and the restart below then rightly
-    // does not have it, which failed this test on the macOS runner (piece 8, the last to
-    // finish there).
+    // does not have it.
     let mut on_disk = None;
     for _ in 0..100 {
         let bitv = std::fs::read_dir(&persistence_folder)?
@@ -1425,9 +1424,7 @@ fn release(
 // is off by default - rqbit, the desktop app and a Session::new_with_opts that leaves it
 // alone all do a full check at startup. So this is the path every shipped default takes,
 // and it has to reach the same have-set: the full check asks the storage about each piece
-// before reading it. It didn't, and a read of a released piece failed the way a missing
-// file does, which wrote off every later piece of the file: one hole, and the rest of the
-// film is downloaded again on every relaunch.
+// before reading it, so a released piece is one hole and not a read error.
 async fn e2e_piece_reclaim_full_check_asks_the_storage() -> anyhow::Result<()> {
     setup_test_logging();
     let (files, torrent_bytes, _server_session, peer) =

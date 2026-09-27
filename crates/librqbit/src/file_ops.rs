@@ -139,7 +139,7 @@ impl<'a> FileOps<'a> {
             // that answer is the have-set: not the bytes, which may still be there after a
             // release, and not a read error, which is per file below and would write off
             // every later piece of the file over one hole. The default says yes, so a
-            // storage that can't lose a piece is checked the way it always was.
+            // storage that can't lose a piece is checked by reading alone.
             let storage_has_piece =
                 self.files
                     .has_piece(piece_info.piece_index)
@@ -188,14 +188,14 @@ impl<'a> FileOps<'a> {
                         "error reading from file {} ({:?}) at {}: {:#}",
                         current_file.index, current_file.fi.relative_filename, pos, &err
                     );
-                    // This piece only. A read error used to latch on the file and
-                    // skip every later piece of it without a read, which is right for a
+                    // This piece only. Latching a read error on the file would skip
+                    // every later piece of it without a read, which is right for a
                     // file that is not there and catastrophic for one blip: a single
                     // transient failure -- an antivirus holding a freshly written file
-                    // on Windows, a momentary I/O error -- silently wrote off a whole
-                    // film, with nothing above `debug!` to say so and nothing that ever
-                    // re-checks. The cost of dropping it is one failed read per piece of
-                    // a genuinely unreadable file, which is a syscall that fails fast.
+                    // on Windows, a momentary I/O error -- would silently write off a
+                    // whole film, with nothing above `debug!` to say so and nothing that
+                    // ever re-checks. The cost is one failed read per piece of a
+                    // genuinely unreadable file, which is a syscall that fails fast.
                     some_files_broken = true;
                 }
             }
@@ -395,9 +395,9 @@ impl<'a> FileOps<'a> {
                         )
                     })?;
                 // A short count is a chunk partly on disk, reported as written. Left to
-                // a debug assertion it passed silently in release: the piece failed its
-                // hash, was fetched again, and nothing said why -- on a full disk, which
-                // is how a vectored write comes back short, again and again.
+                // a debug assertion it would pass silently in release: the piece fails
+                // its hash, is fetched again, and nothing says why -- on a full disk,
+                // which is how a vectored write comes back short, again and again.
                 anyhow::ensure!(
                     written == to_write,
                     "short write to file {file_idx} (\"{:?}\"): {written} of {to_write} bytes",
@@ -610,7 +610,7 @@ mod tests {
         }
     }
 
-    // review #41: a write the storage reports as short is an error, not a chunk written.
+    // A write the storage reports as short is an error, not a chunk written.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_a_short_write_is_an_error() {
         let (metadata, _bytes) = torrent().await;
@@ -683,9 +683,9 @@ mod tests {
         let whole = HoleyStorage::new(bytes.clone(), [], false);
         assert_eq!(initial_check(&metadata, &whole).unwrap(), all);
 
-        // One released piece whose bytes are gone. A read of it fails, and a read error
-        // used to write the whole file off from there on - every later piece marked
-        // needed without a read. The hole is what the storage says it is: one piece.
+        // One released piece whose bytes are gone. A read of it fails, and that must not
+        // write the rest of the file off: the hole is what the storage says it is, one
+        // piece.
         let hole = HoleyStorage::new(bytes.clone(), [3], false);
         assert_eq!(
             initial_check(&metadata, &hole).unwrap(),
@@ -713,12 +713,9 @@ mod tests {
             vec![0, 1, 2, 4, 6, 7]
         );
 
-        // **One read that fails is one piece, not the rest of the file.** The read
-        // error used to latch on the file and skip every later piece of it without a
-        // read at all, so a single transient failure -- an antivirus holding a freshly
-        // written file, a momentary I/O error -- wrote off a whole film silently, with
-        // nothing above `debug!` to say so and nothing that ever re-checks it. Here the
-        // storage holds every piece and fails to read exactly one.
+        // **One read that fails is one piece, not the rest of the file** (see "This
+        // piece only" in `FileOps::initial_check`). Here the storage holds every piece
+        // and fails to read exactly one.
         let blip = HoleyStorage::new(bytes.clone(), [], false).with_unreadable([2]);
         assert_eq!(
             initial_check(&metadata, &blip).unwrap(),

@@ -120,11 +120,8 @@ async fn test_e2e_stream() -> anyhow::Result<()> {
     timeout(Duration::from_secs(10), e2e_stream()).await?
 }
 
-/// review #39. A stream open across an error and the restart after it is
-/// still one the torrent knows about: the restart used to build its states
-/// with a fresh set of streams, and the open stream stayed registered in
-/// the old one, where no completed piece woke it and `drop_pieces` could not
-/// see where it was reading.
+/// A stream open across an error and the restart after it is still one the
+/// torrent knows about; see `ManagedTorrentShared::streams`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stream_open_across_an_error_and_restart_is_still_seen() -> anyhow::Result<()> {
     setup_test_logging();

@@ -195,9 +195,9 @@ impl OpenedFile {
 
     /// Open again what [`OpenedFile::close`] gave back.
     ///
-    /// This fork closes a paused torrent's files (`TorrentStorage::release_files`,
-    /// upstream's 193a5bd8, which upstream has since reverted in d7bfc7b0 and this fork
-    /// keeps), and nothing else reopens them: an unpause goes straight from
+    /// This fork closes a paused torrent's files (`TorrentStorage::release_files`; see
+    /// the fork README, "Pauses release file handles"), and nothing else reopens them:
+    /// an unpause goes straight from
     /// `TorrentStatePaused` to live on the same storage object, and `init()` -- the only
     /// thing that ever opened these -- is not run again. Without this the first read or
     /// write after an unpause fails with [`Error::FsFileIsNone`] and the torrent never
@@ -335,8 +335,7 @@ mod tests {
     // Unix only, and not because the code under test is: writing at this offset leaves a
     // 2 GiB hole, which is free where files are sparse by default and is not on NTFS,
     // where Windows zero-fills it -- six files of it, more than a CI runner has room or
-    // time for. It timed out an unrelated e2e download on the Windows runner of PR #661
-    // before it was gated. Windows takes the seek_write path below, whose offset is a
+    // time for. Windows takes the seek_write path below, whose offset is a
     // u64 with no such boundary, so there is nothing there for this test to find.
     #[cfg(unix)]
     #[test]

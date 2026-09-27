@@ -119,13 +119,13 @@ The pieces at the head of a stream's lookahead -- `deadline_pieces` of them,
 `DEFAULT_DEADLINE_PIECES` (two) unless the embedder sets it -- are
 divided into claims of `CLAIM_CHUNKS`, and several peers hold one each: the
 wire asks for chunks, and `chunk_status` records them globally, so two peers
-filling different chunks of one piece was always safe. Only `inflight` made
-it exclusive. Every deeper piece is reserved whole to one peer, as before,
-and a whole piece the stream reaches is cut at the head (`split_whole`).
+filling different chunks of one piece is safe; only `inflight` decides who
+may. Every deeper piece is reserved whole to one peer, and a whole piece the
+stream reaches is cut at the head (`split_whole`).
 Who may take over whose work -- cutting, doubling, taking a share beyond
 `CLAIMS_PER_PEER` -- is one comparison, written up in `CLAIMS.md`.
 
-This changes three of the invariants below:
+What splitting changes in the invariants:
 
 - **A piece may have several peers.** `inflight[p]` holds a list of
   participants, and a peer is disqualified from writing to a piece by having
@@ -152,11 +152,9 @@ This changes three of the invariants below:
   from `participants` when its own holder next asks for work -- and
   whatever that holder still has out for it (it lost a duplicate race) is
   cancelled then (`take_retired_claims`), since nothing can find those
-  requests once the claim is gone. Ranking on
-  `started` over a list nothing retired from meant "outstanding longest"
-  named a claim that had landed minutes ago, and every free peer was sent
-  to fetch it again -- which is also what put several peers on one piece's
-  writes at the tail of every split piece.
+  requests once the claim is gone. Without the retirement, ranking on
+  `started` would name a claim that landed minutes ago "outstanding
+  longest", and send every free peer to fetch it again.
 - **The second copy goes to a claim whose newest holder the asker
   outpaces.** `stalled_claim()` considers any claim still missing
   something, whatever it has delivered, where the asker's last chunk took
@@ -173,11 +171,10 @@ This changes three of the invariants below:
   therefore a wait since the last delivery, not since the hand-out). The
   whole of it is written up in `CLAIMS.md`.
 - **A piece with several writers needs a real lock.** `per_piece_locks[p]`
-  is taken **exclusively** by a chunk write, and before the state lock. A
-  read lock was exclusion enough while one peer owned a piece; with several,
-  it is the only thing between one peer's chunk and another peer finishing
-  the piece and handing it to the storage as complete. See "Piece
-  completion" below.
+  is taken **exclusively** by a chunk write, and before the state lock.
+  With several writers it is the only thing between one peer's chunk and
+  another peer finishing the piece and handing it to the storage as
+  complete. See "Piece completion" below.
 - **A split piece is never stolen.** There is no single owner to take it
   from, and it already has the parallelism a steal would buy.
 
@@ -286,8 +283,7 @@ IN_FLIGHT → QUEUED
 the write path stamped through `note_delivery`, across re-queues, since
 the piece was last empty.
 
-- **One writer**: it sent the bytes, and it is disconnected as it always
-  was.
+- **One writer**: it sent the bytes, and it is disconnected.
 - **More than one**: nothing can say whose bytes were bad, so nobody is
   disconnected and nobody is written off. The writers go into
   `TorrentStateLive::hash_failure_exclusions`, and while any other peer

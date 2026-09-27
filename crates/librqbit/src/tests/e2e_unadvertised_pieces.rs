@@ -351,7 +351,7 @@ async fn test_e2e_unadvertised_pieces_come_back_in_bulk() -> anyhow::Result<()> 
 }
 
 // The default path, which is every torrent that never calls set_pieces_advertised: a peer
-// sees the have-set, whole, exactly as it did before any of this existed.
+// sees the have-set, whole.
 async fn e2e_unadvertised_pieces_default_is_unchanged() -> anyhow::Result<()> {
     setup_test_logging();
     let (files, torrent_bytes, (_seeder_session, seeder), addr) =
@@ -537,9 +537,8 @@ async fn e2e_unadvertised_pieces_completing_while_held_back() -> anyhow::Result<
     // Either the watcher now sees the middle as a seeder, or it has already
     // fetched the lot and the two have parted as finished peers do: a
     // request loop woken by the Haves it was waiting on downloads sixteen
-    // small pieces over loopback faster than this polls, and used to sit on
-    // a five-second timer instead. Both mean the Haves arrived; the counters
-    // below say on which connection.
+    // small pieces over loopback faster than this polls. Both mean the Haves
+    // arrived; the counters below say on which connection.
     timeout(Duration::from_secs(30), async {
         loop {
             if live_peers(&watcher)?.1 == 1 || have_pieces(&watcher)?.len() == TOTAL_PIECES as usize

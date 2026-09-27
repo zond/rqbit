@@ -3107,14 +3107,8 @@ impl PeerHandler {
     }
 
     /// The chunks of this peer's share of `piece` to ask for: **only the
-    /// ones that are not already on disk.** One claim may have several
-    /// holders -- which is what rescues a piece from a peer that has
-    /// stalled on it -- and the losers of that race are cancelled only when
-    /// the whole piece completes, so without this a holder re-requests
-    /// every chunk of the claim while the winner is delivering them. The
-    /// bytes arrive, are counted into `fetched_bytes`, and are dropped at
-    /// the write as `PreviouslyCompleted`: 210 MB of 592 MB fetched in the
-    /// field log of 2026-09-14.
+    /// ones that are not already on disk** -- see
+    /// `ChunkTracker::chunks_to_request` for what re-requesting them costs.
     ///
     /// The first reading, when the share is handed out; the request loop
     /// asks again before each chunk goes out (`still_to_request`), since a
@@ -3990,11 +3984,10 @@ mod connection_tests {
         Ok(())
     }
 
-    /// **A choke hands back a share nothing was requested for yet.** review
-    /// #31: the handback ran only when the choke discarded requests, so a
+    /// **A choke hands back a share nothing was requested for yet.** A
     /// choke landing between a share being handed to the request loop and
-    /// its first request going out left the piece reserved to a peer that
-    /// was not sending.
+    /// its first request going out discards no requests, and must still
+    /// not leave the piece reserved to a peer that is not sending.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_choke_hands_back_a_share_with_nothing_in_flight() -> anyhow::Result<()> {
         setup_test_logging();
@@ -4340,8 +4333,8 @@ mod connection_tests {
     /// those requests are cancelled, its slots freed and its inflight set
     /// cleared, or the loser sits on a claim's worth of requests until the
     /// seeder answers them -- bytes counted into `fetched_bytes` and dropped
-    /// at `PreviouslyCompleted`, which was the second half of the field's
-    /// 210 MB of 592 MB.
+    /// at `PreviouslyCompleted`: the other half of the 210 MB of 592 MB
+    /// that `ChunkTracker::chunks_to_request` cites.
     #[tokio::test(flavor = "multi_thread")]
     async fn completing_a_piece_cancels_the_other_holders_requests() -> anyhow::Result<()> {
         setup_test_logging();
@@ -5132,13 +5125,7 @@ mod connection_tests {
     /// **A peer asks for the gaps in its claim, not for the claim.**
     ///
     /// The wiring of `ChunkTracker::chunks_to_request` into the request
-    /// loop, which is where the field's bandwidth went. Two peers may hold
-    /// one claim -- that is what rescues a piece from a peer that has
-    /// stalled on it -- and the loser is cancelled only when the whole
-    /// piece completes. Without the filter the loser walks its claim and
-    /// re-requests every chunk of it while the winner delivers them: the
-    /// bytes arrive, are counted into `fetched_bytes`, and are dropped at
-    /// the write. 210 MB of 592 MB fetched in the field log of 2026-09-14.
+    /// loop; its doc says what the filter saves.
     ///
     /// Here half the piece is already on disk before the peer is let near
     /// it. Every `Request` it sends must name a chunk that is not.
@@ -5413,13 +5400,9 @@ mod connection_tests {
     /// A storage is told a piece is complete exactly once, and from that
     /// moment the piece is readable and the bytes are where a restart will
     /// look for them. A chunk that lands after it is a write into a
-    /// finished piece: the piece-per-file store answers it by opening a
-    /// fresh staged copy over the complete one, and from then on every read
-    /// of that piece is served the staged copy -- sixteen kilobytes of a
-    /// four megabyte piece -- so a read either fails past its end or comes
-    /// back zeros. The field log is full of the first:
-    /// `reading 262144 bytes at 1779199 of piece 834`, seconds after six
-    /// and a half megabytes had been served out of that same piece.
+    /// finished piece, which the piece-per-file store turns into a staged
+    /// copy that every later read of the piece is served: see "Nothing may
+    /// write into a piece the storage has finished" in the chunk write path.
     ///
     /// It takes several peers on one piece, which splitting creates: with
     /// one writer the peer that wrote a piece is the peer that completed
@@ -5615,14 +5598,10 @@ mod connection_tests {
     /// **A chunk for a piece that is already complete is not written.**
     ///
     /// Whatever route leaves a peer holding a share of a finished piece,
-    /// its chunk must not reach the storage: the piece-per-file store
-    /// answers a write into a held piece by opening a fresh staged copy
-    /// over the complete one and serving every later read from it -- EOF
-    /// past its few chunks, zeros between. Field log 2026-09-19: piece
-    /// 4342 read `reading 262144 bytes at 998011 of piece 4342` for
-    /// minutes after it had been served whole. Here peer 1 completes the
-    /// piece, the piece is handed back to peer 2 as if some route had done
-    /// it, and peer 2's chunk arrives.
+    /// its chunk must not reach the storage: see "Nothing may write into a
+    /// piece the storage has finished" in the chunk write path. Here peer 1
+    /// completes the piece, the piece is handed back to peer 2 as if some
+    /// route had done it, and peer 2's chunk arrives.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_chunk_for_a_complete_piece_is_not_written() -> anyhow::Result<()> {
         setup_test_logging();

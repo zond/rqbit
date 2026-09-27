@@ -60,8 +60,8 @@ impl Swarm {
     /// How many connections the seeders themselves have. Our own peer counters cannot
     /// stand in for this: `queued` and `connecting` both move when the adder claims the
     /// table slot, a transition before the dial task has been polled, so a peer they
-    /// account for may have no socket yet -- 3168e821 fixed the sibling test for waiting
-    /// on exactly that. A connection the far end has is a socket that exists.
+    /// account for may have no socket yet. A connection the far end has is a socket that
+    /// exists.
     fn far_end_live(&self) -> usize {
         self.seeders
             .iter()
@@ -434,7 +434,7 @@ async fn forgetting_a_parked_peer_strands_none_of_its_pieces_inner() {
     // that owned them to finish reporting their death: every piece handed back, which is
     // what a task with no entry left to find must still do. Waited for rather than slept
     // on -- a death reported in 50 ms passes at once, and a piece stranded for good fails
-    // on the timeout, as it did on the fixed sleep.
+    // on the timeout.
     wait_until(
         || match swarm.far_end_live() {
             LOWERED => Ok(()),
@@ -673,23 +673,21 @@ async fn a_raise_dials_the_peers_it_parked_before_the_backlog_inner() {
     // close is strictly later than the parked peer's own `PeerPermit::drop`, so waiting
     // for it leaves `peer_permits_to_forget` at 0 and the semaphore empty -- which is
     // exactly the state in which it cannot matter whether `set_peer_limit` walks the
-    // table before or after it writes the debt off. Such a wait was added here to
-    // settle a flake and silently deleted the only coverage of that ordering:
-    // measured, with `reconnect_all_not_needed_peers` moved back after the write-off
-    // and a 20 ms sleep in the gap, 8 failures in 10 without the wait and 0 in 10 with
-    // it. The flake it was aimed at is fixed by the far-end gate below instead.
+    // table before or after it writes the debt off. Such a wait deletes the only
+    // coverage of that ordering: with `reconnect_all_not_needed_peers` moved after the
+    // write-off and a 20 ms sleep in the gap, 8 runs in 10 fail without it and none
+    // with it.
     let dialled_before = backlog.accepted.load(Ordering::Relaxed);
     swarm.handle.set_peer_limit(SEEDERS);
     // The raise frees `SEEDERS - LOWERED` slots, and the count below is done when every
     // one of them has reached a far end: a seeder that has the connection, or a tarpit
     // that accepted one. That is the whole point of asking the far ends rather than our
-    // own counters, which is what this waited on before: `queued` drops in
-    // `mark_peer_connecting`, one transition before the dial task is polled, so it fell
-    // to the backlog's size while a slot handed to a guess was still an unopened socket,
-    // and the `dialled` count below read 0 for a dial that had not landed yet. Measured
-    // on a `reconnect_all_not_needed_peers` mutated to skip one parked peer -- a real
-    // regression of the property asserted here, with the guess winning the last slot
-    // rather than the first: the old wait let it through 9 times in 80 runs.
+    // own counters: `queued` drops in `mark_peer_connecting`, one transition before the
+    // dial task is polled, so it falls to the backlog's size while a slot handed to a
+    // guess is still an unopened socket, and the `dialled` count below would read 0 for
+    // a dial that has not landed yet. Against a `reconnect_all_not_needed_peers` mutated
+    // to skip one parked peer, a wait on `queued` let the mutation through 9 times in 80
+    // runs.
     wait_until(
         || {
             let dialled = backlog.accepted.load(Ordering::Relaxed) - dialled_before;
@@ -714,10 +712,7 @@ async fn a_raise_dials_the_peers_it_parked_before_the_backlog_inner() {
     // of the other end, which knows for certain, where the peer counters cannot tell a
     // re-queued peer from a fresh guess. Nor can a dial started earlier be landing only
     // now: until this raise every slot was either held by a peer we were keeping or on loan
-    // against the debt the lowering booked, so the adder never had one to spend. Nine went
-    // this way before the parked peers had a queue of their own, three more while the raise
-    // wrote off that debt before filling the queue, and one for as long as the adder dialled
-    // whatever it happened to be holding.
+    // against the debt the lowering booked, so the adder never had one to spend.
     let dialled = backlog.accepted.load(Ordering::Relaxed) - dialled_before;
     assert_eq!(
         dialled, 0,

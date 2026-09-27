@@ -1,8 +1,8 @@
 //! A live torrent has two locks its peer tasks take in a fixed order: a shard of the peer
 //! table first, then the torrent's state lock (a dying peer holds its shard while it asks
-//! whether the torrent is finished). `update_only_files()` used to take them the other way
-//! round - re-queueing peers under the state lock - and one peer dying at the wrong moment
-//! deadlocked the two, and with them every task that then touched either lock.
+//! whether the torrent is finished). `update_only_files()` must not take them the other
+//! way round - re-queueing peers under the state lock - or one peer dying at the wrong
+//! moment deadlocks the two, and with them every task that then touches either lock.
 //!
 //! What this test can and cannot catch: in debug builds the peer table asserts the order
 //! on every access, so the inversion fails deterministically at the first call. In release
@@ -42,14 +42,14 @@ const FILE_SIZE: usize = (PIECE_LEN * 8) as usize;
 ///
 /// Fewer on Windows, where a connect to a closed localhost port is not refused at once:
 /// the stack retries the SYN for about a second before it gives up, so 2000 of them could
-/// not all die inside the wait below (the first CI run saw 924). The race still gets
+/// not all die inside the wait below (924 did on a CI runner). The race still gets
 /// hundreds of dying peers, and the debug builds' order assertion - which is what catches
 /// an inversion deterministically - fires on the first call either way.
 const PEERS: usize = if cfg!(windows) { 400 } else { 2000 };
 /// Selections to flip between. Neither is ever finished (nothing is downloaded), so every
 /// flip walks the whole peer table looking for peers to re-queue. It never finds one - a
 /// refused connect leaves its peer dead, not not-needed - but it is the walk, not the
-/// re-queueing, that used to happen under the state lock.
+/// re-queueing, that an inversion would put under the state lock.
 const SELECTIONS: [&[usize]; 2] = [&[0], &[0, 1]];
 const FLIPPERS: usize = 2;
 /// How long the deadlock gets to show up. Everything the test does is done in seconds.

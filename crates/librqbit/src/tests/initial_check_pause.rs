@@ -505,20 +505,17 @@ async fn wait_until_resume_data_is_complete(
 /// `start` takes the peer stream as an argument and hands it to the initial
 /// check's continuation. A torrent added *paused* is given `None` --
 /// `Session::add_torrent` only builds one when it is not pausing -- and the
-/// unpause that arrives while the check is running builds a real one and
-/// then drops it on `start`'s early return, because a check is already
-/// going. The continuation still holds the `None` it captured at add time,
-/// so the torrent reaches `Live` with no peer adder and no announce, and
-/// stays there: `start` on a live torrent bails, so unpausing again cannot
-/// repair it.
+/// unpause that arrives while the check is running builds a real one while
+/// a check is already going. That stream has to reach the continuation
+/// (`TorrentStateInitializing::hand_peer_stream`), or the torrent reaches
+/// `Live` with the `None` captured at add time -- no peer adder, no
+/// announce -- and stays there: `start` on a live torrent bails, so
+/// unpausing again cannot repair it.
 ///
 /// `unpause_during_the_initial_check_starts_the_torrent` above does this
-/// exact sequence and passes, because `live().is_some()` is true of a
+/// exact sequence and cannot tell, because `live().is_some()` is true of a
 /// torrent that can never fetch a byte. So this one gives it a seeder and
-/// an empty directory and asks it to actually download -- which is the bar
-/// the comment in `torrent_state/mod.rs` set for a test of this, and the
-/// reason the attempted fix recorded there was reverted rather than
-/// finished.
+/// an empty directory and asks it to actually download.
 #[tokio::test(flavor = "multi_thread")]
 async fn unpause_during_the_initial_check_keeps_the_peer_stream() -> anyhow::Result<()> {
     timeout(
@@ -593,10 +590,10 @@ impl Drop for OpenOnDrop {
     }
 }
 
-/// review #40. A session stops when its owner drops it. The initial check can
-/// take minutes, and the task running it must not hold the session while it
-/// does: held, a dropped session lived on with every one of its tasks, and
-/// the torrent went live under a session nobody owned.
+/// A session stops when its owner drops it. The initial check can take
+/// minutes, and the task running it must not hold the session while it
+/// does: held, a dropped session would live on with every one of its tasks,
+/// and the torrent would go live under a session nobody owns.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_running_initial_check_does_not_keep_a_dropped_session_alive() -> anyhow::Result<()> {
     setup_test_logging();
@@ -639,12 +636,12 @@ async fn a_pause_undone_before_the_check_reports_runs_the_check_again() -> anyho
     .await?
 }
 
-/// review #7. A pause stops the check between pieces; an unpause landing
-/// after the check stopped but before its continuation ran found a check
-/// still running, left it to that continuation and cleared the pause
-/// request -- and the continuation, finding no pause requested, took the
-/// pause's "initial check paused" for a failure and put the torrent in the
-/// error state, with the intent saying run.
+/// A pause stops the check between pieces; an unpause landing after the
+/// check stopped but before its continuation runs finds a check still
+/// running, leaves it to that continuation and clears the pause request.
+/// The continuation, finding no pause requested, must not take the pause's
+/// "initial check paused" for a failure and put the torrent in the error
+/// state, with the intent saying run.
 async fn a_pause_undone_before_the_check_reports_runs_the_check_again_inner() -> anyhow::Result<()>
 {
     setup_test_logging();
@@ -772,10 +769,10 @@ impl StorageFactory for PauseWhilePersisting {
     }
 }
 
-/// review #36. `add_torrent` publishes the handle, awaits the persistence store and only
-/// then starts the torrent. A `pause` in that window used to be lost -- the start wrote
-/// the intent it had captured before the handle existed -- and it left a pause request on
-/// a check that had not started, which `wait_until_initialized` reads as a check that
+/// `add_torrent` publishes the handle, awaits the persistence store and only then starts
+/// the torrent. A `pause` in that window must hold -- not be overwritten by a start writing
+/// the intent it captured before the handle existed -- and must not leave a pause request
+/// on a check that has not started, which `wait_until_initialized` reads as a check that
 /// stopped for good.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pause_while_a_torrent_is_being_added_is_not_lost() -> anyhow::Result<()> {

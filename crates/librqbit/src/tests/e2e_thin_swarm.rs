@@ -246,7 +246,7 @@ async fn a_sighting_brings_a_dead_proven_peer_forward_inner() {
     swarm.come_back().await;
 
     // The tracker, the DHT or PEX names the address again: an address the table already
-    // holds, which used to be ignored outright.
+    // holds, and a sighting of it while starving brings the dial forward.
     assert!(
         swarm.live.add_peer_if_not_seen(swarm.seeder_addr).unwrap(),
         "the sighting queued a dial"

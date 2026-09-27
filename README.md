@@ -5,8 +5,8 @@ This is zond's fork of [ikatson/rqbit](https://github.com/ikatson/rqbit), kept f
 ## Branches
 
 - **`main`** is the fork: upstream's `main` with everything below on top of it. It is what consumers build, and they depend on `librqbit` by git `rev`, not by branch, so a push here reaches them only when they bump the rev.
-- `main` is rebased onto `upstream/main` from time to time, which rewrites its commit hashes and needs a force-push. Some earlier tips are kept as tags (`pinned-<short-sha>`, from when this branch was called `pinned`).
-- Single-change branches, cut from `upstream/main`, were there to be offered upstream. Nothing is planned for upstream now, so they are history.
+- `main` is rebased onto `upstream/main` from time to time, which rewrites its commit hashes and needs a force-push. Some earlier tips are kept as `pinned-<short-sha>` tags.
+- Single-change branches cut from `upstream/main` are not maintained.
 
 The fork publishes no binaries, crates, Docker images or desktop builds, and upstream's three release workflows are deleted here rather than left to run on every push. The Releases, crates.io, docs.rs, Homebrew and Docker links in the upstream README below point at upstream's builds.
 
@@ -71,7 +71,7 @@ These changes apply to every user, opted in or not:
   - a pause or an unpause that arrives during a torrent's initial check lands on the check's own pause intent, instead of being swallowed and leaving the torrent settled the other way;
   - `wait_until_initialized` no longer waits forever on a check that a pause bailed out of; it fails the wait instead;
   - vectored writes past 2 GiB on 32-bit targets.
-- **Pauses release file handles:** a paused torrent gives its file handles back (`TorrentStorage::release_files`), and a file a pause closed is opened again when it is next used. Upstream added the release in 193a5bd8 and reverted it in d7bfc7b0, so upstream now keeps a paused torrent's files open; this fork keeps the release, with the reopen that the reverted version lacked -- without it the first read or write after an unpause failed with "file is None" and the torrent never recovered.
+- **Pauses release file handles:** a paused torrent gives its file handles back (`TorrentStorage::release_files`), and a file a pause closed is opened again when it is next used. Upstream added the release in 193a5bd8 and reverted it in d7bfc7b0, so upstream now keeps a paused torrent's files open; this fork keeps the release, with the reopen that the reverted version lacked -- without it the first read or write after an unpause fails with "file is None" and the torrent never recovers.
 - **Storage implementers:** an error from `on_piece_completed` is now fatal to the torrent, and the call comes before the piece is marked have. Upstream called it afterwards and logged errors at debug level. `has_piece` (default `Ok(true)`) is asked at startup. The wrappers forward the methods listed above.
 - **Persistence format:** JSON records gain a `piece_reclaim` field (a missing field reads as false). Postgres gets a `piece_reclaim BOOLEAN NOT NULL DEFAULT FALSE` column, added with `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` when the store opens.
 - **TLS under `rust-tls`:** a CA installed on the device, such as a corporate proxy or mitmproxy, no longer verifies rqbit's HTTPS. A root that Mozilla adds after the build is not trusted until you rebuild. Under `default-tls`, which the `rqbit` binary uses by default, nothing changes.

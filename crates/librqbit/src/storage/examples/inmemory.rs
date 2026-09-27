@@ -288,14 +288,7 @@ impl TorrentStorage for InMemoryPieceStorage {
             piece_and_offset(&self.lengths, &self.file_infos, file_id, offset)?;
         let g = self.store.read();
         // A read is served the newest copy of the piece: the one being written if there
-        // is one, otherwise the complete one. Hash checking a piece is a read of what was
-        // just written, and it happens before the piece is complete - so a piece being
-        // downloaded has to be readable, and it has to win over a complete copy that is
-        // still around. It can be: drop_pieces() clears the have-bit, but the bytes stay
-        // until the caller releases them, and the piece may be downloaded again in
-        // between. Reading the stale complete copy there would hash-check the old bytes,
-        // pass, and on_piece_completed() would promote the new ones on the strength of a
-        // check that never looked at them.
+        // is one, otherwise the complete one - see InMemoryPieceStorageFactory for why.
         //
         // Nothing wants the older copy while a newer one exists, because the two maps
         // only overlap while a piece is being downloaded, and a piece being downloaded is
@@ -319,9 +312,9 @@ impl TorrentStorage for InMemoryPieceStorage {
     fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
         // A chunk that arrived in one contiguous buffer is written as two slices, the
         // second one empty, at the offset where the chunk ends. For the last chunk of the
-        // torrent that offset is in no piece at all, and the write failed the torrent. For
-        // any other it is the start of the next piece, and the write staged an empty copy
-        // of that piece, which reads then preferred over the complete one.
+        // torrent that offset is in no piece at all, and writing it would fail the
+        // torrent. For any other it is the start of the next piece, and writing it would
+        // stage an empty copy of that piece, which reads would prefer over the complete one.
         if buf.is_empty() {
             return Ok(());
         }
@@ -433,10 +426,7 @@ mod tests {
         }
     }
 
-    // has_piece() must mean "complete", not "started". Chunks arrive 16 KiB at a time,
-    // and a storage that answers yes as soon as the first one lands leaves a have-bit
-    // over a half-written piece if the process dies in between - and startup's
-    // intersection only ever clears bits, so nothing takes it back and we serve garbage.
+    // has_piece() must mean "complete", not "started": see TorrentStorage::has_piece.
     #[test]
     fn test_a_piece_is_not_there_until_it_is_complete() {
         let (factory, storage) = storage();
@@ -552,12 +542,7 @@ mod tests {
         assert_eq!(factory.piece_count(other), 1);
     }
 
-    // A read must see the bytes most recently written. A piece can be downloaded again
-    // while the complete copy is still here - drop_pieces() clears the have-bit and the
-    // caller releases the bytes afterwards - and the check that decides whether to keep
-    // the new copy is a read. Serve it the stale complete one and it hash-checks the old
-    // bytes, passes, and on_piece_completed() promotes the new ones on the strength of a
-    // check that never looked at them.
+    // A read must see the bytes most recently written: see InMemoryPieceStorageFactory.
     #[test]
     fn test_a_read_sees_the_newest_copy_of_a_piece() {
         let (factory, storage) = storage();
