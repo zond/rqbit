@@ -1,0 +1,11 @@
+# Fork rule: every HTTPS client starts at librqbit_upnp::http_client_builder
+# (re-exported as librqbit::http_client_builder), which brings Mozilla's
+# roots under `rust-tls`. A client built any other way makes reqwest
+# construct rustls-platform-verifier, which on Android is Java (a CRL download
+# and parse per handshake) and panics in an embedder that never initialised it.
+disallowed-methods = [
+    { path = "reqwest::Client::new", reason = "start at http_client_builder" },
+    { path = "reqwest::Client::builder", reason = "start at http_client_builder" },
+    { path = "reqwest::ClientBuilder::new", reason = "start at http_client_builder" },
+    { path = "reqwest::get", reason = "start at http_client_builder" },
+]

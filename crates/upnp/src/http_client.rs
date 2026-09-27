@@ -63,6 +63,7 @@
 /// passkey. A public root program is both sufficient and the conservative
 /// choice for it. Someone who does need a private CA can build without
 /// `rust-tls`, or hand librqbit's `SessionOptions` a proxy.
+#[allow(clippy::disallowed_methods)] // the one door clippy.toml points everyone to
 pub fn http_client_builder() -> reqwest::ClientBuilder {
     #[allow(unused_mut)]
     let mut builder = reqwest::ClientBuilder::new();

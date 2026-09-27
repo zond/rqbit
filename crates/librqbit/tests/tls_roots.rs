@@ -34,6 +34,7 @@ fn our_client_builds_where_the_platform_verifier_cannot() {
         std::env::set_var("SSL_CERT_FILE", empty_file.path());
         std::env::set_var("SSL_CERT_DIR", empty_dir.path());
     }
+    #[allow(clippy::disallowed_methods)] // the platform verifier, on purpose
     let platform = reqwest::Client::builder().build();
     let ours = librqbit::http_client_builder().build();
     unsafe {
