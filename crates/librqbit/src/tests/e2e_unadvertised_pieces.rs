@@ -654,8 +654,8 @@ async fn e2e_unadvertised_pieces_gate_survives_two_callers() -> anyhow::Result<(
     // it there - only a hook in the production path could, which is not worth carrying. So
     // it buys its odds with rounds. Measured against the wrong ordering (the gate stored
     // after the lock is dropped) on a 20-run batch each: 60000 rounds caught it 15 times of
-    // 20, 240000 caught it 20 of 20. Hence the number below, at about 3 seconds - which
-    // costs the suite nothing, since another test in this file takes longer than that.
+    // 20, 240000 caught it 20 of 20. Hence the number below: about 5 seconds in a debug
+    // build, and the slowest test in this file.
     //
     // A red run means a real violation whatever the odds are: the gate and the set are read
     // with both threads parked on the barrier, so there is nothing in flight that could

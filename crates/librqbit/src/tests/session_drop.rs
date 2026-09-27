@@ -49,10 +49,25 @@ async fn a_silent_incoming_connection_does_not_keep_a_dropped_session_alive() {
     .unwrap();
     let addr = session.listen_addr().unwrap();
 
-    // Connects and says nothing, so the listener's check of it waits.
+    // Connects and says nothing, so the listener's check of it waits. The check takes a
+    // handle on the session when it starts -- a weak one, which is the point -- so the
+    // session's handle count rising is the check having started, where a fixed sleep only
+    // guessed at it and could pass without the check ever running.
+    let handles = |s: &Arc<Session>| Arc::strong_count(s) + Arc::weak_count(s);
+    let before = handles(&session);
     let silent = TcpStream::connect(addr).await.unwrap();
-    // Time for the listener to accept it and start the check.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_until(
+        || {
+            if handles(&session) > before {
+                Ok(())
+            } else {
+                bail!("the listener has not started checking the connection")
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
 
     let weak = Arc::downgrade(&session);
     drop(session);
