@@ -65,9 +65,6 @@ const CLAIM_CHUNKS: u32 = 16;
 /// come back when a chunk of its own lands. Fast peers qualify sooner and
 /// so take more; slow ones take less; a peer alone on a piece takes all of
 /// it, a round trip at a time; and no constant says how long anyone waits.
-/// It used to be lifted by whether the rest of the lookahead held anything
-/// for the peer, which in steady state it never does, so the first visitor
-/// took every share within a millisecond.
 ///
 /// And "come back" is not "come back when the whole piece it went to is
 /// requested": a peer sent away from the head is offered the head again
@@ -230,14 +227,11 @@ pub const DEFAULT_DEADLINE_PIECES: usize = 2;
 
 /// How many completed pieces the completion median is over.
 ///
-/// Sixteen was a seek's worth: after one, the ring filled with the split
-/// pieces at the new head -- fast, several peers on each -- and the median
-/// fell to under three seconds, then the whole pieces reserved deep in the
-/// window by slow peers came in at eight, and the depth an embedder sized
-/// from it flapped between three and eight within forty seconds (field,
-/// 2026-09-17 12:22). Sixty-four is about seventy-five seconds of a 4 MiB
-/// piece film: one seek's burst is a sixth of the sample and moves the
-/// median, not swings it.
+/// Sixty-four is about seventy-five seconds of a 4 MiB piece film: the
+/// burst of fast split pieces at a seek's new head is a sixth of the
+/// sample and moves the median, not swings it. At sixteen, a seek's worth,
+/// the depth an embedder sized from it flapped between three and eight
+/// within forty seconds (field, 2026-09-17).
 const COMPLETION_SAMPLES: usize = 64;
 
 /// Tracks a piece currently being downloaded.
@@ -394,7 +388,7 @@ impl InflightPiece {
     /// with its requests still out, and once the claim is gone
     /// `overtaken_by` cannot find it to cancel them when the piece
     /// completes. So the caller cancels whatever this connection still has
-    /// out for what is returned here (review #28); for a claim it
+    /// out for what is returned here; for a claim it
     /// delivered itself that is nothing.
     fn retire_finished_claims(
         &mut self,
@@ -511,21 +505,15 @@ impl InflightPiece {
     /// duplicate: a healthy holder finishes sixteen chunks within one of
     /// its round trips, so a claim still open that long is joined only by
     /// somebody faster than its newest holder, and a silent one is joined
-    /// by anyone live. It replaces a cap of two holders, which the field of
-    /// 2026-09-15 found full on a claim held by a peer that had delivered
-    /// nothing in fourteen seconds and a doubler with five seconds of
-    /// latency, with every faster peer turned away from it for six seconds.
-    /// Never this peer's own. Of those, the one with the most left to
+    /// by anyone live. No count of holders caps it (`CLAIMS.md`, "What this
+    /// replaced"). Never this peer's own. Of those, the one with the most left to
     /// fetch, then the oldest -- what gates the piece is the work remaining
     /// on its slowest claim.
     ///
-    /// **Whatever the claim has delivered so far.** A first version doubled
-    /// only claims that had delivered nothing, on the argument that a
-    /// claim with chunks landing is being fetched. The field of 2026-09-15
-    /// showed what that misses: a holder trickling a chunk a second is
-    /// "being fetched" and never rescued, and the piece completes when it
-    /// finishes its sixteen chunks -- 24 and 30 seconds, with fifteen and
-    /// twenty-two seeders connected. Two healthy peers still never double
+    /// **Whatever the claim has delivered so far.** A holder trickling a
+    /// chunk a second is "being fetched" too, and the piece completes when
+    /// it finishes its sixteen chunks -- 24 and 30 seconds in the field of
+    /// 2026-09-15, with fifteen and twenty-two seeders connected. Two healthy peers still never double
     /// each other: a holder with a window of requests out lands a chunk
     /// every few milliseconds, so the wait on it never reaches anyone's
     /// round trip.
@@ -874,9 +862,9 @@ impl PieceTracker {
     /// reaches it a piece *is* one peer's whole reservation -- so what a
     /// whole piece takes is the time to cover, and the split pieces, which
     /// several peers fill at once, are the fast end of the sample. A median
-    /// of split pieces alone measured the mode it was sizing: a deeper
-    /// split made pieces faster, which made the depth shallower, which put
-    /// the cut back to a second before the reader.
+    /// of split pieces alone measures the mode it sizes: a deeper split
+    /// makes pieces faster, which makes the depth shallower, which puts the
+    /// cut back to a second before the reader.
     ///
     /// The upper of the two middles when the count is even, so a horizon
     /// sized from it errs towards starting a piece earlier rather than
@@ -1004,13 +992,11 @@ impl PieceTracker {
     /// deeper in, because a slot freeing is a chunk landing, which is the
     /// moment the peer's latency was re-measured and the event the one
     /// comparison is about. Without it a peer turned away from a head piece
-    /// a few milliseconds old -- which nobody outpaces -- was handed a whole
-    /// piece and sent every one of its 256 chunks before asking again, two
-    /// request windows away; by the time the head piece was old enough to
-    /// share out, every peer that could share it was committed elsewhere.
-    /// The field of 2026-09-15: ten of sixteen shares of the head piece in
-    /// the pool for two seconds, two peers that outpaced it many times over
-    /// each on a whole piece deeper in, and a 5.4 s read.
+    /// a few milliseconds old -- which nobody outpaces -- is handed a whole
+    /// piece and sends every one of its 256 chunks before asking again, two
+    /// request windows away; by the time the head piece is old enough to
+    /// share out, every peer that could share it is committed elsewhere (a
+    /// 5.4 s read in the field of 2026-09-15).
     pub fn acquire_head_share<I, P, S>(&mut self, mut req: AcquireRequest<I, P, S>) -> AcquireResult
     where
         I: Iterator<Item = ValidPieceIndex>,
@@ -2006,13 +1992,12 @@ mod tests {
 
     /// **A peer that has delivered nothing takes no second copy.**
     ///
-    /// The waste this cost is what the field measured: 415 MB fetched
-    /// against 281 MB verified on 2026-09-14. A peer's request window is
-    /// 128 chunks against a 16-chunk claim, so two peers can hold every
-    /// claim of a piece before either has delivered a byte -- and every
-    /// peer arriving after them used to take a second copy of a claim
-    /// nobody could yet call slow, on a piece nobody could yet call
-    /// stalled. A peer with no latency to its name outpaces nobody,
+    /// A peer's request window is 128 chunks against a 16-chunk claim, so
+    /// two peers can hold every claim of a piece before either has
+    /// delivered a byte, and a peer arriving after them would take a second
+    /// copy of a claim nobody can yet call slow, on a piece nobody can yet
+    /// call stalled: 415 MB fetched against 281 MB verified in the field of
+    /// 2026-09-14. A peer with no latency to its name outpaces nobody,
     /// however long the holders have sat: it is sent to fetch the next
     /// piece the stream needs, and proves itself there.
     #[test]
@@ -2183,15 +2168,15 @@ mod tests {
 
     /// **A claim already entirely on disk is not handed to anybody.**
     ///
-    /// This was the defect. A `Participant` was removed when its peer left
-    /// or when the piece ended, never when its claim arrived, so a peer
-    /// that had worked through four claims carried four entries and three
-    /// of them were finished. `stalled_claim` ranked on `started` over that
-    /// list, so "the claim outstanding longest" was, nearly always, one
-    /// whose every chunk had landed long ago -- and every free peer that
-    /// asked was sent to fetch a quarter of a megabyte we already had.
+    /// A `Participant` is retired when its claim arrives, not only when its
+    /// peer leaves or the piece ends. Otherwise a peer that has worked
+    /// through four claims carries four entries, three of them finished,
+    /// and `stalled_claim`, ranking on `started`, nearly always finds "the
+    /// claim outstanding longest" to be one whose every chunk landed long
+    /// ago -- and sends every free peer that asks to fetch a quarter of a
+    /// megabyte we already have.
     ///
-    /// Worse than the waste: it is what put several peers on one piece's
+    /// Worse than the waste: it puts several peers on one piece's
     /// writes at the tail of every split piece, which is the precondition
     /// for a chunk landing in a piece the storage has already finished.
     ///
@@ -2453,8 +2438,8 @@ mod tests {
     ///
     /// `try_steal` takes a piece off a slower peer only when one peer holds
     /// it and nothing is unclaimed, and retiring finished claims is what
-    /// makes that true of a piece a single peer has carried: before, its
-    /// four spent entries made it look like four peers sharing, and it was
+    /// makes that true of a piece a single peer has carried: otherwise its
+    /// four spent entries make it look like four peers sharing, and it is
     /// passed over. It is not sharing -- three of those claims are on disk
     /// and one peer is sitting on the fourth.
     ///
@@ -2832,11 +2817,11 @@ mod tests {
     ///
     /// A peer comes back for another claim when it has *sent* the last
     /// one's requests, not when they have arrived, and its window is eight
-    /// claims wide -- so two peers took all sixteen claims of a 4 MiB piece
-    /// within milliseconds and the piece was back to "the slowest of two".
-    /// The field of 2026-09-14 blocked 13.4 s on one piece while the swarm
-    /// delivered 12-16 MB/s from seventeen seeders; every other blocked
-    /// read in that log was under three seconds.
+    /// claims wide -- so without a share two peers take all sixteen claims
+    /// of a 4 MiB piece within milliseconds and the piece is back to "the
+    /// slowest of two": 13.4 s blocked on one piece in the field of
+    /// 2026-09-14, while the swarm delivered 12-16 MB/s from seventeen
+    /// seeders.
     ///
     /// So a peer takes its share and goes to fetch the next piece the
     /// stream needs, which is work either way.
@@ -3285,7 +3270,7 @@ mod tests {
     /// the slow ones are seventeen samples of sixty-four and the median
     /// stays at a second -- a sixteen-deep ring would by then hold nothing
     /// but slow ones. Then enough slow ones to fill the ring: the fast ones
-    /// are gone and the median is the slow time. A shorter ring let one
+    /// are gone and the median is the slow time. A shorter ring lets one
     /// seek's burst of fast split pieces swing the median, and the depth
     /// with it.
     #[test]
@@ -3490,7 +3475,7 @@ mod tests {
         }
     }
 
-    /// **A holder does not cut its own whole piece** (review #29). It is
+    /// **A holder does not cut its own whole piece.** It is
     /// the one peer whose outpacing the piece says nothing about who else
     /// is coming, and a cut would only pool the tail it has requests out
     /// for.
@@ -3785,9 +3770,9 @@ mod tests {
 
     /// **And it comes back once, not once per holder that left.**
     ///
-    /// Two holders leaving used to push two entries, on the reasoning that
-    /// the cap would bind on the way out. It does not -- see above -- so
-    /// the same sixteen chunks went to the same peer twice in a row.
+    /// Nothing gates the pool on the way out -- see above -- so a second
+    /// entry would send the same sixteen chunks to the same peer twice in
+    /// a row.
     #[test]
     fn a_claim_both_its_holders_left_comes_back_once() {
         let (mut tracker, file_infos, priorities) = make_split_tracker(4);
@@ -3918,8 +3903,7 @@ mod tests {
         })
     }
 
-    /// **Wiped chunks take their writers with them** (review 2026-09-27
-    /// #8). A check that cannot be read breaks the piece without asking
+    /// **Wiped chunks take their writers with them.** A check that cannot be read breaks the piece without asking
     /// who filled it; if the writers outlived that, the next fill -- one
     /// peer's, start to finish -- would come to its hash check with two
     /// names on it and a bad piece from that one peer would blame nobody.
@@ -4063,10 +4047,10 @@ mod tests {
     }
 
     // Between its last chunk arriving and its hash passing, a piece is neither queued,
-    // in-flight nor have. A reselect_pieces() landing in that window finds a dropped piece
-    // nobody owns and queues it; the hash then passes, and without the fix the piece is
-    // have AND queued, and the next peer to ask is handed a piece we have - a redundant
-    // download, and a completion counted twice.
+    // in-flight nor have. A reselect_pieces() landing in that window must not take it for
+    // a dropped piece nobody owns and queue it: the hash would then pass, the piece would
+    // be have AND queued, and the next peer to ask would be handed a piece we have - a
+    // redundant download, and a completion counted twice.
     #[test]
     fn test_reselect_during_the_hash_check_does_not_leave_a_have_piece_queued() {
         let file_infos = reclaim_file_infos(3);
@@ -4745,7 +4729,7 @@ mod tests {
         }
     }
 
-    /// **A steal keeps the piece's start** (review #32). The reader has
+    /// **A steal keeps the piece's start.** The reader has
     /// waited on the piece since it was first handed out, so the median
     /// counts from then; and the thief is measured on its own hold, so the
     /// next peer along cannot take the piece off it at once.

@@ -710,9 +710,9 @@ async fn a_pause_undone_before_the_check_reports_runs_the_check_again_inner() ->
     Ok(())
 }
 
-/// A storage factory that pauses torrent 0 the first time the persistence store asks
-/// whether it can be persisted -- which the session does between publishing the handle
-/// and starting the torrent, and is the only deterministic way into that window.
+/// A storage factory that pauses torrent 0 the first time the session asks whether it
+/// can be persisted -- which it does between publishing the handle and starting the
+/// torrent, and is the only deterministic way into that window.
 #[derive(Clone)]
 struct PauseWhilePersisting {
     session: Arc<std::sync::Mutex<Option<std::sync::Weak<Session>>>>,

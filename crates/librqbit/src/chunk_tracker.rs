@@ -721,9 +721,8 @@ impl ChunkTracker {
     /// field log of 2026-09-14 that was 210 MB of 592 MB fetched.
     ///
     /// It is a filter and not a guarantee: a chunk can arrive between this
-    /// answer and the request going out, which costs exactly what every
-    /// chunk cost before. Out of range answers "ask for all of it", which
-    /// is what the loop did before this existed.
+    /// answer and the request going out, and is then fetched twice. Out of
+    /// range answers "ask for all of it".
     ///
     /// One answer per chunk of the claim, in order, read as the caller walks
     /// the claim: an iterator and not a collection, because the request loop
@@ -1320,10 +1319,10 @@ mod tests {
         assert!(ct.queue_pieces[2]);
     }
 
-    // The per-file count moves with the have-bit, in the same call. It used to be added
-    // in a second step, under a second lock, and a drop_pieces() landing in between saw a
-    // piece that was have but not counted; it also stopped at the zero-length file 2 and
-    // never counted piece 1 into file 3.
+    // The per-file count moves with the have-bit, in the same call: counted in a second
+    // step, under a second lock, a drop_pieces() landing in between would see a piece that
+    // is have but not counted. And the count walks past the zero-length file 2 to count
+    // piece 1 into file 3.
     #[test]
     fn test_per_file_bytes_follow_the_have_bit() {
         let piece_len = CHUNK_SIZE * 2 + 1;
@@ -1876,7 +1875,7 @@ mod piece_reclaim_tests {
         assert!(ct.drop_pieces(&fi, [p0], |_| false).unwrap().is_empty());
     }
 
-    // review #4. The same pull, and the last peer on it leaves before the piece is
+    // The same pull, and the last peer on it leaves before the piece is
     // complete: the piece is requeued keeping its chunks, which for a dropped piece is
     // requeued to nowhere. Kept, the chunk would have the piece refused as "a peer is
     // working on it" on every later ask, with nobody ever coming back to finish it, and
@@ -1928,9 +1927,9 @@ mod piece_reclaim_tests {
     /// **A piece being hash-checked is neither wiped nor queued by a
     /// reselect.** Between its last chunk and its check a piece is in no
     /// set -- not have, not queued, not in flight -- and a reselect that
-    /// sees "dropped, selected, not in flight" used to wipe it and queue
-    /// it for a second peer, whose chunks then landed in a piece the
-    /// storage had just finished (field log 2026-09-19, piece 4342). The
+    /// sees "dropped, selected, not in flight" would wipe it and queue it
+    /// for a second peer, whose chunks then land in a piece the storage
+    /// has just finished (field log 2026-09-19, piece 4342). The
     /// same for asking the file back with `update_only_files`.
     #[test]
     fn test_a_piece_being_checked_is_not_requeued_by_a_reselect() {

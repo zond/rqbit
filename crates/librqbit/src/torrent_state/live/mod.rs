@@ -1483,11 +1483,8 @@ impl TorrentStateLive {
             self.finished_notify.notify_waiters();
             // The last piece landing is what turns an idle request loop's
             // next ask into "nothing left to do, disconnect", and a loop
-            // parked in its wait has nothing else to wake it: the Windows
-            // e2e runs of d1376b40 and 4110d894 counted 224 and 182 tasks
-            // alive fifteen seconds after the download, all of them that.
-            // The finish only -- a pulse on every piece was a herd: 2000
-            // pieces of 32 KiB in the download test, every idle loop
+            // parked in its wait has nothing else to wake it. The finish
+            // only: a pulse on every piece is a herd, every idle loop
             // re-walking the lookahead under the write lock for each.
             self.new_pieces_notify.notify_waiters();
 
@@ -2906,10 +2903,9 @@ impl PeerHandler {
                         }
                     };
                     // And the connection going: the writer's channel closes
-                    // with it, and a loop that only found out on its next
-                    // send sat here for the backstop after the peer was gone
-                    // -- the Windows e2e run of 2026-09-17 had 224 tasks
-                    // still alive when the test expected none.
+                    // with it. A loop that only found out on its next send
+                    // would sit here for the backstop after the peer was
+                    // gone.
                     let gone = self.tx.closed();
                     let mut peer_gone = false;
                     let retry_is_further_off = retry_at.is_some_and(|at| {
@@ -2991,13 +2987,11 @@ impl PeerHandler {
                 // whether the deadline pieces the reader is waiting on have a
                 // share for it: a pool share now that the piece is older than
                 // its round trip, or a lagging claim to copy. What it is given
-                // it sends first, and comes back to this share after. Before
-                // this, a peer turned away from a head piece a few
-                // milliseconds old was handed a whole piece deeper in and sent
-                // all 256 chunks of it before asking again: the field of
-                // 2026-09-15 had ten of sixteen shares of the head piece
-                // unclaimed for two seconds with the peers that outpaced it
-                // all committed elsewhere, and a 5.4 s read.
+                // it sends first, and comes back to this share after.
+                // Otherwise a peer turned away from a head piece a few
+                // milliseconds old sends all 256 chunks of a whole piece
+                // deeper in before asking again (`CLAIMS.md`, "And when it
+                // is asked").
                 //
                 // **No stream, no head.** The head is the streams' lookahead
                 // and nothing else, so with none open the ask can only come
@@ -3025,7 +3019,7 @@ impl PeerHandler {
                 // takes to free a slot. Meanwhile a faster peer can have cut the
                 // piece, stolen it, a choke handed it back, or it completed; the
                 // chunks that left with it are someone else's now or on disk, and
-                // asking for them anyway is a duplicate every one (review #3).
+                // asking for them anyway is a duplicate every one.
                 if !self.still_to_request(&chunk) {
                     trace!(?chunk, "no longer ours to ask for; skipping");
                     continue;
@@ -3349,11 +3343,11 @@ impl PeerHandler {
                 // write into a held piece by opening a fresh staged copy
                 // over it, which every read of that piece is then served:
                 // a few chunks of a four-megabyte piece, EOF past them and
-                // zeros between. Field log 2026-09-19, piece 4342, and
-                // pieces 834 and 3181 before it. The in-flight check above
-                // should make this unreachable; this is the invariant
-                // stated where the write happens, whatever route let the
-                // peer in, and the line names the route next time.
+                // zeros between (field log 2026-09-19, piece 4342). The
+                // in-flight check above should make this unreachable; this
+                // is the invariant stated where the write happens, whatever
+                // route let the peer in, and the line names the route next
+                // time.
                 let chunks = g.get_chunks()?;
                 let have = chunks.is_piece_have(chunk_info.piece_index);
                 if have || chunks.is_piece_fully_downloaded(chunk_info.piece_index) {
@@ -3935,10 +3929,9 @@ mod connection_tests {
     }
 
     /// **With the upload switch off, a request is dropped, not judged.**
-    /// review #37: it used to be validated first, and a request for a
-    /// piece we do not have -- the ordinary thing to ask of a peer whose
-    /// pieces the reclaim takes back -- hung up on a peer we were not
-    /// uploading to anyway.
+    /// Validating it would hang up on a peer that asks for a piece we do
+    /// not have -- the ordinary thing to ask of a peer whose pieces the
+    /// reclaim takes back -- when we are not uploading to it anyway.
     #[tokio::test(flavor = "multi_thread")]
     async fn with_the_upload_switch_off_a_request_is_dropped_not_judged() -> anyhow::Result<()> {
         setup_test_logging();
@@ -4488,8 +4481,8 @@ mod connection_tests {
         Ok(())
     }
 
-    /// **A claim retired with its requests still out has them cancelled**
-    /// (review #28). A holder that lost a duplicate race sits on a finished
+    /// **A claim retired with its requests still out has them
+    /// cancelled.** A holder that lost a duplicate race sits on a finished
     /// claim -- every chunk on disk, delivered by the other copy -- with its
     /// own requests for it still on the wire. When it comes back to the
     /// piece the claim is retired, and after that nothing could find those
@@ -4619,8 +4612,8 @@ mod connection_tests {
         Ok(())
     }
 
-    /// **A share taken from a peer mid-send is not sent any further**
-    /// (review #3). The request loop sends a share a chunk at a time as
+    /// **A share taken from a peer mid-send is not sent any further.**
+    /// The request loop sends a share a chunk at a time as
     /// slots free; here the piece is stolen after the first window has
     /// gone out, and the next slot must go to other work, not to the rest
     /// of a piece that is now another peer's.
@@ -4758,11 +4751,11 @@ mod connection_tests {
     }
 
     /// **A piece several peers filled that fails its hash blames nobody,
-    /// and is fetched again from other peers** (review #5). The hash is
-    /// over the whole piece, so with more than one writer nothing can say
-    /// whose bytes were bad: the peer that happened to deliver the last
-    /// chunk used to be disconnected for it. Nobody is accused now; the
-    /// piece is wiped, queued, and left to peers that had no part in it --
+    /// and is fetched again from other peers.** The hash is over the whole
+    /// piece, so with more than one writer nothing can say whose bytes were
+    /// bad, and the peer that happened to deliver the last chunk is not
+    /// the culprit by that fact. Nobody is accused: the piece is wiped,
+    /// queued, and left to peers that had no part in it --
     /// unless nobody else has it, when it is better fetched from them
     /// again than never.
     #[tokio::test(flavor = "multi_thread")]
@@ -4906,7 +4899,7 @@ mod connection_tests {
     }
 
     /// **A refused peer wakes when the claim it was turned away from is
-    /// old enough to join** (review #34, the `retry_at` wiring). Every
+    /// old enough to join** (the `retry_at` wiring). Every
     /// share of the piece is held, and the peer that asks is told the
     /// instant its own round trip has passed on the newest hold. Nothing
     /// else will wake it -- it has nothing in flight, the lookahead does
@@ -4977,8 +4970,8 @@ mod connection_tests {
         Ok(())
     }
 
-    /// **A refused peer wakes when shares appear in a pool** (review #34,
-    /// the `pool_changed` wiring). A piece held whole is cut by a peer that
+    /// **A refused peer wakes when shares appear in a pool** (the
+    /// `pool_changed` wiring). A piece held whole is cut by a peer that
     /// outpaces it, and what that leaves in the pool is work for peers that
     /// were turned away from it -- including ones with no round trip of
     /// their own, which are told no instant to come back at. Nothing else
@@ -5142,10 +5135,10 @@ mod connection_tests {
     /// loop, which is where the field's bandwidth went. Two peers may hold
     /// one claim -- that is what rescues a piece from a peer that has
     /// stalled on it -- and the loser is cancelled only when the whole
-    /// piece completes. Until this, it walked its claim and re-requested
-    /// every chunk of it while the winner delivered them: the bytes
-    /// arrived, were counted into `fetched_bytes`, and were dropped at the
-    /// write. 210 MB of 592 MB fetched in the field log of 2026-09-14.
+    /// piece completes. Without the filter the loser walks its claim and
+    /// re-requests every chunk of it while the winner delivers them: the
+    /// bytes arrive, are counted into `fetched_bytes`, and are dropped at
+    /// the write. 210 MB of 592 MB fetched in the field log of 2026-09-14.
     ///
     /// Here half the piece is already on disk before the peer is let near
     /// it. Every `Request` it sends must name a chunk that is not.
@@ -5261,9 +5254,9 @@ mod connection_tests {
     /// deeper in and fills its window with it. Then its first chunk lands.
     /// It has a latency now, shorter than the head's claims have been out,
     /// and a slot -- and the slot goes to the head piece, not to the next
-    /// chunk of the piece it was on. Before this the loop sent every chunk
-    /// of the deeper piece first, and a peer that could rescue the head
-    /// piece was gone for two request windows.
+    /// chunk of the piece it was on. Sending every chunk of the deeper
+    /// piece first would keep a peer that could rescue the head piece away
+    /// for two request windows.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_peer_on_a_whole_piece_gives_its_next_slot_to_the_head() -> anyhow::Result<()> {
         setup_test_logging();
@@ -5428,11 +5421,10 @@ mod connection_tests {
     /// `reading 262144 bytes at 1779199 of piece 834`, seconds after six
     /// and a half megabytes had been served out of that same piece.
     ///
-    /// Nothing could produce that while a piece had one peer: the peer that
-    /// wrote it was the peer that completed it. Splitting put several peers
-    /// on one piece, and the per-piece lock that used to make the write
-    /// exclusive by accident -- one writer, and a steal blocked out by
-    /// `try_write` -- had to be made exclusive on purpose.
+    /// It takes several peers on one piece, which splitting creates: with
+    /// one writer the peer that wrote a piece is the peer that completed
+    /// it. So the write is exclusive on purpose, not by way of there being
+    /// one writer.
     ///
     /// Here peer 2 is held inside its write of chunk 0 while peer 1 delivers
     /// the whole piece. Peer 1 must not get as far as the storage's

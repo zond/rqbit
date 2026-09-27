@@ -278,20 +278,12 @@ the thirty-second backstop only when none of those is coming.
 
 ## Status
 
-Built 2026-09-14 (`a31258c0`), rebuilt on the piece's age 2026-09-15 after
-two field logs; the head-at-every-slot ask and the newest-holder rule for
-joining a claim added the same day after the fourth log. The depth became
-the embedder's setting, with the completion median beside it, on
-2026-09-17 after the phone reproduced the television's stalls. Every rule and every wiring point -- the write path's stamp, the
-`pool_changed` pulse and the `retry_at` sleep among them -- is proven by
-a test that fails under mutation. The first log on the latency rules (xtremio
-`a58f5f0`) had 24- and 30-second head-piece blocks; the second (`ef6ac8c`,
-with the claims probe) showed why: ten of sixteen shares of piece 0 sitting
-in the pool while three peers each held two, and whole pieces held by
-high-latency pipelined peers that the holder's-last-delivery clock could
-not see. Both are what the piece's age measures. The fourth log (`2272a51`) then
-showed the comparison right and unasked: fast peers away on whole pieces
-while the head pool sat, and a claim at the holder cap with two dead-weight
-holders. Read the next log's `blocked_read_claims` lines for pieces older
-than a second with shares still unclaimed, or claims open longer than any
-connected peer's latency with only slow holders: there should be none.
+Built (`a31258c0`, rebuilt on the piece's age since), with the split depth
+the embedder's setting (`set_deadline_pieces`) and the completion median
+beside it. Every rule and every wiring point -- the write path's stamp, the
+`pool_changed` pulse and the `retry_at` sleep among them -- is proven by a
+test that fails under mutation. The field logs that shaped it are cited in
+the sections above and in "What this replaced". To check the next log: read
+its `blocked_read_claims` lines for pieces older than a second with shares
+still unclaimed, or claims open longer than any connected peer's latency
+with only slow holders. There should be none.
