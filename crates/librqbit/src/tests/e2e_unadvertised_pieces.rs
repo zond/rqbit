@@ -389,6 +389,20 @@ async fn e2e_unadvertised_pieces_default_is_unchanged() -> anyhow::Result<()> {
         seeder.announced_bitfield()?,
         seeder.with_chunk_tracker(|ct| ct.get_have_pieces().as_bytes().to_vec())?
     );
+
+    // And a live hold-back is upstream's to make: not refused, as it is under explicit
+    // advertising, but a narrowing of what a peer connecting later is sent.
+    assert_eq!(
+        seeder.set_pieces_advertised(HELD_BACK, false)?,
+        HELD_BACK.len(),
+        "the default refused a live hold-back"
+    );
+    assert_eq!(announced(&seeder)?, ADVERTISED.collect::<Vec<_>>());
+    assert_eq!(
+        seeder.set_pieces_advertised(HELD_BACK, true)?,
+        HELD_BACK.len()
+    );
+    assert_eq!(announced(&seeder)?, (0..TOTAL_PIECES).collect::<Vec<_>>());
     Ok(())
 }
 

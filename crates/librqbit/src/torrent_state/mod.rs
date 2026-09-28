@@ -535,16 +535,19 @@ impl ManagedTorrent {
     ///
     /// There is no un-Have in BitTorrent. A peer that was told cannot be untold, and one
     /// that asks for a piece we have stopped serving is left waiting on a request that
-    /// never completes. So **a live torrent refuses to withdraw an announcement**: a
-    /// `false` over a range holding any piece that is both ours and advertised changes
-    /// nothing and fails with [`advertised::WithdrawRefused`], which it also logs. Holding
-    /// back a piece we do not have yet is not a withdrawal -- nobody was told -- and a
-    /// live torrent does it. An announcement ends with the torrent leaving the swarm:
-    /// once it is paused, errored or initializing, it has no peers, and the set may be
-    /// changed freely, which is how a caller starts it again from a clean slate.
+    /// never completes. So **under explicit advertising a live torrent refuses to
+    /// withdraw an announcement**: a `false` over a range holding any piece that is both
+    /// ours and advertised changes nothing and fails with [`advertised::WithdrawRefused`],
+    /// which it also logs. Holding back a piece we do not have yet is not a withdrawal --
+    /// nobody was told -- and a live torrent does it. An announcement ends with the
+    /// torrent leaving the swarm: once it is paused, errored or initializing, it has no
+    /// peers, and the set may be changed freely, which is how a caller starts it again
+    /// from a clean slate.
     ///
     /// Under explicit advertising a live torrent also keeps what it announced: its
-    /// [`Self::drop_pieces`] skips a piece that is ours and advertised.
+    /// [`Self::drop_pieces`] skips a piece that is ours and advertised. Under the default
+    /// neither holds, as upstream: a `false` on a live torrent is a hold-back that
+    /// narrows the bitfield a peer connecting later is sent, and is not refused.
     ///
     /// # How long it lasts
     ///

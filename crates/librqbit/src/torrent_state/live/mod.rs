@@ -1250,10 +1250,11 @@ impl TorrentStateLive {
     /// already connected got a handshake bitfield without them and there is no other way
     /// to tell them. Peers that connect afterwards see them in that bitfield instead.
     ///
-    /// Stopping is refused, changing nothing, if any piece of the range is announced:
-    /// ours and advertised. The have-set is read under the state lock, which is what a
-    /// completion sets it under, so a piece cannot become ours between the check and the
-    /// change.
+    /// Under explicit advertising, stopping is refused, changing nothing, if any piece of
+    /// the range is announced: ours and advertised. The have-set is read under the state
+    /// lock, which is what a completion sets it under, so a piece cannot become ours
+    /// between the check and the change. Under the default it is not refused: a hold-back
+    /// there narrows only the bitfield a peer connecting later is sent, as upstream.
     pub(crate) fn set_pieces_advertised(
         &self,
         pieces: Range<u32>,
@@ -1274,10 +1275,17 @@ impl TorrentStateLive {
                 .collect();
             (added.len(), announce)
         } else {
-            let announced: Vec<u32> = ids()
-                .filter(|id| ct.is_piece_have(*id) && set.contains(*id))
-                .map(|id| id.get())
-                .collect();
+            // Only under explicit advertising: the default is upstream's, where what we
+            // announce is the have-set and a hold-back only narrows what a peer that
+            // connects later is sent.
+            let announced: Vec<u32> = if set.is_explicit() {
+                ids()
+                    .filter(|id| ct.is_piece_have(*id) && set.contains(*id))
+                    .map(|id| id.get())
+                    .collect()
+            } else {
+                Vec::new()
+            };
             if !announced.is_empty() {
                 drop(g);
                 let refused = super::advertised::WithdrawRefused { pieces: announced };

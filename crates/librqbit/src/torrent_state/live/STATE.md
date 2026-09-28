@@ -89,10 +89,11 @@ pub(crate) struct AdvertisedPieces {
 A piece is **announced** when `have[p] && advertised[p]`: the handshake bitfield is
 `have & advertised`, a Have goes out only for an advertised piece
 (`should_advertise_have`), and a request for an unadvertised piece is dropped
-(`on_download_request`). While the torrent is live the announced set only grows:
-`set_pieces_advertised(_, false)` is refused (`WithdrawRefused`) if it would clear an
-announced piece -- checked under the state lock, which is what a completion sets the
-have-bit under -- and under explicit advertising `drop_pieces` skips announced pieces.
+(`on_download_request`). Under explicit advertising, while the torrent is live the
+announced set only grows: `set_pieces_advertised(_, false)` is refused (`WithdrawRefused`)
+if it would clear an announced piece -- checked under the state lock, which is what a
+completion sets the have-bit under -- and `drop_pieces` skips announced pieces. Under the
+default neither is refused, as upstream.
 
 Its lock is a leaf: taken after the state lock where both are needed, and nothing is
 taken while it is held.
