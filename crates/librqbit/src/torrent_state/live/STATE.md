@@ -72,6 +72,31 @@ Per-peer tracking of which chunks have been requested from this peer. Used for:
 - Pricing an arrival: the time since its request is the peer's `last_latency`
 - Cleanup when peer dies
 
+### 4. `AdvertisedPieces` (in `torrent_state/advertised.rs`)
+
+Which pieces the torrent tells peers about. Lives on `ManagedTorrentShared`, not in
+the chunk tracker, so it outlives every state change -- a pause, and a restart out of
+an error, which builds a new tracker.
+
+```rust
+pub(crate) struct AdvertisedPieces {
+    set: RwLock<Option<BF>>,  // None: every piece (upstream); Some: exactly these
+    bytes: usize,             // bitfield size, to materialise the set
+    explicit: bool,           // SessionOptions::explicit_piece_advertising: starts empty
+}
+```
+
+A piece is **announced** when `have[p] && advertised[p]`: the handshake bitfield is
+`have & advertised`, a Have goes out only for an advertised piece
+(`should_advertise_have`), and a request for an unadvertised piece is dropped
+(`on_download_request`). While the torrent is live the announced set only grows:
+`set_pieces_advertised(_, false)` is refused (`WithdrawRefused`) if it would clear an
+announced piece -- checked under the state lock, which is what a completion sets the
+have-bit under -- and under explicit advertising `drop_pieces` skips announced pieces.
+
+Its lock is a leaf: taken after the state lock where both are needed, and nothing is
+taken while it is held.
+
 ## Piece State Invariant
 
 A piece is in exactly ONE of these states:

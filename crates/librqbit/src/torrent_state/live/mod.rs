@@ -1170,7 +1170,8 @@ impl TorrentStateLive {
     /// advertising them, and stop wanting them either way. Bookkeeping only - releasing
     /// the storage is the caller's job. See [`crate::ManagedTorrent::drop_pieces`].
     ///
-    /// Pieces a live stream is about to read are skipped.
+    /// Pieces a live stream is about to read are skipped, and so, under explicit
+    /// advertising, are pieces we have announced.
     pub(crate) fn drop_pieces(&self, pieces: Range<u32>) -> anyhow::Result<Vec<u32>> {
         let mut g = self.lock_write("drop_pieces");
         let locked = &mut **g;
@@ -1184,6 +1185,19 @@ impl TorrentStateLive {
         let candidates = droppable_pieces_in(pieces, &self.lengths, &wanted);
         let (dropped, freed) = {
             let pieces = locked.get_pieces_mut()?;
+            // Under explicit advertising a piece we announced stays ours while we are in
+            // the swarm: a peer that was told may still ask for it. Read under the same
+            // lock the completion sets the have-bit under, so nothing becomes announced
+            // between this and the drop.
+            let advertised = &self.shared.advertised;
+            let candidates: Vec<ValidPieceIndex> = if advertised.is_explicit() {
+                let ct = pieces.chunks();
+                candidates
+                    .filter(|id| !(ct.is_piece_have(*id) && advertised.contains(*id)))
+                    .collect()
+            } else {
+                candidates.collect()
+            };
             let have_before = pieces.chunks().get_hns().have_bytes;
             let dropped = pieces.drop_pieces(&self.metadata.file_infos, candidates)?;
             // Only the pieces we had move the have-bitfield and the have counter; a
@@ -1210,66 +1224,83 @@ impl TorrentStateLive {
     /// Two reasons to stay quiet. A Have is queued when the piece completes and can go out
     /// much later - after rate limiting, behind whatever else that peer's writer has to
     /// send. If we dropped the piece in between, advertising it earns us a request we
-    /// cannot serve and, with no reject-request in vanilla BitTorrent, a disconnect. And
-    /// the caller may have held the piece back on purpose - see
+    /// cannot serve. And the caller may not advertise the piece at all - see
     /// [`crate::ManagedTorrent::set_pieces_advertised`].
     ///
-    /// Only a torrent that opted into reclaim can lose a piece it had, and only a torrent
-    /// that has held something back has anything to hide, so only those pay for the lock.
-    /// The `unadvertised_pieces` gate is a fast path and not the truth: it goes up before
-    /// the set it summarises and comes down only under the lock that set changes under,
-    /// so it can be true with nothing held back - which costs a lock and answers
-    /// correctly - but never false while something is.
+    /// Only a torrent that opted into reclaim can lose a piece it had, and only one whose
+    /// advertised set is not everything has anything to hide, so only those pay for a
+    /// lock - the set's own, a leaf, and the state lock only under reclaim.
     pub(crate) fn should_advertise_have(&self, id: ValidPieceIndex) -> bool {
-        if !self.shared.options.piece_reclaim
-            && !self.shared.unadvertised_pieces.load(Ordering::Relaxed)
-        {
+        let advertised = &self.shared.advertised;
+        if !advertised.is_everything() && !advertised.contains(id) {
+            return false;
+        }
+        if !self.shared.options.piece_reclaim {
             return true;
         }
         self.lock_read("should_advertise_have")
             .get_chunks()
-            .is_ok_and(|ct| ct.is_piece_advertised(id))
+            .is_ok_and(|ct| ct.is_piece_have(id))
     }
 
-    /// Hold pieces back from what we announce, or put them back: see
-    /// [`crate::ManagedTorrent::set_pieces_advertised`]. Returns how many pieces changed,
-    /// and whether anything at all is still held back.
+    /// Advertise pieces, or stop advertising them, on a live torrent: see
+    /// [`crate::ManagedTorrent::set_pieces_advertised`]. Returns how many pieces changed.
     ///
     /// Pieces that just became advertised and that we have get a Have, because the peers
     /// already connected got a handshake bitfield without them and there is no other way
     /// to tell them. Peers that connect afterwards see them in that bitfield instead.
+    ///
+    /// Stopping is refused, changing nothing, if any piece of the range is announced:
+    /// ours and advertised. The have-set is read under the state lock, which is what a
+    /// completion sets it under, so a piece cannot become ours between the check and the
+    /// change.
     pub(crate) fn set_pieces_advertised(
         &self,
         pieces: Range<u32>,
         advertised: bool,
-    ) -> anyhow::Result<(usize, bool)> {
+    ) -> anyhow::Result<usize> {
         let ids = || valid_pieces_in(pieces.clone(), &self.lengths);
-        let mut g = self.lock_write("set_pieces_advertised");
-        let pt = g.get_pieces_mut()?;
-        // Collected before the change, while "held back" is still readable. Only the
-        // pieces that were hidden AND that we have need a Have; re-announcing the rest
-        // would be telling peers something they were already told.
-        let announce: Vec<ValidPieceIndex> = if advertised {
-            let ct = pt.chunks();
-            ids()
-                .filter(|id| ct.is_piece_have(*id) && ct.is_piece_held_back(*id))
-                .collect()
+        let set = &self.shared.advertised;
+        let g = self.lock_write("set_pieces_advertised");
+        let ct = g.get_chunks()?;
+        let (changed, announce) = if advertised {
+            // Collected before the change, from the pieces that change. Only the ones we
+            // have need a Have; the rest are announced by their own completion.
+            let added = set.add(ids());
+            let announce: Vec<ValidPieceIndex> = added
+                .iter()
+                .copied()
+                .filter(|id| ct.is_piece_have(*id))
+                .collect();
+            (added.len(), announce)
         } else {
-            Vec::new()
+            let announced: Vec<u32> = ids()
+                .filter(|id| ct.is_piece_have(*id) && set.contains(*id))
+                .map(|id| id.get())
+                .collect();
+            if !announced.is_empty() {
+                drop(g);
+                let refused = super::advertised::WithdrawRefused { pieces: announced };
+                warn!(
+                    id = self.shared.id,
+                    info_hash = ?self.shared.info_hash,
+                    "{refused}"
+                );
+                return Err(refused.into());
+            }
+            (set.remove(ids()), Vec::new())
         };
-        let changed = pt.set_pieces_advertised(ids(), advertised);
-        let still_held_back = pt.chunks().has_unadvertised_pieces();
         drop(g);
 
         self.announce_to_connected_peers(&announce);
-        Ok((changed, still_held_back))
+        Ok(changed)
     }
 
     /// Queue a Have for each of these pieces on every peer that has a writer, over the
     /// peer's own channel rather than the broadcast.
     ///
     /// The broadcast keeps the last 128 pieces, and a writer that falls behind skips what
-    /// it missed. Completions arrive one by one, at download speed; a hold-back lifted
+    /// it missed. Completions arrive one by one, at download speed; a set advertised
     /// all at once is a single synchronous burst of hundreds, so every connected peer
     /// would hear of the last 128 and never of the rest - its handshake bitfield came
     /// without them, and nothing else tells it. The peer's channel is unbounded and
@@ -2118,9 +2149,13 @@ impl PeerConnectionHandler for &'_ PeerHandler {
 
     fn serialize_bitfield_message_to_buf(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
         let g = self.state.lock_read("serialize_bitfield_message_to_buf");
-        // Not the have-bitfield: the pieces the caller has held back are cleared from it.
-        // A borrow of the have-bytes unless something actually is held back.
-        let advertised = g.get_chunks()?.advertised_pieces_bytes();
+        // Not the have-bitfield: the pieces we have and advertise. A borrow of the
+        // have-bytes while every piece is advertised.
+        let advertised = self
+            .state
+            .shared
+            .advertised
+            .announced(g.get_chunks()?.get_have_pieces().as_bytes());
         let msg = Message::Bitfield(ByteBuf(&advertised));
         let len = msg.serialize(buf, &Default::default)?;
         trace!("sending: {:?}, length={}", &msg, len);
@@ -2694,6 +2729,18 @@ impl PeerHandler {
                 );
             }
         };
+
+        // A piece we have not advertised is not served, whether we have it or not: we
+        // told nobody it was here. Dropped rather than answered -- the fork does not
+        // negotiate BEP 6, so there is no Reject Request to send -- and without hanging
+        // up, since a peer asking on the off chance has done nothing wrong.
+        if !self.state.shared.advertised.contains(piece_index) {
+            debug!(
+                ?request,
+                "a peer asked for a piece we do not advertise, dropping the request"
+            );
+            return Ok(());
+        }
 
         if !self
             .state

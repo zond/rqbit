@@ -238,6 +238,19 @@ pub async fn seeder(
     piece_len: u32,
     ratelimits: crate::limits::LimitsConfig,
 ) -> anyhow::Result<Seeder> {
+    seeder_advertising(prefix, file_size, piece_len, ratelimits, false).await
+}
+
+/// [`seeder`], in a session under
+/// [`crate::SessionOptions::explicit_piece_advertising`] when `explicit` is set: it has
+/// every piece and announces none of them until told.
+pub async fn seeder_advertising(
+    prefix: &str,
+    file_size: usize,
+    piece_len: u32,
+    ratelimits: crate::limits::LimitsConfig,
+    explicit: bool,
+) -> anyhow::Result<Seeder> {
     use anyhow::Context;
 
     let files = create_default_random_dir_with_torrents(1, file_size, Some(prefix));
@@ -265,6 +278,7 @@ pub async fn seeder(
                 ..Default::default()
             }),
             ratelimits,
+            explicit_piece_advertising: explicit,
             ..Default::default()
         },
     )

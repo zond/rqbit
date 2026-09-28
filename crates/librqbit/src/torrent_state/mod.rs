@@ -1,3 +1,4 @@
+pub mod advertised;
 pub mod initializing;
 pub mod live;
 pub mod paused;
@@ -11,7 +12,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Weak;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -210,23 +211,10 @@ pub struct ManagedTorrentShared {
     /// the torrent starves, in milliseconds: [`DEFAULT_STARVING_RETRY`] until
     /// [`ManagedTorrent::set_starving_retry`] changes it.
     pub(crate) starving_retry_ms: AtomicU64,
-    /// Whether [`ManagedTorrent::set_pieces_advertised`] has anything held back, so the
-    /// Have path can answer "announce it" without taking the state lock when it doesn't.
-    ///
-    /// Written only inside [`ManagedTorrent::set_pieces_advertised`], which holds
-    /// [`ManagedTorrent::locked`] for write from before the gate goes up to after it is
-    /// written back down. That is not the lock the set changes under - the set lives in
-    /// the chunk tracker, reached through [`TorrentStateLive`]'s own lock on the live
-    /// path and through no lock at all on the paused one - it is a lock held *around*
-    /// that, and it is what serialises the pair, because that call is the only thing in
-    /// the crate that changes the set. So two callers run one after the other, and each
-    /// leaves the gate agreeing with the set it left behind.
-    ///
-    /// It is a fast-path gate and not the truth: it can be true with nothing held back -
-    /// while a hold-back call is in flight, and after a re-check throws the set away -
-    /// which costs a lock and answers correctly. It is never false while something is
-    /// held back.
-    pub(crate) unadvertised_pieces: AtomicBool,
+    /// The pieces this torrent tells peers about, and serves: see [`advertised`]. Here and
+    /// not in the chunk tracker so that it survives every state change, including a
+    /// restart out of an error, which builds a new tracker.
+    pub(crate) advertised: advertised::AdvertisedPieces,
     pub(crate) connector: Arc<StreamConnector>,
     pub(crate) storage_factory: BoxStorageFactory,
     pub(crate) session: Weak<Session>,
@@ -466,9 +454,12 @@ impl ManagedTorrent {
     /// retry it.
     ///
     /// Skipped: pieces an earlier claim still holds; pieces that a live stream is about
-    /// to read - dropping those would only make them be re-requested at once; and pieces
+    /// to read - dropping those would only make them be re-requested at once; pieces
     /// a peer is working on, in-flight or fully downloaded and being hash-checked, which
-    /// complete and can be dropped then.
+    /// complete and can be dropped then; and, on a live torrent under
+    /// [`crate::SessionOptions::explicit_piece_advertising`], pieces we have announced
+    /// (see [`Self::set_pieces_advertised`]), which a peer that was told may still ask for.
+    /// Pause the torrent first to drop those.
     ///
     /// A dropped piece stays dropped until [`Self::reselect_pieces`] is called for it,
     /// the file it belongs to is re-selected through `update_only_files`, or a live
@@ -514,128 +505,97 @@ impl ManagedTorrent {
         }
     }
 
-    /// Hold `pieces` back from what we announce to peers, or put them back.
+    /// Advertise `pieces` to peers, or stop advertising them. Returns how many pieces
+    /// changed.
     ///
-    /// A held-back piece is one we may have, read and serve, but do not tell anyone
-    /// about: it is cleared from the bitfield we send on handshake, and completing it
-    /// sends no Have. Nothing else changes - we still download it, a stream still reads
-    /// it, and a peer that asks for it anyway is served, because we do have it. There is
-    /// no refusal path here and no need for one.
+    /// A piece is **announced** -- in the bitfield a peer is sent at its handshake, and
+    /// by a Have when it completes -- when we have it and it is advertised, and it is
+    /// **served** on the same terms: a peer's request for a piece we have not advertised
+    /// is dropped, unanswered and without hanging up on it. (The fork does not negotiate
+    /// BEP 6, so no peer can be sent a Reject Request; to the peer a dropped request is a
+    /// slow one.) We still download such a piece, and a stream still reads it.
     ///
-    /// A client is free to announce less than it holds; BEP-3 says what a Have and a
-    /// bitfield mean, not that every piece must produce one. This is that freedom, made
-    /// explicit and per piece.
+    /// # The two defaults
     ///
-    /// # What it is for
+    /// Upstream's: every piece is advertised, so what we announce is the have-set, and
+    /// nothing changes until this is called with `false`. Under
+    /// [`crate::SessionOptions::explicit_piece_advertising`]: nothing is, from the first
+    /// moment the torrent exists -- its add, its initial check, its restore at start-up --
+    /// and a piece is announced only once this has been called with `true` for it.
     ///
-    /// An application that streams video and bounds its cache reclaims pieces behind the
-    /// playhead within seconds of reading them (see [`Self::drop_pieces`]). Such a piece
-    /// must be `have` while the reader is on it, or the stream cannot read it - but
-    /// announcing it invites a request for a piece we are about to throw away, so the
-    /// peer spends a round trip to be disappointed. BEP-6's Reject Request only makes
-    /// that exchange formally legal - the peer still wasted the round trip, and clients
-    /// hold a rejection against the peer that sent it. Not advertising in the first place
-    /// costs the peer nothing.
+    /// # Advertising
     ///
-    /// So: hold the reclaim window back, advertise a piece once it leaves the window and
-    /// is there to stay. It is equally the answer for anything else we hold but do not
-    /// want traffic for.
+    /// Advertising a piece we have announces it: connected peers are sent a Have, on
+    /// each peer's own channel, so a whole torrent at once reaches every peer as surely
+    /// as one piece does. Advertising one we do not have yet announces it the moment it
+    /// completes, the way any BitTorrent client announces a piece -- which is how a
+    /// caller shares a set it chose before the pieces arrived.
     ///
-    /// # Using it
+    /// # Never withdrawing
     ///
-    /// The set is a range at a time and idempotent, so a moving window is two calls -
-    /// advertise what the playhead has left, hold back what it has reached - each one a
-    /// bit-range fill. Returns how many pieces actually changed.
+    /// There is no un-Have in BitTorrent. A peer that was told cannot be untold, and one
+    /// that asks for a piece we have stopped serving is left waiting on a request that
+    /// never completes. So **a live torrent refuses to withdraw an announcement**: a
+    /// `false` over a range holding any piece that is both ours and advertised changes
+    /// nothing and fails with [`advertised::WithdrawRefused`], which it also logs. Holding
+    /// back a piece we do not have yet is not a withdrawal -- nobody was told -- and a
+    /// live torrent does it. An announcement ends with the torrent leaving the swarm:
+    /// once it is paused, errored or initializing, it has no peers, and the set may be
+    /// changed freely, which is how a caller starts it again from a clean slate.
     ///
-    /// Hold a piece back BEFORE it completes if the goal is that no Have ever goes out
-    /// for it. There is no un-Have in BitTorrent: a peer we have already told cannot be
-    /// untold, and holding the piece back afterwards only stops us repeating it to peers
-    /// that connect later.
+    /// Under explicit advertising a live torrent also keeps what it announced: its
+    /// [`Self::drop_pieces`] skips a piece that is ours and advertised.
     ///
-    /// Putting pieces back sends a Have for each one we have and had held back, since the
-    /// peers already connected got a bitfield without them. Those are queued on each
-    /// peer's own writer channel, so a whole torrent at once reaches every peer as
-    /// surely as one piece does.
+    /// # How long it lasts
     ///
-    /// Holding back is orthogonal to having: a piece can be held back before it is
-    /// downloaded, and stays held back if it is dropped and downloaded again. It is a
-    /// policy set the caller owns, and nothing but this call changes it.
+    /// For the life of the torrent in this session, and not persisted. It is not in the
+    /// chunk tracker, so a pause keeps it, and so does a restart out of an error and the
+    /// full check that restart runs: what was announced before is announced again for as
+    /// long as the check still finds it on the disk, and an advertised piece it does not
+    /// find is announced when it is downloaded again. Removing the torrent ends it, and
+    /// adding it again starts from the default.
     ///
-    /// The set is per-session and is not persisted, like the want-set of
-    /// [`Self::drop_pieces`]. It lives in the chunk tracker: a pause keeps that, so a
-    /// pause keeps the set, and it is still in force when the torrent goes live again. A
-    /// re-check builds a new tracker, so the set is gone with the old one and everything
-    /// we have is announced again.
-    ///
-    /// Whether that is recoverable depends on how the re-check came about. A torrent
-    /// added again is, but not in one breath: adding it with
-    /// [`crate::AddTorrentOptions::paused`] returns while it is still `initializing` -
-    /// the check of what is on disk runs in the background - and this call refuses that
-    /// state. So: add it paused, await [`Self::wait_until_initialized`], which returns
-    /// once the check is done and the torrent is `paused`, hold back what must be held
-    /// back, then unpause. Nothing has been announced at any point in that, because a
-    /// torrent that has not been live has had no peers to announce to.
-    ///
-    /// A torrent restarted after an error (`error` -> `initializing`) is not - the check
-    /// runs in the background and the torrent goes initializing -> paused -> live in one
-    /// locked step when it finishes, so there is no state a caller can catch it in and
-    /// re-apply the set at. Watching for it to come back and re-applying then is after
-    /// the fact: it is live, and announcing, first. If those pieces must not be
-    /// announced, remove the torrent and add it again paused instead of restarting it.
-    ///
-    /// Works on a live or paused torrent, needs no options to have been set, and with
-    /// nothing held back costs nothing: what we announce is then the have-set itself.
+    /// Works in every state; with nothing ever held back it costs nothing.
     pub fn set_pieces_advertised(
         &self,
         pieces: Range<u32>,
         advertised: bool,
     ) -> anyhow::Result<usize> {
-        let gate = &self.shared.unadvertised_pieces;
-        let mut g = self.locked.write();
-        let was = gate.load(Ordering::Relaxed);
-        if !advertised {
-            // Before the set itself changes, never after, so the window between the two
-            // may only cost the Have path a lock and not let out a piece the caller has
-            // just asked us to hold back. Inside the lock, because holding that lock
-            // across both writes is what orders this against another caller doing the
-            // same thing - see the field's doc.
-            gate.store(true, Ordering::Relaxed);
+        // Under this lock, the state cannot change between the question "is it live?"
+        // and the change to the set: a torrent going live finds the set as this left it.
+        let g = self.locked.write();
+        if let ManagedTorrentState::Live(live) = &g.state {
+            return live.set_pieces_advertised(pieces, advertised);
         }
-        let result = match &mut g.state {
-            ManagedTorrentState::Live(live) => live.set_pieces_advertised(pieces, advertised),
-            ManagedTorrentState::Paused(paused) => {
-                Ok(paused.set_pieces_advertised(pieces, advertised))
-            }
-            state => Err(anyhow::anyhow!(
-                "torrent is neither live nor paused: {}",
-                state.name()
-            )),
+        // Not in the swarm: nobody to tell, and nothing announced to take back.
+        let lengths = *self.metadata.load_full().context("no metadata")?.lengths();
+        let ids = live::valid_pieces_in(pieces, &lengths);
+        let changed = if advertised {
+            self.shared.advertised.add(ids).len()
+        } else {
+            self.shared.advertised.remove(ids)
         };
-        match result {
-            // Recomputed rather than cleared, since this call may have put back only part
-            // of what is held back - and unconditionally, so a hold-back that held nothing
-            // back does not leave the gate stuck on. Still under the lock: two callers
-            // write the gate in the order they wrote the set, so whoever goes last leaves
-            // the gate saying what the set says. Store it after the lock and the loser of
-            // that race stores what the set looked like before the winner changed it.
-            Ok((changed, still_held_back)) => {
-                gate.store(still_held_back, Ordering::Relaxed);
-                drop(g);
-                Ok(changed)
-            }
-            // Nothing reached the set: the state arm refused the call, or the live arm
-            // failed to reach the chunk tracker, both before a bit was touched. So the
-            // gate goes back to what it said when we came in - it was right about the set
-            // then and the set has not moved. Without this the raise above sticks: this
-            // lives on ManagedTorrentShared, which outlives every state the torrent goes
-            // through, so there is nothing later to bring it down and every Have takes the
-            // lock for the life of the torrent.
-            Err(e) => {
-                gate.store(was, Ordering::Relaxed);
-                drop(g);
-                Err(e)
-            }
-        }
+        drop(g);
+        Ok(changed)
+    }
+
+    /// The pieces [`Self::set_pieces_advertised`] has left advertised, ascending, or
+    /// `None` when every piece is (upstream's default, with nothing held back). Whether
+    /// one is announced is whether we also have it.
+    pub fn advertised_pieces(&self) -> Option<Vec<u32>> {
+        self.shared.advertised.snapshot()
+    }
+
+    /// What this torrent announces right now: the bitfield a peer connecting now would
+    /// be sent. For tests.
+    #[cfg(test)]
+    pub(crate) fn announced_bitfield(&self) -> anyhow::Result<Vec<u8>> {
+        self.with_chunk_tracker(|ct| {
+            self.shared
+                .advertised
+                .announced(ct.get_have_pieces().as_bytes())
+                .into_owned()
+        })
     }
 
     /// Make pieces dropped by [`Self::drop_pieces`] wanted again, e.g. after seeking

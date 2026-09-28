@@ -102,6 +102,7 @@ pub use session::{
     SUPPORTED_SCHEMES, Session, SessionOptions, SessionPersistenceConfig,
 };
 pub use stream_connect::ConnectionOptions;
+pub use torrent_state::advertised::WithdrawRefused;
 pub use torrent_state::{
     DEFAULT_PEER_LIMIT, DEFAULT_STREAM_LOOKAHEAD_BYTES, DroppedPieces, FileStreamOptions,
     ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,

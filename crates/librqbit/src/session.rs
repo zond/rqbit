@@ -154,6 +154,9 @@ pub struct Session {
     _disable_upload: bool,
     pub ipv4_only: bool,
     pub peer_limit: Option<usize>,
+    /// [`SessionOptions::explicit_piece_advertising`], for every torrent this session
+    /// makes.
+    explicit_piece_advertising: bool,
     client_name_and_version: String,
 }
 
@@ -518,6 +521,18 @@ pub struct SessionOptions {
     /// Override the client name and version used in User-Agent headers and
     /// peer extended handshakes. Defaults to "rqbit X.Y.Z".
     pub client_name_and_version: Option<String>,
+
+    /// Announce nothing a caller has not asked for. Off by default, which is upstream's
+    /// behaviour: a torrent announces every piece it has.
+    ///
+    /// On, every torrent of the session -- added, restored at start-up, or restarted
+    /// out of an error -- announces and serves only the pieces
+    /// [`crate::ManagedTorrent::set_pieces_advertised`] was told to advertise, from the
+    /// moment it exists; and a live one keeps what it announced: it refuses to withdraw
+    /// an announcement, and its [`crate::ManagedTorrent::drop_pieces`] skips an announced
+    /// piece. For an application that shares a set it chose rather than whatever it
+    /// happens to hold.
+    pub explicit_piece_advertising: bool,
 }
 
 impl Default for SessionOptions {
@@ -546,6 +561,7 @@ impl Default for SessionOptions {
             disable_local_service_discovery: false,
             ipv4_only: false,
             client_name_and_version: None,
+            explicit_piece_advertising: false,
         }
     }
 }
@@ -845,6 +861,7 @@ impl Session {
                 trackers: opts.trackers,
                 disable_trackers: opts.disable_trackers,
                 peer_limit: opts.peer_limit,
+                explicit_piece_advertising: opts.explicit_piece_advertising,
                 client_name_and_version,
 
                 #[cfg(feature = "disable-upload")]
@@ -1464,7 +1481,10 @@ impl Session {
                     u64::try_from(crate::torrent_state::DEFAULT_STARVING_RETRY.as_millis())
                         .unwrap_or(u64::MAX),
                 ),
-                unadvertised_pieces: Default::default(),
+                advertised: crate::torrent_state::advertised::AdvertisedPieces::new(
+                    self.explicit_piece_advertising,
+                    metadata.lengths(),
+                ),
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),
                 streams: Default::default(),

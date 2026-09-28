@@ -1,10 +1,16 @@
-//! What a peer sees of a torrent that holds pieces back.
+//! What a peer sees of a torrent that does not advertise every piece.
 //!
-//! Two paths carry the have-set to a peer, and a held-back piece has to be missing from
-//! both: the bitfield sent at handshake, and the Have broadcast a completed piece sets
-//! off. These tests drive them over real connections between real sessions, so a leak
-//! shows up as the other side learning of a piece it was never told about - and, given
-//! long enough, downloading it.
+//! Two paths carry the have-set to a peer, and a piece we do not advertise has to be
+//! missing from both: the bitfield sent at handshake, and the Have a completed piece sets
+//! off. A third path is the upload: a request for such a piece is not served. These tests
+//! drive them over real connections between real sessions - and, where the exact bytes
+//! on the wire are the claim, from a hand-driven peer - so a leak shows up as the other
+//! side learning of a piece it was never told about, or being sent one.
+//!
+//! Under [`crate::SessionOptions::explicit_piece_advertising`] nothing is announced
+//! until [`ManagedTorrent::set_pieces_advertised`] advertises it, and an announcement is
+//! never taken back while the torrent is in the swarm. Without it every piece is
+//! advertised, as upstream, and pieces may be held back.
 
 use std::{net::Ipv4Addr, ops::Range, time::Duration};
 
@@ -15,9 +21,13 @@ use tokio::{io::AsyncReadExt, time::timeout};
 use tracing::info;
 
 use crate::{
-    AddTorrent, ManagedTorrent, ManagedTorrentState, Session,
+    AddTorrent, ManagedTorrent, Session,
+    storage::{StorageFactoryExt, examples::inmemory::InMemoryPieceStorageFactory},
     tests::test_util::{TestPeerMetadata, setup_test_logging},
-    torrent_state::live::peer::stats::snapshot::{PeerStatsFilter, PeerStatsFilterState},
+    torrent_state::{
+        advertised::WithdrawRefused,
+        live::peer::stats::snapshot::{PeerStatsFilter, PeerStatsFilterState},
+    },
 };
 
 use super::test_util;
@@ -27,25 +37,37 @@ const TOTAL_PIECES: u32 = 16;
 // The first half stands in for a playback window: pieces we have and read, and are about
 // to reclaim, so nobody should hear about them.
 const HELD_BACK: Range<u32> = 0..TOTAL_PIECES / 2;
+// What an explicitly advertising torrent announces in most tests below: the other half.
+const ADVERTISED: Range<u32> = TOTAL_PIECES / 2..TOTAL_PIECES;
 
 type Client = (std::sync::Arc<Session>, std::sync::Arc<ManagedTorrent>);
 
 // A session that has the whole torrent and listens for peers, plus the torrent file, the
-// directory it was made from, and the address to dial it on.
+// directory it was made from, and the address to dial it on. Upstream's default: it
+// advertises every piece.
 async fn seeder(prefix: &str) -> anyhow::Result<(TempDir, Vec<u8>, Client, std::net::SocketAddr)> {
-    seeder_of(prefix, TOTAL_PIECES).await
+    seeder_of(prefix, TOTAL_PIECES, false).await
+}
+
+// The same under explicit advertising: it has every piece and announces none of them.
+async fn explicit_seeder(
+    prefix: &str,
+) -> anyhow::Result<(TempDir, Vec<u8>, Client, std::net::SocketAddr)> {
+    seeder_of(prefix, TOTAL_PIECES, true).await
 }
 
 // The same, for a torrent of `pieces` pieces.
 async fn seeder_of(
     prefix: &str,
     pieces: u32,
+    explicit: bool,
 ) -> anyhow::Result<(TempDir, Vec<u8>, Client, std::net::SocketAddr)> {
-    let seeder = test_util::seeder(
+    let seeder = test_util::seeder_advertising(
         prefix,
         (PIECE_LEN * pieces) as usize,
         PIECE_LEN,
         Default::default(),
+        explicit,
     )
     .await?;
     Ok((
@@ -98,6 +120,17 @@ fn have_pieces(handle: &ManagedTorrent) -> anyhow::Result<Vec<u32>> {
     })
 }
 
+// The pieces this torrent announces right now: what a peer connecting now is told.
+fn announced(handle: &ManagedTorrent) -> anyhow::Result<Vec<u32>> {
+    let bytes = handle.announced_bitfield()?;
+    Ok(
+        crate::type_aliases::BF::from_boxed_slice(bytes.into_boxed_slice())
+            .iter_ones()
+            .filter_map(|id| u32::try_from(id).ok())
+            .collect(),
+    )
+}
+
 async fn wait_for_pieces(handle: &ManagedTorrent, want: &[u32]) -> anyhow::Result<()> {
     timeout(Duration::from_secs(30), async {
         loop {
@@ -110,64 +143,49 @@ async fn wait_for_pieces(handle: &ManagedTorrent, want: &[u32]) -> anyhow::Resul
     .await?
 }
 
-// The bitfield path: a peer sees what we announce and only that, while the pieces we
-// held back stay ours to read and to serve. It has no other source, so a piece from the
-// held-back half could only come from us having told it.
+// The bitfield path, under explicit advertising: a peer sees what we advertised and only
+// that, while the pieces we did not advertise stay ours to read. It has no other source,
+// so a piece from the unadvertised half could only come from us having told it.
 async fn e2e_unadvertised_pieces() -> anyhow::Result<()> {
     setup_test_logging();
     let (files, torrent_bytes, (_seeder_session, seeder), addr) =
-        seeder("test_unadvertised_pieces").await?;
+        explicit_seeder("test_unadvertised_pieces").await?;
     let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
 
-    // Held back before anyone connects, so the bitfield sent at handshake is the first
-    // thing that has to be short.
-    assert_eq!(
-        seeder.set_pieces_advertised(HELD_BACK, false)?,
-        HELD_BACK.len()
-    );
-    // Saying it twice changes nothing: a caller tracking a playhead re-states its window.
-    assert_eq!(seeder.set_pieces_advertised(HELD_BACK, false)?, 0);
-
-    // We still have every piece, we are still finished, and the pieces we held back are
-    // still ours to hand over if a peer asks for one anyway. Not advertising is not
-    // refusing: there is nothing to refuse, we have the piece.
+    // Every piece is ours and none of them is announced: nothing was advertised, and
+    // under this option that is from the moment the torrent existed.
     assert!(seeder.stats().finished);
     assert_eq!(have_pieces(&seeder)?, (0..TOTAL_PIECES).collect::<Vec<_>>());
-    let lengths = *seeder
-        .metadata
-        .load_full()
-        .context("no metadata")?
-        .lengths();
-    seeder.with_chunk_tracker(|ct| {
-        for id in HELD_BACK {
-            let piece = lengths.validate_piece_index(id).unwrap();
-            let chunk = lengths
-                .chunk_info_from_received_data(piece, 0, PIECE_LEN)
-                .unwrap();
-            assert!(
-                ct.is_chunk_ready_to_upload(&chunk),
-                "held back piece {id} became unservable"
-            );
-        }
-    })?;
+    assert_eq!(announced(&seeder)?, Vec::<u32>::new());
 
-    // And still readable, which is the reason a piece is kept `have` in the first place.
+    // Advertised before anyone connects, so the bitfield sent at handshake is the first
+    // thing that has to be short.
+    assert_eq!(
+        seeder.set_pieces_advertised(ADVERTISED, true)?,
+        ADVERTISED.len()
+    );
+    // Saying it twice changes nothing: a caller re-states its set.
+    assert_eq!(seeder.set_pieces_advertised(ADVERTISED, true)?, 0);
+    assert_eq!(announced(&seeder)?, ADVERTISED.collect::<Vec<_>>());
+
+    // Still readable, which is the reason a piece is kept `have` in the first place.
     let mut stream = seeder.clone().stream(0).await?;
     let mut read = Vec::new();
     stream.read_to_end(&mut read).await?;
     assert_eq!(read, orig_content);
 
-    info!("holding back pieces {HELD_BACK:?}, starting the peer");
+    info!("advertising {ADVERTISED:?}, starting the peer");
 
     let leecher_dir = TempDir::with_prefix("test_unadvertised_pieces_leecher")?;
     let (_leecher_session, leecher) = leecher(&leecher_dir, &torrent_bytes, addr).await?;
 
-    let advertised = (HELD_BACK.end..TOTAL_PIECES).collect::<Vec<_>>();
+    let advertised = ADVERTISED.collect::<Vec<_>>();
     wait_for_pieces(&leecher, &advertised).await?;
     assert!(!leecher.stats().finished);
 
-    // Let it try for a while: a Have that leaked out late would show up here, and this is
-    // long enough for the peer to have asked for the piece and got it.
+    // The window a "nothing else arrives" claim is measured over: a Have that leaked out
+    // late would show up here, and this is long enough for the peer to have asked for the
+    // piece and got it.
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(
         have_pieces(&leecher)?,
@@ -244,17 +262,17 @@ fn peer_connection_counters(
     Ok((peer.counters.connection_attempts, peer.counters.errors))
 }
 
-// The other half: a piece put back has to reach the peers that are already connected.
-// Their handshake bitfield came without it, so the only thing that can tell them is a
-// Have - and this asserts they got it that way, over the connection they already had,
-// rather than by the connection dying and the fresh handshake covering for it.
+// The other half: a piece advertised later has to reach the peers that are already
+// connected. Their handshake bitfield came without it, so the only thing that can tell
+// them is a Have - and this asserts they got it that way, over the connection they already
+// had, rather than by the connection dying and the fresh handshake covering for it.
 async fn e2e_unadvertised_pieces_come_back() -> anyhow::Result<()> {
     setup_test_logging();
     let (files, torrent_bytes, (_seeder_session, seeder), addr) =
-        seeder("test_unadvertised_pieces_come_back").await?;
+        explicit_seeder("test_unadvertised_pieces_come_back").await?;
     let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
 
-    seeder.set_pieces_advertised(HELD_BACK, false)?;
+    seeder.set_pieces_advertised(ADVERTISED, true)?;
 
     let leecher_dir = TempDir::with_prefix("test_unadvertised_pieces_come_back_leecher")?;
     let (_leecher_session, leecher) = leecher(&leecher_dir, &torrent_bytes, addr).await?;
@@ -263,9 +281,9 @@ async fn e2e_unadvertised_pieces_come_back() -> anyhow::Result<()> {
 
     let before = peer_connection_counters(&leecher, addr)?;
 
-    info!("advertising {HELD_BACK:?} again");
+    info!("advertising {HELD_BACK:?} too");
 
-    // The window has moved on and these pieces are staying, so announce them.
+    // These pieces are to be shared as well, so announce them.
     assert_eq!(
         seeder.set_pieces_advertised(HELD_BACK, true)?,
         HELD_BACK.len()
@@ -294,25 +312,22 @@ async fn test_e2e_unadvertised_pieces_come_back() -> anyhow::Result<()> {
     .await?
 }
 
-// More pieces put back at once than the Have broadcast holds, to a peer that is already
-// connected. A caller that holds back a playback window puts a whole extent back when the
-// window moves on, and that is hundreds of pieces in one call. The broadcast keeps the
-// last 128 and a writer that falls behind it skips what it missed, so the peer would hear
-// of the last 128 and never of the rest: it has no other way to learn of them short of
-// hanging up and getting a fresh bitfield, which nothing makes it do.
+// More pieces advertised at once than the Have broadcast holds, to a peer that is already
+// connected. A caller that shares a finished download advertises a whole file in one
+// call, and that is hundreds of pieces. The broadcast keeps the last 128 and a writer that
+// falls behind it skips what it missed, so the peer would hear of the last 128 and never
+// of the rest: it has no other way to learn of them short of hanging up and getting a
+// fresh bitfield, which nothing makes it do.
 async fn e2e_unadvertised_pieces_come_back_in_bulk() -> anyhow::Result<()> {
     const PIECES: u32 = 512;
     setup_test_logging();
     let (files, torrent_bytes, (_seeder_session, seeder), addr) =
-        seeder_of("test_unadvertised_pieces_bulk", PIECES).await?;
+        seeder_of("test_unadvertised_pieces_bulk", PIECES, true).await?;
     let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
 
-    // All of it, so the handshake bitfield tells the peer nothing and every piece it gets
-    // it has to have heard of by Have.
-    assert_eq!(
-        seeder.set_pieces_advertised(0..PIECES, false)?,
-        PIECES as usize
-    );
+    // Nothing advertised, so the handshake bitfield tells the peer nothing and every
+    // piece it gets it has to have heard of by Have.
+    assert_eq!(announced(&seeder)?, Vec::<u32>::new());
 
     let leecher_dir = TempDir::with_prefix("test_unadvertised_pieces_bulk_leecher")?;
     let (_leecher_session, leecher) = leecher(&leecher_dir, &torrent_bytes, addr).await?;
@@ -367,14 +382,13 @@ async fn e2e_unadvertised_pieces_default_is_unchanged() -> anyhow::Result<()> {
     );
 
     // Nothing was ever held back, so what we announce is the have-bitfield itself and
-    // putting pieces "back" is a no-op rather than an allocation.
+    // advertising pieces is a no-op rather than an allocation.
     assert_eq!(seeder.set_pieces_advertised(0..u32::MAX, true)?, 0);
-    seeder.with_chunk_tracker(|ct| {
-        assert_eq!(
-            ct.advertised_pieces_bytes().as_ref(),
-            ct.get_have_pieces().as_bytes()
-        );
-    })?;
+    assert_eq!(seeder.advertised_pieces(), None);
+    assert_eq!(
+        seeder.announced_bitfield()?,
+        seeder.with_chunk_tracker(|ct| ct.get_have_pieces().as_bytes().to_vec())?
+    );
     Ok(())
 }
 
@@ -389,7 +403,7 @@ async fn test_e2e_unadvertised_pieces_default_is_unchanged() -> anyhow::Result<(
 
 // A session that starts with nothing, knows nobody, and listens - so a peer can connect
 // to it and watch what it announces while it fills up. Nothing reaches it until the test
-// hands it a peer.
+// hands it a peer. Under explicit advertising, so it announces only what it is told to.
 async fn middle(
     prefix: &str,
     torrent_bytes: &[u8],
@@ -405,6 +419,7 @@ async fn middle(
                 listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
                 ..Default::default()
             }),
+            explicit_piece_advertising: true,
             ..Default::default()
         },
     )
@@ -453,24 +468,26 @@ async fn wait_for_live_peers(handle: &ManagedTorrent, n: u32) -> anyhow::Result<
 }
 
 // The Have path, which the bitfield path cannot reach: a peer that is already connected
-// when a held-back piece completes. It got no bitfield - we had nothing to send one about
-// - so a Have is the only thing that could tell it, and there must not be one.
+// when a piece completes. It got no bitfield - we had nothing to send one about - so a
+// Have is the only thing that can tell it anything. Under explicit advertising a piece
+// advertised before it arrives is announced the moment it completes, and a piece that
+// was not advertised is not announced at all.
 //
-// Three sessions, because the piece has to complete on the session being watched: a
-// seeder, a middle that downloads from it with everything held back, and a watcher that
-// knows only the middle and so can have learnt nothing anywhere else.
+// Three sessions, because the pieces have to complete on the session being watched: a
+// seeder, a middle that downloads from it, and a watcher that knows only the middle and
+// so can have learnt nothing anywhere else.
 async fn e2e_unadvertised_pieces_completing_while_held_back() -> anyhow::Result<()> {
     setup_test_logging();
     let (_seeder_files, torrent_bytes, (_seeder_session, _seeder), seeder_addr) =
         seeder("test_unadvertised_pieces_completing").await?;
 
-    // Held back before the middle has a single piece, and before it has anywhere to get
-    // one: every piece it ever completes, it completes held back.
+    // Half advertised before the middle has a single piece, and before it has anywhere
+    // to get one: every piece it ever completes, it completes under this set.
     let (_middle_dir, (_middle_session, middle), middle_addr) =
         middle("test_unadvertised_pieces_completing_middle", &torrent_bytes).await?;
     assert_eq!(
-        middle.set_pieces_advertised(0..TOTAL_PIECES, false)?,
-        TOTAL_PIECES as usize
+        middle.set_pieces_advertised(ADVERTISED, true)?,
+        ADVERTISED.len()
     );
     assert_eq!(have_pieces(&middle)?, Vec::<u32>::new());
 
@@ -499,44 +516,49 @@ async fn e2e_unadvertised_pieces_completing_while_held_back() -> anyhow::Result<
     timeout(Duration::from_secs(30), middle.wait_until_completed()).await??;
     assert_eq!(have_pieces(&middle)?, (0..TOTAL_PIECES).collect::<Vec<_>>());
 
-    // Long enough for a Have queued behind the completion to have gone out, been asked
-    // about and answered. Watched throughout rather than sampled at the end: a Have moves
-    // the watcher's picture of us the instant it lands, and it would move back if the
-    // connection were replaced by a fresh handshake.
+    // The advertised half was announced as it completed: the watcher heard of it by Have,
+    // since it had no bitfield, and fetched it.
+    let advertised = ADVERTISED.collect::<Vec<_>>();
+    wait_for_pieces(&watcher, &advertised).await?;
+
+    // The window a "nothing else arrives" claim is measured over: long enough for a Have
+    // queued behind a completion to have gone out, been asked about and answered. Watched
+    // throughout rather than sampled at the end: a Have moves the watcher's picture of us
+    // the instant it lands, and it would move back if the connection were replaced by a
+    // fresh handshake.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
         assert_eq!(
             live_peers(&watcher)?.1,
             0,
-            "the watcher was told about a piece that completed while held back"
+            "the watcher was told about a piece that completed unadvertised"
         );
         assert_eq!(
             have_pieces(&watcher)?,
-            Vec::<u32>::new(),
-            "the watcher got a piece that completed while held back"
+            advertised,
+            "the watcher got a piece that completed unadvertised"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     // Silence, not a dead peer: it spent all of that connected to the session that had
-    // every piece and said nothing.
+    // every piece and said nothing more.
     assert_eq!(live_peers(&watcher)?.0, 1);
 
-    info!("nothing leaked, now advertising the lot");
+    info!("nothing leaked, now advertising the rest");
 
     // The control, and the reason the silence above means something: that connection was
-    // never mute, it just had nothing to say. Put the pieces back and all sixteen Haves
-    // travel down it at once - the watcher goes from thinking we have nothing to thinking
-    // we have the lot. Same connection, so the counters must not move: a redial would
+    // never mute, it just had nothing more to say. Advertise the rest and its Haves travel
+    // down it at once. Same connection, so the counters must not move: a redial would
     // carry the pieces too, in a fresh handshake bitfield, and would say nothing about
     // the Have path.
     let before = peer_connection_counters(&watcher, middle_addr)?;
     assert_eq!(
         middle.set_pieces_advertised(0..TOTAL_PIECES, true)?,
-        TOTAL_PIECES as usize
+        HELD_BACK.len()
     );
     // Either the watcher now sees the middle as a seeder, or it has already
     // fetched the lot and the two have parted as finished peers do: a
-    // request loop woken by the Haves it was waiting on downloads sixteen
+    // request loop woken by the Haves it was waiting on downloads eight
     // small pieces over loopback faster than this polls. Both mean the Haves
     // arrived; the counters below say on which connection.
     timeout(Duration::from_secs(30), async {
@@ -566,264 +588,18 @@ async fn test_e2e_unadvertised_pieces_completing_while_held_back() -> anyhow::Re
     .await?
 }
 
-// Whether the Have path can skip the state lock, which is the whole cost of this feature
-// for a torrent that never uses it.
-fn gate(handle: &ManagedTorrent) -> bool {
-    handle
-        .shared
-        .unadvertised_pieces
-        .load(std::sync::atomic::Ordering::Relaxed)
-}
-
-fn anything_held_back(handle: &ManagedTorrent) -> anyhow::Result<bool> {
-    handle.with_chunk_tracker(|ct| ct.has_unadvertised_pieces())
-}
-
-// The gate is allowed to be true with nothing held back - it costs a lock and the lock
-// gives the right answer. It is not allowed to be false while something is held back:
-// false is the fast path that never looks at the set, so a Have would go out for a piece
-// the caller is holding back.
-//
-// That holds only if both writes to the gate happen inside the write guard on
-// ManagedTorrent::locked that the call takes and keeps around the change to the set. That
-// guard is not the lock the set itself changes under - it is held around it - but it is
-// what keeps two callers off each other. This is the half of it a single caller can show:
-// the gate must not move before the guard is taken, because a caller already holding it
-// can be about to compute "nothing held back" and store that over the top.
-async fn e2e_unadvertised_pieces_gate_waits_for_the_lock() -> anyhow::Result<()> {
-    setup_test_logging();
-    let (_files, _torrent_bytes, (_session, handle), _addr) =
-        seeder("test_unadvertised_pieces_gate").await?;
-    assert!(!gate(&handle));
-
-    // All sync: holding the state lock across an await would stall the whole runtime.
-    tokio::task::block_in_place(|| -> anyhow::Result<()> {
-        let g = handle.locked.write();
-        let holder = std::thread::spawn({
-            let handle = handle.clone();
-            move || handle.set_pieces_advertised(HELD_BACK, false)
-        });
-        // Long enough for it to have got as far as it is going to get, which is the lock.
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(
-            !gate(&handle),
-            "the gate went up before the lock the call holds around the change to the set"
-        );
-        drop(g);
-        holder
-            .join()
-            .map_err(|_| anyhow::anyhow!("the holding-back thread panicked"))??;
-        Ok(())
-    })?;
-
-    assert!(gate(&handle));
-    assert!(anything_held_back(&handle)?);
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_e2e_unadvertised_pieces_gate_waits_for_the_lock() -> anyhow::Result<()> {
-    timeout(
-        Duration::from_secs(120),
-        e2e_unadvertised_pieces_gate_waits_for_the_lock(),
-    )
-    .await?
-}
-
-// And the other half, which needs two callers: one holding pieces back while another puts
-// pieces back. Whichever of them changes the set last must be the one whose answer the
-// gate ends up with. Store the gate outside that guard and it is not: the advertiser can
-// read "nothing held back" off a set the other thread has not touched yet, and write that
-// after the other thread has held pieces back.
-//
-// A leak like that is not a moment, it is a state: the gate stays wrong until the next
-// call to this API, which is why looking after the threads are done finds it.
-async fn e2e_unadvertised_pieces_gate_survives_two_callers() -> anyhow::Result<()> {
-    setup_test_logging();
-    let (_files, _torrent_bytes, (_session, handle), _addr) =
-        seeder("test_unadvertised_pieces_race").await?;
-
-    // Two threads that live for the whole test and are let off a barrier together, rather
-    // than a pair spawned per round: spawning them is slow enough that the first would be
-    // done before the second started, and there would be no race to lose.
-    //
-    // This is a probabilistic test and cannot be made a deterministic one from out here:
-    // the losing interleave needs the advertising thread stopped in the few instructions
-    // between dropping the lock and storing the gate, and nothing outside the call can hold
-    // it there - only a hook in the production path could, which is not worth carrying. So
-    // it buys its odds with rounds. Measured against the wrong ordering (the gate stored
-    // after the lock is dropped) on a 20-run batch each: 60000 rounds caught it 15 times of
-    // 20, 240000 caught it 20 of 20. Hence the number below: about 5 seconds in a debug
-    // build, and the slowest test in this file.
-    //
-    // A red run means a real violation whatever the odds are: the gate and the set are read
-    // with both threads parked on the barrier, so there is nothing in flight that could
-    // explain the two disagreeing.
-    const ROUNDS: usize = 240000;
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
-    let failed = std::sync::Arc::new(parking_lot::Mutex::new(None));
-    let caller = |advertised: bool| {
-        let handle = handle.clone();
-        let barrier = barrier.clone();
-        let failed = failed.clone();
-        std::thread::spawn(move || {
-            for _ in 0..ROUNDS {
-                barrier.wait();
-                if let Err(e) = handle.set_pieces_advertised(HELD_BACK, advertised) {
-                    *failed.lock() = Some(e);
-                }
-                // Never skipped, whatever happened: the other two are waiting on it.
-                barrier.wait();
-            }
-        })
-    };
-
-    let threads =
-        tokio::task::block_in_place(|| -> anyhow::Result<[std::thread::JoinHandle<()>; 2]> {
-            let threads = [caller(false), caller(true)];
-            for round in 0..ROUNDS {
-                // Between rounds, with both threads parked on the barrier.
-                handle.set_pieces_advertised(0..TOTAL_PIECES, true)?;
-                assert!(!gate(&handle), "round {round}: the reset left the gate up");
-
-                barrier.wait();
-                barrier.wait();
-
-                if let Some(e) = failed.lock().take() {
-                    return Err(e);
-                }
-                assert!(
-                    !anything_held_back(&handle)? || gate(&handle),
-                    "round {round}: pieces are held back and the gate says nothing is, \
-                     so the Have path will announce them without ever looking"
-                );
-            }
-            Ok(threads)
-        })?;
-    for t in threads {
-        t.join()
-            .map_err(|_| anyhow::anyhow!("a calling thread panicked"))?;
-    }
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_e2e_unadvertised_pieces_gate_survives_two_callers() -> anyhow::Result<()> {
-    timeout(
-        Duration::from_secs(120),
-        e2e_unadvertised_pieces_gate_survives_two_callers(),
-    )
-    .await?
-}
-
-// A hold-back that holds nothing back - an empty range, or one past the last piece - must
-// leave the gate down. It goes up on the way in, before the set is touched, because at
-// that point we do not yet know; what brings it down again is that the gate is written
-// from the set on the way out whichever direction the call was going.
-async fn e2e_unadvertised_pieces_gate_comes_back_down() -> anyhow::Result<()> {
-    setup_test_logging();
-    let (_files, _torrent_bytes, (_session, handle), _addr) =
-        seeder("test_unadvertised_pieces_gate_down").await?;
-
-    assert_eq!(handle.set_pieces_advertised(0..0, false)?, 0);
-    assert!(!anything_held_back(&handle)?);
-    assert!(
-        !gate(&handle),
-        "a hold-back that held nothing back left the Have path taking the lock forever"
-    );
-
-    assert_eq!(
-        handle.set_pieces_advertised(TOTAL_PIECES..TOTAL_PIECES + 8, false)?,
-        0
-    );
-    assert!(!gate(&handle));
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_e2e_unadvertised_pieces_gate_comes_back_down() -> anyhow::Result<()> {
-    timeout(
-        Duration::from_secs(120),
-        e2e_unadvertised_pieces_gate_comes_back_down(),
-    )
-    .await?
-}
-
-// A call the torrent refuses must leave the gate exactly as it found it. The gate lives on
-// ManagedTorrentShared, which outlives every state the torrent passes through, so nothing
-// later comes along to correct one left up: every Have takes the state lock for the rest of
-// the torrent's life. And the raise happens on the way in, before we know whether the call
-// can go through at all.
-//
-// The refused state is swapped in by hand. The one a caller actually meets is
-// `initializing` - the window between add_torrent(paused: true) returning and the check of
-// what is on disk finishing, which is what the test below is about - and that window cannot
-// be held open from outside. The arm that refuses the call is the same one either way.
-async fn e2e_unadvertised_pieces_gate_survives_a_refused_call() -> anyhow::Result<()> {
-    setup_test_logging();
-    let (_files, _torrent_bytes, (_session, handle), _addr) =
-        seeder("test_unadvertised_pieces_gate_refused").await?;
-
-    // In and out with no await in between, so nothing else gets a look at it.
-    let refuse = |handle: &ManagedTorrent| {
-        let stashed = std::mem::replace(
-            &mut handle.locked.write().state,
-            ManagedTorrentState::Error(anyhow::anyhow!("a state this call does not serve")),
-        );
-        let refused = handle.set_pieces_advertised(HELD_BACK, false);
-        let gate_after = gate(handle);
-        handle.locked.write().state = stashed;
-        (refused, gate_after)
-    };
-
-    // Refused with nothing held back: the gate has to come back down.
-    let (refused, gate_after) = refuse(&handle);
-    assert!(refused.is_err());
-    assert!(!anything_held_back(&handle)?);
-    assert!(
-        !gate_after,
-        "a refused hold-back left the Have path taking the lock for the life of the torrent"
-    );
-
-    // Refused with pieces held back: the gate has to stay up. So it is put back to what it
-    // said, not cleared - clearing it here would be the one thing the gate may never do.
-    assert_eq!(
-        handle.set_pieces_advertised(HELD_BACK, false)?,
-        HELD_BACK.len()
-    );
-    assert!(gate(&handle));
-    let (refused, gate_after) = refuse(&handle);
-    assert!(refused.is_err());
-    assert!(anything_held_back(&handle)?);
-    assert!(
-        gate_after,
-        "a refused call put the gate down with pieces still held back, so the Have path \
-         will announce them without ever looking"
-    );
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_e2e_unadvertised_pieces_gate_survives_a_refused_call() -> anyhow::Result<()> {
-    timeout(
-        Duration::from_secs(120),
-        e2e_unadvertised_pieces_gate_survives_a_refused_call(),
-    )
-    .await?
-}
-
-// The sequence set_pieces_advertised documents for a torrent that has to be added again
-// with the set already in force: add it paused, wait for the check of what is on disk to
-// finish, hold back, then unpause. The wait is the step that is easy to leave out and
-// cannot be skipped - add_torrent returns while the torrent is still `initializing`, and
-// holding back is refused there.
+// A torrent added again, with its data on disk, under explicit advertising: from the
+// moment it exists - through its initial check and into live - it announces nothing it
+// was not told to, and the set can be given to it while it is still checking. No pause,
+// no waiting for the check: there is no moment at which it announced its pieces by
+// default.
 async fn e2e_unadvertised_pieces_readded_paused() -> anyhow::Result<()> {
     setup_test_logging();
     let (files, torrent_bytes, (session, seeder), addr) =
-        seeder("test_unadvertised_pieces_readd").await?;
+        explicit_seeder("test_unadvertised_pieces_readd").await?;
 
     // Out of the session, data left where it is. The set is per-session, so the torrent
-    // comes back announcing everything it finds - which is what the sequence is for.
+    // comes back with a fresh one.
     session.delete(seeder.id().into(), false).await?;
     drop(seeder);
 
@@ -831,7 +607,7 @@ async fn e2e_unadvertised_pieces_readded_paused() -> anyhow::Result<()> {
         .add_torrent(
             AddTorrent::from_bytes(torrent_bytes.clone()),
             Some(crate::AddTorrentOptions {
-                paused: true,
+                paused: false,
                 output_folder: Some(files.path().to_str().unwrap().to_owned()),
                 overwrite: true,
                 ..Default::default()
@@ -840,31 +616,25 @@ async fn e2e_unadvertised_pieces_readded_paused() -> anyhow::Result<()> {
         .await?
         .into_handle()
         .context("expected a handle")?;
-
-    // The step. Without it the torrent is still checking the files and the hold-back below
-    // is refused; with it the torrent is paused, which is a state this call serves.
-    timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
-    assert!(handle.is_paused());
-    assert!(handle.live().is_none());
+    // Whatever state the check has reached, the call is served.
     assert_eq!(
-        handle.set_pieces_advertised(HELD_BACK, false)?,
-        HELD_BACK.len()
+        handle.set_pieces_advertised(ADVERTISED, true)?,
+        ADVERTISED.len()
     );
-
-    // Only now does it get to talk to anyone, and the first bitfield it sends is already
-    // short.
-    session.unpause(&handle).await?;
     timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
+    assert!(handle.live().is_some());
+    assert_eq!(announced(&handle)?, ADVERTISED.collect::<Vec<_>>());
 
     let leecher_dir = TempDir::with_prefix("test_unadvertised_pieces_readd_leecher")?;
     let (_leecher_session, leecher) = leecher(&leecher_dir, &torrent_bytes, addr).await?;
-    let advertised = (HELD_BACK.end..TOTAL_PIECES).collect::<Vec<_>>();
+    let advertised = ADVERTISED.collect::<Vec<_>>();
     wait_for_pieces(&leecher, &advertised).await?;
+    // The window a "nothing else arrives" claim is measured over.
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(
         have_pieces(&leecher)?,
         advertised,
-        "the peer got a piece held back on the torrent before it was ever unpaused"
+        "the peer got a piece the re-added torrent was never told to advertise"
     );
     assert!(!leecher.stats().finished);
     Ok(())
@@ -875,6 +645,296 @@ async fn test_e2e_unadvertised_pieces_readded_paused() -> anyhow::Result<()> {
     timeout(
         Duration::from_secs(120),
         e2e_unadvertised_pieces_readded_paused(),
+    )
+    .await?
+}
+
+// A peer driven by hand, so the bytes on the wire are the claim and not what a session
+// made of them: the handshake, then messages as `(id, payload)`. It announces no
+// extension (reserved bits all zero), so the other side sends it nothing but BEP-3.
+struct RawPeer {
+    stream: tokio::net::TcpStream,
+}
+
+const MSG_UNCHOKE: u8 = 1;
+const MSG_INTERESTED: u8 = 2;
+const MSG_HAVE: u8 = 4;
+const MSG_BITFIELD: u8 = 5;
+const MSG_REQUEST: u8 = 6;
+const MSG_PIECE: u8 = 7;
+
+impl RawPeer {
+    async fn connect(
+        addr: std::net::SocketAddr,
+        info_hash: librqbit_core::hash_id::Id20,
+    ) -> anyhow::Result<Self> {
+        use tokio::io::AsyncWriteExt;
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
+        let mut handshake = Vec::with_capacity(68);
+        handshake.push(19);
+        handshake.extend_from_slice(b"BitTorrent protocol");
+        handshake.extend_from_slice(&[0; 8]);
+        handshake.extend_from_slice(&info_hash.0);
+        handshake.extend_from_slice(&TestPeerMetadata::good().as_peer_id().0);
+        stream.write_all(&handshake).await?;
+        let mut theirs = [0u8; 68];
+        stream.read_exact(&mut theirs).await?;
+        anyhow::ensure!(&theirs[28..48] == info_hash.0.as_slice(), "wrong torrent");
+        Ok(Self { stream })
+    }
+
+    async fn send(&mut self, id: u8, payload: &[u8]) -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let len = u32::try_from(payload.len() + 1)?;
+        self.stream.write_all(&len.to_be_bytes()).await?;
+        self.stream.write_all(&[id]).await?;
+        self.stream.write_all(payload).await?;
+        Ok(())
+    }
+
+    async fn request(&mut self, piece: u32) -> anyhow::Result<()> {
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&piece.to_be_bytes());
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        payload.extend_from_slice(&PIECE_LEN.to_be_bytes());
+        self.send(MSG_REQUEST, &payload).await
+    }
+
+    // The next message, keep-alives skipped. Bounded, so a peer that has gone quiet
+    // fails the test with what it was waiting for rather than hanging it.
+    async fn next(&mut self) -> anyhow::Result<(u8, Vec<u8>)> {
+        timeout(Duration::from_secs(30), async {
+            loop {
+                let mut len = [0u8; 4];
+                self.stream.read_exact(&mut len).await?;
+                let len = u32::from_be_bytes(len) as usize;
+                if len == 0 {
+                    continue;
+                }
+                let mut msg = vec![0u8; len];
+                self.stream.read_exact(&mut msg).await?;
+                let id = msg.remove(0);
+                return Ok::<_, anyhow::Error>((id, msg));
+            }
+        })
+        .await
+        .context("the peer sent nothing for 30 s")?
+    }
+
+    // What the other side announced at the handshake: its bitfield, which it sends
+    // before its unchoke.
+    async fn bitfield(&mut self) -> anyhow::Result<Vec<u32>> {
+        let (id, payload) = self.next().await?;
+        anyhow::ensure!(
+            id == MSG_BITFIELD,
+            "expected a bitfield first, got message {id}"
+        );
+        Ok(bits(&payload))
+    }
+
+    // Wait for the message `id`, collecting the Haves that arrive on the way.
+    async fn until(&mut self, id: u8, haves: &mut Vec<u32>) -> anyhow::Result<Vec<u8>> {
+        loop {
+            let (got, payload) = self.next().await?;
+            if got == id {
+                return Ok(payload);
+            }
+            if got == MSG_HAVE {
+                haves.push(u32::from_be_bytes(payload[..4].try_into()?));
+            }
+        }
+    }
+}
+
+fn bits(bytes: &[u8]) -> Vec<u32> {
+    crate::type_aliases::BF::from_boxed_slice(bytes.to_vec().into_boxed_slice())
+        .iter_ones()
+        .filter_map(|id| u32::try_from(id).ok())
+        .collect()
+}
+
+// The piece a Piece message carries.
+fn piece_index(payload: &[u8]) -> anyhow::Result<u32> {
+    Ok(u32::from_be_bytes(payload[..4].try_into()?))
+}
+
+// Under explicit advertising, on the wire: the bitfield a peer is sent at its handshake
+// names nothing until something is advertised, then exactly what was; advertising a
+// piece we have sends a connected peer its Have; a request for a piece we have and did
+// not advertise is dropped, not served, and the connection stays; and an announcement is
+// never taken back.
+async fn e2e_explicit_advertising_on_the_wire() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (_files, _torrent_bytes, (_session, seeder), addr) =
+        explicit_seeder("test_explicit_advertising_wire").await?;
+    let info_hash = seeder.info_hash();
+
+    // Every piece is ours; the bitfield says none of them is.
+    let mut first = RawPeer::connect(addr, info_hash).await?;
+    assert_eq!(first.bitfield().await?, Vec::<u32>::new());
+    let mut haves = Vec::new();
+    first.until(MSG_UNCHOKE, &mut haves).await?;
+    first.send(MSG_INTERESTED, &[]).await?;
+
+    // Advertised with the peer connected: it hears of each piece by Have.
+    assert_eq!(
+        seeder.set_pieces_advertised(ADVERTISED, true)?,
+        ADVERTISED.len()
+    );
+    // A request for a piece we have and did not advertise, then one for a piece we did.
+    // The upload is served in order, so had the first been served its Piece would be
+    // the first to arrive.
+    first.request(HELD_BACK.start).await?;
+    first.request(ADVERTISED.start).await?;
+    let piece = first.until(MSG_PIECE, &mut haves).await?;
+    assert_eq!(
+        piece_index(&piece)?,
+        ADVERTISED.start,
+        "we served a piece we never advertised"
+    );
+    // Not hung up on: the next request on the same connection is served too.
+    first.request(ADVERTISED.start + 1).await?;
+    let piece = first.until(MSG_PIECE, &mut haves).await?;
+    assert_eq!(piece_index(&piece)?, ADVERTISED.start + 1);
+    haves.sort_unstable();
+    assert_eq!(haves, ADVERTISED.collect::<Vec<_>>());
+
+    // An announcement stays: a live torrent refuses to withdraw one, and changes nothing.
+    for range in [
+        ADVERTISED,
+        0..TOTAL_PIECES,
+        ADVERTISED.end - 1..ADVERTISED.end,
+    ] {
+        let refused = seeder
+            .set_pieces_advertised(range.clone(), false)
+            .expect_err("a live torrent withdrew an announcement");
+        let refused = refused
+            .downcast_ref::<WithdrawRefused>()
+            .context("expected the typed refusal")?;
+        assert_eq!(
+            refused.pieces,
+            range.filter(|p| ADVERTISED.contains(p)).collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(announced(&seeder)?, ADVERTISED.collect::<Vec<_>>());
+    assert_eq!(seeder.advertised_pieces(), Some(ADVERTISED.collect()));
+
+    // And a peer connecting now is told exactly the advertised half.
+    let mut second = RawPeer::connect(addr, info_hash).await?;
+    assert_eq!(second.bitfield().await?, ADVERTISED.collect::<Vec<_>>());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_explicit_advertising_on_the_wire() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_explicit_advertising_on_the_wire(),
+    )
+    .await?
+}
+
+// A restart out of an error throws the chunk tracker away and checks the disk again. The
+// advertised set is not in the tracker, so the torrent comes back announcing what it
+// announced before - no less, since those peers were told, and no more, since nobody
+// asked for more.
+async fn e2e_explicit_advertising_survives_a_restart_from_error() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (_files, _torrent_bytes, (session, seeder), addr) =
+        explicit_seeder("test_explicit_advertising_restart").await?;
+    let info_hash = seeder.info_hash();
+    seeder.set_pieces_advertised(ADVERTISED, true)?;
+
+    seeder.stop_with_error(anyhow::anyhow!("simulated fatal error"));
+    assert!(seeder.live().is_none());
+    // Out of the swarm, so it has nobody to answer to. Nothing asked here: the set is
+    // what it was.
+    session.unpause(&seeder).await?;
+    timeout(Duration::from_secs(30), seeder.wait_until_completed()).await??;
+    assert!(seeder.live().is_some(), "the restart did not go live");
+
+    let mut peer = RawPeer::connect(addr, info_hash).await?;
+    assert_eq!(
+        peer.bitfield().await?,
+        ADVERTISED.collect::<Vec<_>>(),
+        "the restart changed what the torrent announces"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_explicit_advertising_survives_a_restart_from_error() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_explicit_advertising_survives_a_restart_from_error(),
+    )
+    .await?
+}
+
+// Under explicit advertising a live torrent keeps what it announced: dropping it would
+// leave a peer that was told asking for a piece we no longer have. Out of the swarm -
+// paused - it drops like any other piece, and its set can be emptied, which is how a
+// caller starts it again from nothing.
+async fn e2e_explicit_advertising_keeps_what_it_announced() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (_files, torrent_bytes, (_seeder_session, _seeder), seeder_addr) =
+        seeder("test_explicit_advertising_keeps").await?;
+
+    let dir = TempDir::with_prefix("test_explicit_advertising_keeps_client")?;
+    let session = Session::new_with_opts(
+        dir.path().into(),
+        crate::SessionOptions {
+            dht: None,
+            persistence: None,
+            peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+            explicit_piece_advertising: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent_bytes.clone()),
+            Some(crate::AddTorrentOptions {
+                paused: false,
+                initial_peers: Some(vec![seeder_addr]),
+                piece_reclaim: true,
+                storage_factory: Some(InMemoryPieceStorageFactory::default().boxed()),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    timeout(Duration::from_secs(30), handle.wait_until_completed()).await??;
+    handle.set_pieces_advertised(ADVERTISED, true)?;
+
+    // Live: everything but the announced half goes.
+    let claim = handle.drop_pieces(0..TOTAL_PIECES)?;
+    assert_eq!(claim.pieces(), HELD_BACK.collect::<Vec<_>>().as_slice());
+    drop(claim);
+    assert_eq!(have_pieces(&handle)?, ADVERTISED.collect::<Vec<_>>());
+    assert_eq!(announced(&handle)?, ADVERTISED.collect::<Vec<_>>());
+
+    // Paused: out of the swarm, so the set may be emptied and the pieces dropped.
+    session.pause(&handle).await?;
+    assert_eq!(
+        handle.set_pieces_advertised(0..TOTAL_PIECES, false)?,
+        ADVERTISED.len()
+    );
+    assert_eq!(handle.advertised_pieces(), Some(Vec::new()));
+    let claim = handle.drop_pieces(ADVERTISED)?;
+    assert_eq!(claim.pieces(), ADVERTISED.collect::<Vec<_>>().as_slice());
+    drop(claim);
+    assert_eq!(have_pieces(&handle)?, Vec::<u32>::new());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_explicit_advertising_keeps_what_it_announced() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        e2e_explicit_advertising_keeps_what_it_announced(),
     )
     .await?
 }
