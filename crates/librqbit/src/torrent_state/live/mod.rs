@@ -3064,7 +3064,10 @@ impl PeerHandler {
                 // request on a plain download. Skipping it leaves nothing
                 // uncollected: the pool and retired-claim flags an ask drains
                 // are only set by the acquisition that drains them. A stream
-                // opened after this check is asked for at the next slot.
+                // opened after this check is asked for at the next slot. (A
+                // background stream alone makes no head either, and the ask
+                // then comes back empty too; it is asked anyway, for as long
+                // as a guess stands without its read.)
                 if ask_head
                     && !self.state.shared.streams.is_empty()
                     && let Some(Next::Share(piece, chunks)) = self.acquire_next_piece(Ask::Head)?

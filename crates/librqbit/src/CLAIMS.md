@@ -9,7 +9,7 @@ rebuilds them.
 
 - **Whole.** One holder, one claim covering the piece. Every piece reserved
   outside the head of the lookahead -- at depth >= the split depth (`DEFAULT_DEADLINE_PIECES`, 2, until the
-  embedder sets one),
+  embedder sets one), for a background stream (below),
   or from the ordinary queue -- is whole. This is vanilla rqbit: stealable
   at 10x, and `peer_avg_time` is honest because one peer fetched all of it.
 - **Split.** Cut into `CLAIM_CHUNKS` (16) claims, each held by one peer,
@@ -177,6 +177,51 @@ new video opens. Reactive joining -- letting anyone pile onto a blocked
 piece's last range -- was considered and rejected: it duplicates the range
 once per peer that frees a slot and can only shorten a stall that has
 already started, where a depth sized from measurement prevents it.
+
+## Background streams: a guess gets none of this
+
+A stream is opened either to be read or in the background
+(`FileStreamOptions::background`). A background stream is a stream nobody
+is reading yet: an embedder's guess at where a read will start -- the
+point a film was left at, say, while the player is still reading its
+header at the top of the file -- so that the first pieces there are on
+their way before the read arrives. Its pieces are fetched; what they are
+never given is anything above, because everything above is paid for by a
+read that is blocked, and nobody is blocked on a guess:
+
+- **Never at the head.** The head is the first `deadline_pieces` of the
+  *read* streams' lookahead that this peer could take. The walk takes read
+  pieces only until it has counted that many; a background piece is
+  reached only after, or once the read streams have nothing left, so no
+  background piece ever stands in the head, however many read pieces were
+  skipped as on disk or not the peer's. A read's blocked piece is offered
+  to every peer before any background piece is offered to one.
+- **Never split, cut or copied.** Reserved whole, joined only for work
+  nobody holds (`Share::Unclaimed`), never cut by `split_whole`.
+- **Never offered to the head ask.** `acquire_head_share` walks the read
+  streams' head and stops there.
+- **Never stolen for.** A background piece is never the
+  `held_priority_piece` the 10x steal is attempted for. (The vanilla 3x
+  steal of the oldest piece in flight, after the ordinary queue is empty,
+  treats it as it treats any whole piece.)
+
+Past the head, a peer looking for a whole piece meets the read streams'
+deeper pieces and the background streams' pieces in turn, a read piece
+first: with `deadline_pieces` at 2, one read stream wanting R1, R2, ...
+and one background stream wanting B1, B2, ..., a peer that can take
+nothing at the head is offered R3, B1, R4, B2, ... -- each class going on
+alone once the other has run out. Each class is interleaved among its own
+streams, one piece of each in turn, in an order shuffled per ask. With no
+background stream open, the order and every decision are what they were
+before background streams existed.
+
+Nothing remembers what a piece was reserved for. When the read arrives
+where the guess was, the embedder drops the background stream and the
+read opens a read stream there; the piece reserved whole for the guess is
+then at the head, and is cut like any whole piece that drifts there.
+And it is a piece like any other once it completes: a sample for
+`median_completion`, which is the time whole pieces take as much as split
+ones.
 
 ## When a refused peer asks again
 

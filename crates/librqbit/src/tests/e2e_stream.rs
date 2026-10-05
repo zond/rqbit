@@ -178,3 +178,77 @@ async fn a_stream_open_across_an_error_and_restart_is_still_seen() -> anyhow::Re
     );
     Ok(())
 }
+
+/// A stream opened with `background: true` is one: what it wants is the
+/// background class of the lookahead, and nothing of it is read -- and the
+/// plain stream opened beside it is read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_opened_in_the_background_is_one() -> anyhow::Result<()> {
+    setup_test_logging();
+    let files = create_default_random_dir_with_torrents(1, 8192, Some("stream_background"));
+    let torrent = create_torrent(
+        files.path(),
+        CreateTorrentOptions {
+            piece_length: Some(1024),
+            ..Default::default()
+        },
+        &BlockingSpawner::new(1),
+    )
+    .await?;
+    // Somewhere else, so the streams have something to want.
+    let dir = TempDir::with_prefix("stream_background_client")?;
+    let session = Session::new_with_opts(
+        dir.path().into(),
+        crate::SessionOptions {
+            dht: None,
+            persistence: None,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent.as_bytes()?.to_vec()),
+            Some(crate::AddTorrentOptions {
+                overwrite: true,
+                output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+    let metadata = handle.metadata.load_full().context("expected metadata")?;
+    let lookahead = |handle: &crate::torrent_state::ManagedTorrentHandle| {
+        let mut next = handle.shared().streams.iter_next_pieces(metadata.lengths());
+        let read: Vec<u32> = next.read.by_ref().map(|p| p.get()).collect();
+        let background: Vec<u32> = next.background.by_ref().map(|p| p.get()).collect();
+        (read, background)
+    };
+
+    let _guess = handle
+        .clone()
+        .stream_with_options(
+            0,
+            crate::FileStreamOptions {
+                lookahead_bytes: 2048,
+                background: true,
+            },
+        )
+        .await?;
+    assert_eq!(lookahead(&handle), (vec![], vec![0, 1]));
+
+    let _read = handle
+        .clone()
+        .stream_with_options(
+            0,
+            crate::FileStreamOptions {
+                lookahead_bytes: 1024,
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(lookahead(&handle), (vec![0], vec![0, 1]));
+    Ok(())
+}

@@ -48,7 +48,10 @@ fn stream_options(query: &StreamQueryParams) -> Result<FileStreamOptions> {
             "lookahead_bytes must be at most {MAX_LOOKAHEAD_BYTES}"
         ))
         .with_status(StatusCode::BAD_REQUEST),
-        Some(lookahead_bytes) => Ok(FileStreamOptions { lookahead_bytes }),
+        Some(lookahead_bytes) => Ok(FileStreamOptions {
+            lookahead_bytes,
+            ..Default::default()
+        }),
         None => Ok(FileStreamOptions::default()),
     }
 }

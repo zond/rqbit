@@ -935,6 +935,7 @@ async fn e2e_piece_reclaim_a_seek_out_of_the_window_wakes_the_seeder() -> anyhow
             0,
             crate::FileStreamOptions {
                 lookahead_bytes: PIECE_LEN as u64,
+                ..Default::default()
             },
         )
         .await?;
@@ -995,6 +996,7 @@ async fn e2e_piece_reclaim_a_release_under_a_parked_read_wakes_the_seeder() -> a
             0,
             crate::FileStreamOptions {
                 lookahead_bytes: PIECE_LEN as u64,
+                ..Default::default()
             },
         )
         .await?;

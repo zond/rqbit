@@ -1,3 +1,26 @@
+//! Streams: readers of one file of a torrent, and what they want next.
+//!
+//! Every open stream has a position and a lookahead, and the pieces from the
+//! one to the other are what the torrent fetches first
+//! ([`TorrentStreams::iter_next_pieces`], read by the piece picker). A
+//! stream is one of two classes, chosen when it opens
+//! ([`FileStreamOptions::background`]):
+//!
+//! - **Read** (the default): somebody is reading it, or about to. The first
+//!   pieces of its lookahead are pieces a read blocks on, and the picker
+//!   gives them everything it has: split between peers, joined by any peer
+//!   faster than the one holding a share, asked for before every chunk sent
+//!   elsewhere (`CLAIMS.md`).
+//! - **Background**: a stream nobody is reading yet -- opened at a guess at
+//!   where a read will start, so that the first pieces there are on their
+//!   way before it does. Its pieces are fetched whole, one peer each, never
+//!   split, copied or stolen for, and never offered before a read stream's
+//!   head. Past the read streams' head they take turns with the read
+//!   streams' deeper pieces.
+//!
+//! A background stream turns into nothing else: the embedder drops it, and
+//! the stream the read arrives on is a read stream.
+
 use std::{
     collections::VecDeque,
     io::SeekFrom,
@@ -19,7 +42,9 @@ use tokio::{
 };
 use tracing::{debug, trace};
 
-use crate::{ManagedTorrent, file_info::FileInfo, storage::TorrentStorage};
+use crate::{
+    ManagedTorrent, file_info::FileInfo, piece_tracker::ReadAndBackground, storage::TorrentStorage,
+};
 
 use super::{ManagedTorrentHandle, TorrentMetadata};
 
@@ -33,12 +58,17 @@ pub const DEFAULT_STREAM_LOOKAHEAD_BYTES: u64 = 32 * 1024 * 1024;
 pub struct FileStreamOptions {
     /// How many bytes to prioritize ahead of the current reader position.
     pub lookahead_bytes: u64,
+    /// A stream nobody is reading yet (default `false`): its lookahead is
+    /// fetched, but whole and behind every read stream's head; see the
+    /// module doc.
+    pub background: bool,
 }
 
 impl Default for FileStreamOptions {
     fn default() -> Self {
         Self {
             lookahead_bytes: DEFAULT_STREAM_LOOKAHEAD_BYTES,
+            background: false,
         }
     }
 }
@@ -49,6 +79,8 @@ struct StreamState {
     file_abs_offset: u64,
     position: u64,
     lookahead_bytes: u64,
+    /// See [`FileStreamOptions::background`].
+    background: bool,
     waker: Option<Waker>,
 }
 
@@ -99,11 +131,17 @@ impl TorrentStreams {
         }
     }
 
-    // Interleave 1st, 2nd etc pieces from each active stream in turn until they get 1/10th of the file .
+    /// What the open streams want next, by class: the 1st, 2nd etc piece of
+    /// each read stream in turn, and the same of each background stream.
+    /// How the picker walks the two is
+    /// [`crate::piece_tracker::PriorityPieces`]'s.
     pub(crate) fn iter_next_pieces<'a>(
         &'a self,
         lengths: &'a Lengths,
-    ) -> impl Iterator<Item = ValidPieceIndex> + 'a {
+    ) -> ReadAndBackground<
+        impl Iterator<Item = ValidPieceIndex> + 'a,
+        impl Iterator<Item = ValidPieceIndex> + 'a,
+    > {
         struct Interleave<I> {
             all: VecDeque<I>,
         }
@@ -122,13 +160,26 @@ impl TorrentStreams {
             }
         }
 
-        let mut all: Vec<_> = self.streams.iter().map(|s| s.queue(lengths)).collect();
+        let mut all: Vec<_> = self
+            .streams
+            .iter()
+            .map(|s| (s.background, s.queue(lengths)))
+            .collect();
 
         // Shuffle to decrease determinism and make queueing fairer.
         use rand::seq::SliceRandom;
         all.shuffle(&mut rand::rng());
 
-        Interleave { all: all.into() }
+        let (background, read): (VecDeque<_>, VecDeque<_>) =
+            all.into_iter().partition(|(background, _)| *background);
+        ReadAndBackground {
+            read: Interleave {
+                all: read.into_iter().map(|(_, queue)| queue).collect(),
+            },
+            background: Interleave {
+                all: background.into_iter().map(|(_, queue)| queue).collect(),
+            },
+        }
     }
 
     pub(crate) fn wake_streams_on_piece_completed(
@@ -439,13 +490,19 @@ impl ManagedTorrent {
                 file_id,
                 position: 0,
                 lookahead_bytes: options.lookahead_bytes,
+                background: options.background,
                 waker: None,
                 file_len: fd_len,
                 file_abs_offset: fd_offset,
             },
         );
 
-        debug!(stream_id = s.stream_id, file_id, "started stream");
+        debug!(
+            stream_id = s.stream_id,
+            file_id,
+            background = options.background,
+            "started stream"
+        );
 
         Ok(s)
     }
@@ -486,6 +543,7 @@ mod tests {
             file_abs_offset: 0,
             position: 0,
             lookahead_bytes,
+            background: false,
             waker: None,
         };
         state.queue(lengths).map(|p| p.get()).collect()
@@ -504,6 +562,7 @@ mod tests {
             file_abs_offset: 0,
             position,
             lookahead_bytes,
+            background: false,
             waker: None,
         };
         // A reader at the start with two pieces of lookahead, and one in the middle of
@@ -535,7 +594,7 @@ mod tests {
         let lengths = Lengths::new(10 * 1024, 1024).unwrap();
         let streams = TorrentStreams::default();
         assert!(streams.is_empty());
-        assert_eq!(streams.iter_next_pieces(&lengths).count(), 0);
+        assert_eq!(streams.iter_next_pieces(&lengths).read.count(), 0);
 
         let id = streams.next_id();
         streams.streams.insert(
@@ -546,15 +605,16 @@ mod tests {
                 file_abs_offset: 0,
                 position: 0,
                 lookahead_bytes: 2 * 1024,
+                background: false,
                 waker: None,
             },
         );
         assert!(!streams.is_empty());
-        assert_eq!(streams.iter_next_pieces(&lengths).count(), 2);
+        assert_eq!(streams.iter_next_pieces(&lengths).read.count(), 2);
 
         streams.drop_stream(id);
         assert!(streams.is_empty());
-        assert_eq!(streams.iter_next_pieces(&lengths).count(), 0);
+        assert_eq!(streams.iter_next_pieces(&lengths).read.count(), 0);
     }
 
     #[test]
@@ -573,5 +633,41 @@ mod tests {
             queued_piece_ids(u64::MAX, &lengths),
             (0..10).collect::<Vec<_>>()
         );
+    }
+
+    /// **A background stream's pieces come out as background, and a read
+    /// stream's as read**, each class interleaved among its own streams.
+    /// What the classes share is everything a stream wants for the pieces
+    /// it covers: both keep their pieces from being dropped
+    /// (`wanted_ranges`), keep the file's peers (`streamed_file_ids`), and
+    /// are woken when the piece they are on completes.
+    #[test]
+    fn iter_next_pieces_keeps_the_classes_apart() {
+        let lengths = Lengths::new(10 * 1024, 1024).unwrap();
+        let streams = TorrentStreams::default();
+        let state = |position: u64, background: bool| StreamState {
+            file_id: 0,
+            file_len: lengths.total_length(),
+            file_abs_offset: 0,
+            position,
+            lookahead_bytes: 2 * 1024,
+            background,
+            waker: None,
+        };
+        streams.streams.insert(streams.next_id(), state(0, false));
+        streams
+            .streams
+            .insert(streams.next_id(), state(5 * 1024, true));
+
+        let ids =
+            |it: &mut dyn Iterator<Item = ValidPieceIndex>| it.map(|p| p.get()).collect::<Vec<_>>();
+        let mut next = streams.iter_next_pieces(&lengths);
+        assert_eq!(ids(&mut next.read), vec![0, 1]);
+        assert_eq!(ids(&mut next.background), vec![5, 6]);
+
+        let mut ranges = streams.wanted_ranges(&lengths);
+        ranges.sort_by_key(|r| r.start);
+        assert_eq!(ranges, vec![0..2, 5..7]);
+        assert_eq!(streams.streamed_file_ids().count(), 2);
     }
 }

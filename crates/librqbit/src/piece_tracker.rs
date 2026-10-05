@@ -682,10 +682,68 @@ pub enum AcquireResult {
     Crowded { retry_at: Option<Instant> },
 }
 
+/// The pieces open streams want next, each in the order its streams want
+/// them, in two classes.
+///
+/// **A stream being read** wants the pieces it is about to block on. The
+/// first [`PieceTracker::deadline_pieces`] of these that a peer could take
+/// are the head of the lookahead: split between peers, joinable, and
+/// offered before every chunk sent deeper in (`CLAIMS.md`).
+///
+/// **A background stream** is a stream nobody is reading yet: a guess at
+/// where a read will start. Its pieces are fetched, and only ever whole:
+/// none of them is at the head, so none is split, copied, stolen for, or
+/// offered to a head ask ([`PieceTracker::acquire_head_share`]). Past the
+/// head, a peer meets the read streams' deeper pieces and the background
+/// pieces in turn, a read piece first; see [`PieceTracker::acquire_piece`].
+///
+/// Any iterator of pieces is a lookahead of read streams only, which is
+/// what every lookahead was before background streams existed.
+pub trait PriorityPieces {
+    /// The next piece a stream being read wants.
+    fn next_read(&mut self) -> Option<ValidPieceIndex>;
+    /// The next piece a background stream wants.
+    fn next_background(&mut self) -> Option<ValidPieceIndex>;
+}
+
+impl<I: Iterator<Item = ValidPieceIndex>> PriorityPieces for I {
+    fn next_read(&mut self) -> Option<ValidPieceIndex> {
+        self.next()
+    }
+
+    fn next_background(&mut self) -> Option<ValidPieceIndex> {
+        None
+    }
+}
+
+/// A [`PriorityPieces`] of two iterators: the read streams' pieces and the
+/// background streams' pieces.
+#[derive(Debug, Clone)]
+pub struct ReadAndBackground<R, B> {
+    /// What the streams being read want, in the order they want it.
+    pub read: R,
+    /// What the background streams want, in the order they want it.
+    pub background: B,
+}
+
+impl<R, B> PriorityPieces for ReadAndBackground<R, B>
+where
+    R: Iterator<Item = ValidPieceIndex>,
+    B: Iterator<Item = ValidPieceIndex>,
+{
+    fn next_read(&mut self) -> Option<ValidPieceIndex> {
+        self.read.next()
+    }
+
+    fn next_background(&mut self) -> Option<ValidPieceIndex> {
+        self.background.next()
+    }
+}
+
 /// Parameters for acquiring a piece.
 pub struct AcquireRequest<'a, I, P, S>
 where
-    I: Iterator<Item = ValidPieceIndex>,
+    I: PriorityPieces,
     P: Fn(ValidPieceIndex) -> bool,
     S: Fn(ValidPieceIndex) -> bool,
 {
@@ -707,7 +765,8 @@ where
     /// measured distance apart could not test the rule that one peer has
     /// out-delivered another.
     pub now: Instant,
-    /// Priority pieces to check first (e.g., for streaming).
+    /// Priority pieces to check first: what open streams want next; see
+    /// [`PriorityPieces`].
     pub priority_pieces: I,
     /// File download priority ordering.
     pub file_priorities: &'a FilePriorities,
@@ -935,7 +994,7 @@ impl PieceTracker {
     /// the old peer and update counters.
     pub fn acquire_piece<I, P, S>(&mut self, mut req: AcquireRequest<I, P, S>) -> AcquireResult
     where
-        I: Iterator<Item = ValidPieceIndex>,
+        I: PriorityPieces,
         P: Fn(ValidPieceIndex) -> bool,
         S: Fn(ValidPieceIndex) -> bool,
     {
@@ -999,7 +1058,7 @@ impl PieceTracker {
     /// 5.4 s read in the field of 2026-09-15).
     pub fn acquire_head_share<I, P, S>(&mut self, mut req: AcquireRequest<I, P, S>) -> AcquireResult
     where
-        I: Iterator<Item = ValidPieceIndex>,
+        I: PriorityPieces,
         P: Fn(ValidPieceIndex) -> bool,
         S: Fn(ValidPieceIndex) -> bool,
     {
@@ -1010,11 +1069,22 @@ impl PieceTracker {
         })
     }
 
-    /// The walk over a stream's lookahead in playback order, `depth` pieces
-    /// deep at most, counting only the pieces this peer could take.
+    /// The walk over the streams' lookahead in playback order, `depth`
+    /// pieces deep at most, counting only the read streams' pieces this
+    /// peer could take.
+    ///
+    /// **The order.** First the read streams' pieces, until `deep` reaches
+    /// [`Self::deadline_pieces`]: that is the head. Then the read streams'
+    /// deeper pieces and the background streams' pieces in turn, a read
+    /// piece first -- R, B, R, B -- each class going on alone once the other
+    /// has nothing left. So a background piece is reached only with the
+    /// head behind the walk, or with no read piece left to put in it: none
+    /// is ever counted into the head, however many the read streams' pieces
+    /// skipped were; and a walk that stops at the head (`depth` no deeper
+    /// than the deadline pieces) never reaches one.
     fn walk_lookahead<I, P, S>(&mut self, req: &mut AcquireRequest<I, P, S>, depth: usize) -> Walk
     where
-        I: Iterator<Item = ValidPieceIndex>,
+        I: PriorityPieces,
         P: Fn(ValidPieceIndex) -> bool,
         S: Fn(ValidPieceIndex) -> bool,
     {
@@ -1039,9 +1109,36 @@ impl PieceTracker {
             now: req.now,
         };
         let mut retry = Retry::default();
-        for piece in &mut req.priority_pieces {
+        // Background pieces only in a walk that goes past the head.
+        let with_background = depth > deadline_pieces;
+        // Past the head, whose turn it is: a read piece first.
+        let mut background_turn = false;
+        loop {
             if deep >= depth {
                 break;
+            }
+            let pieces = &mut req.priority_pieces;
+            // Never the background's turn inside the head: see below.
+            let next = if !background_turn {
+                pieces.next_read().map(|piece| (piece, false))
+            } else {
+                None
+            };
+            let next = match next {
+                Some(next) => Some(next),
+                None if with_background => pieces
+                    .next_background()
+                    .map(|piece| (piece, true))
+                    // A background piece's turn with none left: the read
+                    // streams go on alone.
+                    .or_else(|| pieces.next_read().map(|piece| (piece, false))),
+                None => None,
+            };
+            let Some((piece, background)) = next else {
+                break;
+            };
+            if deep >= deadline_pieces {
+                background_turn = !background;
             }
             if self.chunks.is_piece_have(piece)
                 || self.chunks.is_releasing(piece)
@@ -1084,18 +1181,21 @@ impl PieceTracker {
                 // whole piece's bytes and elapsed time to whichever peer
                 // delivered its last chunk. Splitting everything turned
                 // both of those off for the whole lookahead.
+                //
+                // A background piece is never at the head, whatever `deep`
+                // says: nobody is reading it, so nothing is waiting on it.
                 None => {
                     return Walk::taken(self.reserve_piece(
                         piece,
                         req.peer,
                         req.connection,
-                        deep < deadline_pieces,
+                        !background && deep < deadline_pieces,
                         req.now,
                     ));
                 }
                 Some(inflight) => {
                     let tracker = &self.chunks;
-                    let share = if deep < deadline_pieces {
+                    let share = if !background && deep < deadline_pieces {
                         // A piece that reached the head whole is cut here,
                         // as it would have been had it been reserved here;
                         // see [`InflightPiece::split_whole`].
@@ -1136,7 +1236,9 @@ impl PieceTracker {
                         // see [`CLAIMS_PER_PEER`].
                         Err(Crowded) => crowded = true,
                     }
-                    if held_priority_piece.is_none() && !inflight.has_peer(req.peer) {
+                    // Nobody steals for a guess.
+                    if !background && held_priority_piece.is_none() && !inflight.has_peer(req.peer)
+                    {
                         held_priority_piece = Some(piece);
                     }
                 }
@@ -1204,7 +1306,7 @@ impl PieceTracker {
         threshold: f64,
     ) -> Option<AcquireResult>
     where
-        I: Iterator<Item = ValidPieceIndex>,
+        I: PriorityPieces,
         P: Fn(ValidPieceIndex) -> bool,
         S: Fn(ValidPieceIndex) -> bool,
     {
@@ -1237,7 +1339,7 @@ impl PieceTracker {
         threshold: f64,
     ) -> Option<AcquireResult>
     where
-        I: Iterator<Item = ValidPieceIndex>,
+        I: PriorityPieces,
         P: Fn(ValidPieceIndex) -> bool,
         S: Fn(ValidPieceIndex) -> bool,
     {
@@ -4877,5 +4979,447 @@ mod tests {
             }
             _ => panic!("Expected Stolen, got {:?}", result),
         }
+    }
+
+    // === BACKGROUND STREAMS ===
+
+    /// A full ask by `who`, whose last chunk took `last_latency`, with
+    /// `read` as the read streams' lookahead and `background` as the
+    /// background streams'; `has` says which pieces the peer has.
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_classes(
+        tracker: &mut PieceTracker,
+        file_infos: &FileInfos,
+        file_priorities: &FilePriorities,
+        who: u8,
+        read: &[ValidPieceIndex],
+        background: &[ValidPieceIndex],
+        now: Instant,
+        last_latency: Option<Duration>,
+        has: impl Fn(ValidPieceIndex) -> bool,
+    ) -> AcquireResult {
+        tracker.acquire_piece(AcquireRequest {
+            peer: peer(who),
+            connection: 0,
+            peer_avg_time: None,
+            last_latency,
+            now,
+            priority_pieces: ReadAndBackground {
+                read: read.iter().copied(),
+                background: background.iter().copied(),
+            },
+            file_priorities,
+            file_infos,
+            peer_has_piece: has,
+            can_steal: |_| true,
+        })
+    }
+
+    /// [`acquire_classes`] as the head-only ask, by a fresh peer that has
+    /// every piece.
+    fn head_share_classes(
+        tracker: &mut PieceTracker,
+        file_infos: &FileInfos,
+        file_priorities: &FilePriorities,
+        who: u8,
+        read: &[ValidPieceIndex],
+        background: &[ValidPieceIndex],
+        now: Instant,
+    ) -> AcquireResult {
+        tracker.acquire_head_share(AcquireRequest {
+            peer: peer(who),
+            connection: 0,
+            peer_avg_time: None,
+            last_latency: None,
+            now,
+            priority_pieces: ReadAndBackground {
+                read: read.iter().copied(),
+                background: background.iter().copied(),
+            },
+            file_priorities,
+            file_infos,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+        })
+    }
+
+    fn pieces(tracker: &PieceTracker, ids: impl IntoIterator<Item = u32>) -> Vec<ValidPieceIndex> {
+        ids.into_iter().map(|id| piece(tracker, id)).collect()
+    }
+
+    /// Puts `p` on disk, as a hash check that passed does.
+    fn have(tracker: &mut PieceTracker, file_infos: &FileInfos, p: ValidPieceIndex) {
+        tracker.chunks.reserve_needed_piece(p);
+        tracker.mark_piece_hash_ok(p, file_infos);
+    }
+
+    /// **Past the head, read and background pieces take turns, a read piece
+    /// first.**
+    ///
+    /// One read stream wanting R1..R4 (pieces 0..=3) and one background
+    /// stream wanting B1..B3 (pieces 6..=8), at the default depth of two.
+    /// R1 and R2 are the head, held split by two peers. Every fresh peer
+    /// after them can take nothing at the head, and is handed the first
+    /// piece nobody holds in the order R3, B1, R4, B2 -- and then B3, the
+    /// background stream going on alone once the read stream has nothing
+    /// left. A whole piece held by somebody else is passed over, but still
+    /// takes its turn: what alternates is the two queues, not the pieces
+    /// handed out.
+    #[test]
+    fn past_the_head_read_and_background_pieces_take_turns() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker_of(10, CLAIM_CHUNKS);
+        assert_eq!(tracker.deadline_pieces(), 2);
+        let read = pieces(&tracker, 0..4);
+        let background = pieces(&tracker, 6..9);
+        let t0 = Instant::now();
+        // The head, one claim each: nothing left in either pool.
+        for (who, head) in [(1u8, read[0]), (2, read[1])] {
+            assert_eq!(
+                reserved_piece(acquire_classes(
+                    &mut tracker,
+                    &file_infos,
+                    &priorities,
+                    who,
+                    &read,
+                    &background,
+                    t0,
+                    None,
+                    |_| true,
+                )),
+                head
+            );
+        }
+
+        let handed: Vec<u32> = (3u8..8)
+            .map(|who| {
+                reserved_piece(acquire_classes(
+                    &mut tracker,
+                    &file_infos,
+                    &priorities,
+                    who,
+                    &read,
+                    &background,
+                    t0,
+                    None,
+                    |_| true,
+                ))
+                .get()
+            })
+            .collect();
+        assert_eq!(handed, vec![2, 6, 3, 7, 8], "R3, B1, R4, B2, B3");
+    }
+
+    /// **With no background stream, nothing changes.** A plain iterator is
+    /// a lookahead of read streams only, and a [`ReadAndBackground`] with
+    /// nothing in the background hands out exactly what it does, ask for
+    /// ask, past the head included -- where the background's empty turn
+    /// must hand straight back to the read stream.
+    #[test]
+    fn without_a_background_stream_the_order_is_the_read_streams() {
+        let t0 = Instant::now();
+        let run = |with_classes: bool| {
+            let (mut tracker, file_infos, priorities) = make_split_tracker_of(8, 2 * CLAIM_CHUNKS);
+            let read = pieces(&tracker, [0, 1, 2, 4, 5]);
+            (1u8..12)
+                .map(|who| {
+                    let result = if with_classes {
+                        acquire_classes(
+                            &mut tracker,
+                            &file_infos,
+                            &priorities,
+                            who,
+                            &read,
+                            &[],
+                            t0,
+                            None,
+                            |_| true,
+                        )
+                    } else {
+                        acquire_in_window(&mut tracker, &file_infos, &priorities, who, &read, t0)
+                    };
+                    format!("{result:?}")
+                })
+                .collect::<Vec<_>>()
+        };
+        let plain = run(false);
+        assert_eq!(run(true), plain);
+        // And past the head, the read stream's deeper pieces in its order.
+        assert!(
+            plain[4].contains("piece: 2") && plain[5].contains("piece: 4"),
+            "{plain:#?}"
+        );
+    }
+
+    /// **A background piece is reserved whole, and nobody cuts it or copies
+    /// it**, however long it has been in flight and however fast the asker:
+    /// nobody is reading it, so nothing waits on it. The same piece read by
+    /// a stream is cut by the same asker, at the same moment.
+    #[test]
+    fn a_background_piece_is_never_split_or_copied() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+        let guessed = piece(&tracker, 2);
+        let t0 = Instant::now();
+        let first = acquire_classes(
+            &mut tracker,
+            &file_infos,
+            &priorities,
+            1,
+            &[],
+            &[guessed],
+            t0,
+            None,
+            |_| true,
+        );
+        assert_eq!(
+            claimed(first),
+            0..SPLIT_CHUNKS_PER_PIECE,
+            "reserved whole, at the front of the lookahead"
+        );
+
+        // Ten seconds on, a peer with a 10 ms round trip: it outpaces the
+        // piece by any measure, and is still sent elsewhere.
+        let later = t0 + Duration::from_secs(10);
+        let fast = Some(Duration::from_millis(10));
+        let second = acquire_classes(
+            &mut tracker,
+            &file_infos,
+            &priorities,
+            2,
+            &[],
+            &[guessed],
+            later,
+            fast,
+            |_| true,
+        );
+        assert_ne!(reserved_or_none(second), Some(guessed));
+        assert_eq!(tracker.participants(guessed).len(), 1, "still one holder");
+        assert_eq!(
+            tracker.participants(guessed)[0].chunks,
+            0..SPLIT_CHUNKS_PER_PIECE,
+            "of the whole piece"
+        );
+
+        // The control: read, it is the head, and that asker cuts it.
+        let third = acquire_classes(
+            &mut tracker,
+            &file_infos,
+            &priorities,
+            3,
+            &[guessed],
+            &[],
+            later,
+            fast,
+            |_| true,
+        );
+        assert_eq!(reserved_or_none(third), Some(guessed));
+    }
+
+    /// **Nobody steals for a guess.** A piece a read stream waits on, held
+    /// by a peer ten times slower, is taken off it even with free pieces
+    /// elsewhere (`a_stalled_stream_piece_is_stolen_even_with_free_pieces_left`).
+    /// The same piece wanted by a background stream is left where it is,
+    /// and the asker takes a free piece.
+    #[test]
+    fn nobody_steals_for_a_background_piece() {
+        let chunks = make_test_chunk_tracker(5);
+        let mut tracker = PieceTracker::new(chunks);
+        let file_infos = make_test_file_infos(5);
+        let file_priorities = make_default_file_priorities(&file_infos);
+        let guessed = piece(&tracker, 3);
+        tracker.reserve_piece(
+            guessed,
+            peer(1),
+            0,
+            false,
+            Instant::now() - Duration::from_secs(600),
+        );
+
+        let ask = |tracker: &mut PieceTracker, read: &[ValidPieceIndex], bg: &[ValidPieceIndex]| {
+            tracker.acquire_piece(AcquireRequest {
+                peer: peer(2),
+                connection: 0,
+                now: Instant::now(),
+                peer_avg_time: Some(Duration::from_millis(600)),
+                last_latency: None,
+                priority_pieces: ReadAndBackground {
+                    read: read.iter().copied(),
+                    background: bg.iter().copied(),
+                },
+                file_priorities: &file_priorities,
+                file_infos: &file_infos,
+                peer_has_piece: |_| true,
+                can_steal: |_| true,
+            })
+        };
+        match ask(&mut tracker, &[], &[guessed]) {
+            AcquireResult::Reserved { piece, .. } => assert_ne!(piece, guessed),
+            other => panic!("expected a free piece, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                ask(&mut tracker, &[guessed], &[]),
+                AcquireResult::Stolen { piece, .. } if piece == guessed
+            ),
+            "the control: read, the same piece is stolen"
+        );
+    }
+
+    /// **The head ask offers read streams' deadline pieces and nothing
+    /// else.** With the read stream's pieces on disk, or with no read
+    /// stream at all, a free background piece is still not offered: the
+    /// head ask is sent before every chunk, and a guess is not what it is
+    /// for. The full ask hands the same piece out whole.
+    #[test]
+    fn a_head_ask_offers_no_background_piece() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+        let t0 = Instant::now();
+        let read = pieces(&tracker, [0]);
+        have(&mut tracker, &file_infos, read[0]);
+        let background = pieces(&tracker, [2]);
+        for read in [&read[..], &[]] {
+            assert!(
+                matches!(
+                    head_share_classes(
+                        &mut tracker,
+                        &file_infos,
+                        &priorities,
+                        1,
+                        read,
+                        &background,
+                        t0
+                    ),
+                    AcquireResult::NoneAvailable { .. }
+                ),
+                "the head ask offered a background piece"
+            );
+        }
+        assert_eq!(
+            claimed(acquire_classes(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                1,
+                &read,
+                &background,
+                t0,
+                None,
+                |_| true,
+            )),
+            0..SPLIT_CHUNKS_PER_PIECE,
+            "the full ask hands it whole"
+        );
+    }
+
+    /// **A read's blocked pieces go to every peer before any background
+    /// piece**, wherever they sit in its lookahead. The read stream's first
+    /// piece is on disk and its second is one these peers do not have, so
+    /// its head is its third and fourth -- and each of four peers takes a
+    /// share of those before the fifth is given the background stream's
+    /// piece. The pieces skipped are not counted, so they do not let a
+    /// background piece into the head.
+    #[test]
+    fn a_blocked_read_comes_before_any_background_piece() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker_of(8, 2 * CLAIM_CHUNKS);
+        let t0 = Instant::now();
+        let read = pieces(&tracker, 0..4);
+        let background = pieces(&tracker, [6]);
+        have(&mut tracker, &file_infos, read[0]);
+        let lacking = read[1];
+        let handed: Vec<u32> = (1u8..=5)
+            .map(|who| {
+                reserved_piece(acquire_classes(
+                    &mut tracker,
+                    &file_infos,
+                    &priorities,
+                    who,
+                    &read,
+                    &background,
+                    t0,
+                    None,
+                    |p| p != lacking,
+                ))
+                .get()
+            })
+            .collect();
+        assert_eq!(handed, vec![2, 2, 3, 3, 6]);
+    }
+
+    /// **Background pieces are fetched while the reads are covered.** Every
+    /// piece the read stream wants is in flight with somebody else -- its
+    /// head split, its deeper pieces whole -- and a peer that asks is given
+    /// the background stream's piece, not one off the ordinary queue.
+    #[test]
+    fn background_pieces_are_fetched_when_the_reads_are_all_in_flight() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker_of(10, CLAIM_CHUNKS);
+        let t0 = Instant::now();
+        let read = pieces(&tracker, 0..4);
+        let background = pieces(&tracker, [8]);
+        for who in 1u8..=4 {
+            acquire_classes(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                who,
+                &read,
+                &[],
+                t0,
+                None,
+                |_| true,
+            );
+        }
+        assert!(read.iter().all(|p| tracker.is_inflight(*p)));
+        assert_eq!(
+            reserved_piece(acquire_classes(
+                &mut tracker,
+                &file_infos,
+                &priorities,
+                5,
+                &read,
+                &background,
+                t0,
+                None,
+                |_| true,
+            )),
+            background[0]
+        );
+    }
+
+    /// **A piece reserved for a background stream is a read's piece once a
+    /// read wants it.** The embedder drops its background stream when the
+    /// read arrives where it guessed, and the read stream opens there: the
+    /// piece is whole with one peer, as every background piece is, and from
+    /// that ask on it is the head -- cut by a peer that outpaces it, as any
+    /// whole piece that reaches the head is. Nothing about the piece
+    /// remembers what it was reserved for.
+    #[test]
+    fn a_background_piece_a_read_arrives_at_is_a_read_piece() {
+        let (mut tracker, file_infos, priorities) = make_split_tracker(4);
+        let guessed = piece(&tracker, 1);
+        let t0 = Instant::now();
+        acquire_classes(
+            &mut tracker,
+            &file_infos,
+            &priorities,
+            1,
+            &[],
+            &[guessed],
+            t0,
+            None,
+            |_| true,
+        );
+        let later = t0 + Duration::from_secs(5);
+        let result = acquire_classes(
+            &mut tracker,
+            &file_infos,
+            &priorities,
+            2,
+            &[guessed],
+            &[],
+            later,
+            Some(Duration::from_millis(10)),
+            |_| true,
+        );
+        assert_eq!(reserved_or_none(result), Some(guessed));
+        assert!(tracker.participants(guessed).len() > 1, "cut between peers");
     }
 }
