@@ -385,10 +385,18 @@ impl ManagedTorrent {
     }
 
     pub async fn stream(self: Arc<Self>, file_id: usize) -> anyhow::Result<FileStream> {
+        // Streams need live or paused state, so wait out the initial check
+        // of existing data instead of failing while it runs.
+        self.wait_until_initialized().await?;
         self.stream_with_options(file_id, FileStreamOptions::default())
             .await
     }
 
+    /// [`Self::stream`] with options, and without its wait for the initial
+    /// check: a torrent that is still initializing is an error here, at once.
+    /// An embedder that keeps torrents paused until it starts them itself
+    /// waits for the check its own way, and a wait here would hang on a
+    /// torrent nobody has started.
     pub async fn stream_with_options(
         self: Arc<Self>,
         file_id: usize,

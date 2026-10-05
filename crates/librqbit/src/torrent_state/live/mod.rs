@@ -336,6 +336,14 @@ pub struct TorrentStateLive {
 }
 
 impl TorrentStateLive {
+    fn max_request_window(&self) -> usize {
+        self.shared
+            .options
+            .peer_max_request_window
+            .unwrap_or(DEFAULT_PEER_REQUEST_WINDOW)
+            .max(1)
+    }
+
     pub(crate) fn new(
         paused: TorrentStatePaused,
         fatal_errors_tx: tokio::sync::oneshot::Sender<anyhow::Error>,
@@ -628,7 +636,7 @@ impl TorrentStateLive {
             addr,
             incoming,
             on_bitfield_notify: Default::default(),
-            flow_control: Mutex::new(PeerFlowControl::default()),
+            flow_control: Mutex::new(PeerFlowControl::new(self.max_request_window())),
             state: self.clone(),
             tx,
             counters,
@@ -2027,11 +2035,11 @@ struct PeerFlowControl {
     request_window: usize,
 }
 
-impl Default for PeerFlowControl {
-    fn default() -> Self {
+impl PeerFlowControl {
+    fn new(max_request_window: usize) -> Self {
         Self {
             i_am_choked: true,
-            request_window: DEFAULT_PEER_REQUEST_WINDOW,
+            request_window: max_request_window,
         }
     }
 }
@@ -2229,7 +2237,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         if let Some(reqq) = hs.reqq.and_then(|reqq| usize::try_from(reqq).ok())
             && reqq > 0
         {
-            let request_window = reqq.min(DEFAULT_PEER_REQUEST_WINDOW);
+            let request_window = reqq.min(self.state.max_request_window());
             let mut flow = self.lock_flow_control("update request window");
             if flow.request_window != request_window {
                 debug!(
@@ -2373,14 +2381,15 @@ impl PeerHandler {
     /// A handler for a connection to `addr` that no socket is behind, unchoked. Tests only.
     #[cfg(test)]
     fn for_test(state: Arc<TorrentStateLive>, addr: SocketAddr, tx: PeerTx) -> Self {
+        let flow_control = Mutex::new(PeerFlowControl {
+            i_am_choked: false,
+            ..PeerFlowControl::new(state.max_request_window())
+        });
         PeerHandler {
             state,
             connection: next_connection(),
             counters: Default::default(),
-            flow_control: Mutex::new(PeerFlowControl {
-                i_am_choked: false,
-                ..Default::default()
-            }),
+            flow_control,
             on_bitfield_notify: Notify::new(),
             addr,
             incoming: false,
@@ -3974,6 +3983,77 @@ mod connection_tests {
             vec![(new_piece.get(), addr)],
             "the old connection's death took the new one's piece with it, or kept its own"
         );
+        Ok(())
+    }
+
+    /// **The request window is the torrent's `max_request_window`, everywhere.**
+    /// A connection starts with it, and a peer's `reqq` can only lower it:
+    /// one larger than the option leaves the option's window, one smaller
+    /// is honoured.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_request_window_is_the_configured_one() -> anyhow::Result<()> {
+        use crate::peer_connection::{PeerConnectionHandler, PeerConnectionOptions};
+        use peer_binary_protocol::extended::handshake::ExtendedHandshake;
+
+        setup_test_logging();
+        let files =
+            create_default_random_dir_with_torrents(1, CHUNK_SIZE as usize * 4, Some("window"));
+        let torrent = create_torrent(
+            files.path(),
+            CreateTorrentOptions {
+                piece_length: Some(CHUNK_SIZE),
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await?;
+        let dir = TempDir::with_prefix("window_client")?;
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            crate::SessionOptions {
+                dht: None,
+                persistence: None,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.as_bytes()?.to_vec()),
+                Some(crate::AddTorrentOptions {
+                    overwrite: true,
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    peer_opts: Some(PeerConnectionOptions {
+                        max_request_window: Some(5),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        tokio::time::timeout(Duration::from_secs(30), handle.wait_until_initialized()).await??;
+        let live = handle.live().context("expected a live torrent")?;
+        let (tx, _rx) = unbounded_channel();
+        let handler = live.new_peer_handler(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 1)),
+            false,
+            tx,
+            Default::default(),
+            CancellationToken::new(),
+        );
+        let window = |h: &PeerHandler| h.lock_flow_control("test").request_window;
+        assert_eq!(window(&handler), 5, "a new connection starts at the option");
+
+        let handshake = |reqq| ExtendedHandshake {
+            reqq: Some(reqq),
+            ..Default::default()
+        };
+        (&handler).on_extended_handshake(&handshake(250))?;
+        assert_eq!(window(&handler), 5, "a larger reqq does not raise it");
+        (&handler).on_extended_handshake(&handshake(3))?;
+        assert_eq!(window(&handler), 3, "a smaller reqq lowers it");
         Ok(())
     }
 

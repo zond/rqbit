@@ -47,8 +47,8 @@ const CLAIM_CHUNKS: u32 = 16;
 ///
 /// **A peer comes back for another claim when it has *sent* the last one's
 /// requests, not when they have arrived.** Its window is
-/// `DEFAULT_PEER_REQUEST_WINDOW` -- 128 chunks against a 16-chunk claim --
-/// so without this one peer takes eight claims in a few milliseconds and
+/// `PeerConnectionOptions::max_request_window` -- 128 chunks by default,
+/// against a 16-chunk claim -- so without this one peer takes eight claims in a few milliseconds and
 /// two peers take all sixteen of a 4 MiB piece. The piece is then "the
 /// slowest of two", which is the thing splitting exists to prevent: the
 /// field of 2026-09-14 blocked 13.4 s on one piece while the swarm was
@@ -195,7 +195,7 @@ pub struct ClaimSnapshot {
 ///
 /// **Double work is worth paying for where a deadline is, and nowhere
 /// else.** A piece is split the moment a stream waits on it, and a peer's
-/// request window is 128 chunks against a 16-chunk claim -- so two peers
+/// request window is 128 chunks by default against a 16-chunk claim -- so two peers
 /// can hold every claim of a 4 MiB piece before either has delivered a
 /// byte. A piece at the head of the window is therefore parked on two
 /// peers, and if either is slow the read blocks on it. Further out there

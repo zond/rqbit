@@ -882,3 +882,72 @@ async fn a_check_that_lands_on_a_paused_torrent_releases_the_files_inner() -> an
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_stream_waits_for_the_initial_check() -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(120),
+        only_stream_waits_for_the_initial_check_inner(),
+    )
+    .await?
+}
+
+/// `stream` waits out the initial check; `stream_with_options` does not.
+///
+/// The plain call is the convenient one: a caller that has just added a
+/// torrent gets its stream once the existing data is checked, instead of an
+/// "initializing" error. The call with options is for an embedder that
+/// decides itself when a torrent runs -- one that keeps torrents paused until
+/// it starts them waits for the check its own way, and a wait inside the
+/// call would hang it on a torrent nobody has started. So with the check
+/// held mid-read, the call with options answers at once, and the plain call
+/// is still waiting until the check is let through.
+async fn only_stream_waits_for_the_initial_check_inner() -> anyhow::Result<()> {
+    setup_test_logging();
+    let (dir, torrent_bytes) = complete_torrent_on_disk("rqbit_stream_wait").await?;
+    let gate = Arc::new(Gate::default());
+
+    let session = Session::new_with_opts(dir.path().into(), session_opts(None, None)).await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent_bytes),
+            Some(add_opts(&dir, true, &gate)),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    gate.wait_until_check_started().await?;
+
+    let with_options = timeout(
+        Duration::from_secs(10),
+        handle
+            .clone()
+            .stream_with_options(0, crate::FileStreamOptions::default()),
+    )
+    .await;
+    let mut plain = tokio::spawn(handle.clone().stream(0));
+    // The check cannot get past the gate, so a plain call that has not
+    // answered by now is waiting for it; the half second only bounds how
+    // long the test looks.
+    let plain_early = timeout(Duration::from_millis(500), &mut plain).await;
+    gate.open();
+
+    let with_options =
+        with_options.context("stream_with_options waited for a check it should not wait for")?;
+    let err = with_options
+        .err()
+        .context("a torrent mid-check has no stream to give yet")?;
+    assert!(
+        format!("{err:#}").contains("initializing"),
+        "the error says why: {err:#}"
+    );
+    assert!(
+        plain_early.is_err(),
+        "stream answered while the check was still held"
+    );
+    let stream = timeout(WAIT, plain)
+        .await
+        .context("stream still waiting after the check finished")???;
+    assert_eq!(stream.position(), 0);
+    Ok(())
+}
