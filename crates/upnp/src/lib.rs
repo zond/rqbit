@@ -24,9 +24,19 @@ pub mod http_client;
 pub use http_client::http_client_builder;
 
 const SERVICE_TYPE_WAN_IP_CONNECTION: &str = "urn:schemas-upnp-org:service:WANIPConnection:1";
+/// What routers with a PPPoE WAN, such as most DSL ones, offer instead of
+/// WANIPConnection. Its AddPortMapping is the same.
+const SERVICE_TYPE_WAN_PPP_CONNECTION: &str = "urn:schemas-upnp-org:service:WANPPPConnection:1";
 const SSDP_MULTICAST_IP: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(239, 255, 255, 250), 1900));
 pub const SSDP_SEARCH_WAN_IPCONNECTION_ST: &str = "urn:schemas-upnp-org:service:WANIPConnection:1";
+pub const SSDP_SEARCH_WAN_PPPCONNECTION_ST: &str =
+    "urn:schemas-upnp-org:service:WANPPPConnection:1";
+/// What the port forwarder searches for: either WAN connection service.
+const WAN_CONNECTION_SEARCH_TARGETS: [&str; 2] = [
+    SSDP_SEARCH_WAN_IPCONNECTION_ST,
+    SSDP_SEARCH_WAN_PPPCONNECTION_ST,
+];
 pub const SSDP_SEARCH_ROOT_ST: &str = "upnp:rootdevice";
 
 pub fn make_ssdp_search_request(kind: &str) -> String {
@@ -255,9 +265,12 @@ impl UpnpEndpoint {
     fn get_wan_services(&self) -> impl Iterator<Item = WanService> + '_ {
         self.iter_services()
             .filter_map(|(_, s)| {
-                let service_type = [SERVICE_TYPE_WAN_IP_CONNECTION]
-                    .into_iter()
-                    .find(|t| *t == s.service_type)?;
+                let service_type = [
+                    SERVICE_TYPE_WAN_IP_CONNECTION,
+                    SERVICE_TYPE_WAN_PPP_CONNECTION,
+                ]
+                .into_iter()
+                .find(|t| *t == s.service_type)?;
                 Some((
                     service_type,
                     self.discover_response.location.join(&s.control_url),
@@ -341,16 +354,20 @@ pub async fn discover_once(
     timeout: Duration,
     bind_device: Option<&BindDevice>,
 ) -> anyhow::Result<()> {
-    search(tx, kind, timeout, bind_device).await.map(|_| ())
+    search(tx, &[kind], timeout, bind_device, SSDP_MULTICAST_IP)
+        .await
+        .map(|_| ())
 }
 
-/// One SSDP search: what [`discover_once`] does, returning how many
-/// endpoints answered.
+/// One SSDP search for each of `kinds`, from one socket, sent to `to` (the
+/// SSDP multicast group but in tests): what [`discover_once`] does,
+/// returning how many endpoints answered.
 async fn search(
     tx: &UnboundedSender<UpnpDiscoverResponse>,
-    kind: &str,
+    kinds: &[&str],
     timeout: Duration,
     bind_device: Option<&BindDevice>,
+    to: SocketAddr,
 ) -> anyhow::Result<usize> {
     // TODO: do we need IPv6 support here? I can't test it, don't have the hardware for it (router / IPv6 provider).
     let socket = UdpSocket::bind_udp(
@@ -361,11 +378,13 @@ async fn search(
         },
     )?;
 
-    let message = make_ssdp_search_request(kind);
-    socket
-        .send_to(message.as_bytes(), SSDP_MULTICAST_IP)
-        .await
-        .with_context(|| format!("failed to send SSDP search request to {SSDP_MULTICAST_IP}"))?;
+    for kind in kinds {
+        let message = make_ssdp_search_request(kind);
+        socket
+            .send_to(message.as_bytes(), to)
+            .await
+            .with_context(|| format!("failed to send SSDP search request to {to}"))?;
+    }
 
     let mut buffer = [0; 2048];
 
@@ -552,9 +571,10 @@ impl Gateways for NetworkGateways {
     async fn search(&self, found: &UnboundedSender<UpnpDiscoverResponse>) -> anyhow::Result<usize> {
         search(
             found,
-            SSDP_SEARCH_WAN_IPCONNECTION_ST,
+            &WAN_CONNECTION_SEARCH_TARGETS,
             self.discover_timeout,
             self.bind_device.as_ref(),
+            SSDP_MULTICAST_IP,
         )
         .await
     }
@@ -1525,5 +1545,189 @@ mod forwarder_tests {
         let infos = logs.at(tracing::Level::INFO);
         assert_eq!(infos.len(), 1, "{infos:?}");
         assert!(infos[0].starts_with("determined local IP"), "{infos:?}");
+    }
+}
+
+/// The DSL routers' WAN connection service, found and mapped through.
+#[cfg(test)]
+mod wan_ppp_tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use url::Url;
+
+    use crate::{
+        RootDesc, SERVICE_TYPE_WAN_IP_CONNECTION, SERVICE_TYPE_WAN_PPP_CONNECTION,
+        SSDP_SEARCH_WAN_IPCONNECTION_ST, SSDP_SEARCH_WAN_PPPCONNECTION_ST, UpnpDiscoverResponse,
+        UpnpEndpoint, WAN_CONNECTION_SEARCH_TARGETS, WanService, forward_port, search,
+    };
+
+    const PPP_GATEWAY: &str = r#"<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <device>
+    <deviceType>urn:schemas-upnp-org:device:InternetGatewayDevice:1</deviceType>
+    <friendlyName>DSL Router</friendlyName>
+    <deviceList>
+      <device>
+        <deviceType>urn:schemas-upnp-org:device:WANDevice:1</deviceType>
+        <deviceList>
+          <device>
+            <deviceType>urn:schemas-upnp-org:device:WANConnectionDevice:1</deviceType>
+            <serviceList>
+              <service>
+                <serviceType>urn:schemas-upnp-org:service:WANPPPConnection:1</serviceType>
+                <controlURL>/upnp/control/WANPPPConn1</controlURL>
+                <SCPDURL>/WANPPPConnSCPD.xml</SCPDURL>
+              </service>
+            </serviceList>
+          </device>
+        </deviceList>
+      </device>
+    </deviceList>
+  </device>
+</root>"#;
+
+    #[test]
+    fn searches_for_both_wan_connection_services() {
+        assert!(WAN_CONNECTION_SEARCH_TARGETS.contains(&SSDP_SEARCH_WAN_IPCONNECTION_ST));
+        assert!(WAN_CONNECTION_SEARCH_TARGETS.contains(&SSDP_SEARCH_WAN_PPPCONNECTION_ST));
+    }
+
+    #[tokio::test]
+    async fn search_asks_for_each_target_and_counts_the_answers() {
+        // Stands in for the multicast group: takes both searches, answers one.
+        let gateway = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let to = gateway.local_addr().unwrap();
+        let answer = tokio::spawn(async move {
+            let mut asked = Vec::new();
+            let mut buf = [0u8; 2048];
+            for _ in 0..2 {
+                let (n, from) = gateway.recv_from(&mut buf).await.unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                asked.extend(
+                    request
+                        .lines()
+                        .filter_map(|l| l.strip_prefix("ST: "))
+                        .map(str::to_owned),
+                );
+                if asked.len() == 1 {
+                    gateway
+                        .send_to(
+                            b"HTTP/1.1 200 OK\r\nLOCATION: http://192.168.1.1:49000/igddesc.xml\r\n\r\n",
+                            from,
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            asked
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let answered = search(
+            &tx,
+            &WAN_CONNECTION_SEARCH_TARGETS,
+            // Long enough for the answer over loopback to arrive.
+            std::time::Duration::from_secs(2),
+            None,
+            to,
+        )
+        .await
+        .unwrap();
+        assert_eq!(answered, 1);
+        assert_eq!(
+            rx.try_recv().unwrap().location.as_str(),
+            "http://192.168.1.1:49000/igddesc.xml"
+        );
+        // Both searches went out before the search's own wait began, so they
+        // have long arrived by now.
+        answer.abort();
+        let asked = answer.await;
+        assert!(asked.is_ok(), "the gateway did not get a search per target");
+        assert_eq!(asked.unwrap(), WAN_CONNECTION_SEARCH_TARGETS.to_vec());
+    }
+
+    #[test]
+    fn manages_a_wan_ppp_connection_service() {
+        let endpoint = UpnpEndpoint {
+            discover_response: UpnpDiscoverResponse {
+                received_from: "192.168.1.1:1900".parse().unwrap(),
+                location: Url::parse("http://192.168.1.1:49000/igddesc.xml").unwrap(),
+            },
+            data: quick_xml::de::from_str::<RootDesc>(PPP_GATEWAY).unwrap(),
+            nics: Vec::new(),
+        };
+        assert_eq!(
+            endpoint.get_wan_services().collect::<Vec<_>>(),
+            vec![WanService {
+                control_url: Url::parse("http://192.168.1.1:49000/upnp/control/WANPPPConn1")
+                    .unwrap(),
+                service_type: SERVICE_TYPE_WAN_PPP_CONNECTION,
+            }]
+        );
+    }
+
+    /// Answers one HTTP request with 200 and returns the request as text.
+    async fn answer_one_request(listener: tokio::net::TcpListener) -> String {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = conn.read(&mut buf).await.unwrap();
+            assert!(n > 0, "connection closed before the request was complete");
+            request.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&request).into_owned();
+            if let Some(head_end) = text.find("\r\n\r\n") {
+                let length = text[..head_end]
+                    .lines()
+                    .find_map(|l| {
+                        let (name, value) = l.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= head_end + 4 + length {
+                    conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await
+                        .unwrap();
+                    return text;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn add_port_mapping_names_the_service_it_was_found_as() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(answer_one_request(listener));
+        let service = WanService {
+            control_url: Url::parse(&format!("http://{addr}/upnp/control/WANPPPConn1")).unwrap(),
+            service_type: SERVICE_TYPE_WAN_PPP_CONNECTION,
+        };
+        forward_port(
+            &service,
+            "192.168.1.2".parse().unwrap(),
+            6881,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let request = server.await.unwrap().to_lowercase();
+        assert!(
+            request.contains(&format!(
+                "soapaction: \"{}#addportmapping\"",
+                SERVICE_TYPE_WAN_PPP_CONNECTION.to_lowercase()
+            )),
+            "{request}"
+        );
+        assert!(
+            request.contains(&format!(
+                "<u:addportmapping xmlns:u=\"{}\">",
+                SERVICE_TYPE_WAN_PPP_CONNECTION.to_lowercase()
+            )),
+            "{request}"
+        );
+        assert!(
+            !request.contains(&SERVICE_TYPE_WAN_IP_CONNECTION.to_lowercase()),
+            "{request}"
+        );
     }
 }

@@ -35,5 +35,5 @@ librqbit-dualstack-sockets.workspace = true
 socket2.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "net", "io-util"] }
 tracing-subscriber = { workspace = true, features = ["fmt", "registry"] }
