@@ -11,12 +11,12 @@ use std::{
 };
 use tokio::{
     sync::{
-        mpsc::{UnboundedSender, unbounded_channel},
+        mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
         watch,
     },
     time::Instant,
 };
-use tracing::{Instrument, Span, debug, debug_span, trace, warn};
+use tracing::{Instrument, Span, debug, debug_span, info, trace, warn};
 use url::Url;
 
 pub mod http_client;
@@ -399,8 +399,14 @@ async fn search(
 
 pub struct UpnpPortForwarderOptions {
     pub lease_duration: Duration,
+    /// How often to search for gateways while one answers.
     pub discover_interval: Duration,
     pub discover_timeout: Duration,
+    /// The longest wait between searches while none answers. The wait starts
+    /// at `discover_interval` and doubles after each search that finds
+    /// nothing or fails, up to this; it drops back to `discover_interval` once
+    /// a gateway answers or a mapping is lost.
+    pub discover_interval_max: Duration,
 }
 
 impl Default for UpnpPortForwarderOptions {
@@ -408,6 +414,7 @@ impl Default for UpnpPortForwarderOptions {
         Self {
             discover_interval: Duration::from_secs(60),
             discover_timeout: Duration::from_secs(10),
+            discover_interval_max: Duration::from_secs(600),
             lease_duration: Duration::from_secs(60),
         }
     }
@@ -627,17 +634,47 @@ impl UpnpPortForwarder {
     }
 }
 
+/// A failure that can last, such as no gateway on the network: warned about
+/// once when it starts, logged at debug while it lasts, and noted at info
+/// when it clears, so a network without UPnP costs one warning, not one a
+/// minute.
+#[derive(Default)]
+struct Standing {
+    failing: bool,
+}
+
+impl Standing {
+    fn fail(&mut self, what: std::fmt::Arguments<'_>) {
+        if std::mem::replace(&mut self.failing, true) {
+            debug!("{what}");
+        } else {
+            warn!("{what}");
+        }
+    }
+
+    fn clear(&mut self, what: std::fmt::Arguments<'_>) {
+        if std::mem::take(&mut self.failing) {
+            info!("{what}");
+        }
+    }
+}
+
 async fn discovery<G: Gateways>(
     gateways: &G,
     opts: &UpnpPortForwarderOptions,
     tx: UnboundedSender<UpnpDiscoverResponse>,
+    mut mapping_lost: UnboundedReceiver<()>,
     state: &watch::Sender<PortForwardingState>,
 ) {
-    let mut discover_interval = tokio::time::interval(opts.discover_interval);
-    discover_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let base = opts.discover_interval;
+    let max = opts.discover_interval_max.max(base);
+    // The wait after the next search that finds nothing.
+    let mut backoff = base;
+    let mut search_failed = Standing::default();
+    let mut no_gateway = Standing::default();
 
     loop {
-        discover_interval.tick().await;
+        let started = Instant::now();
         let result = gateways.search(&tx).await;
         update_state(state, |s| {
             s.searched = true;
@@ -653,8 +690,46 @@ async fn discovery<G: Gateways>(
                 }
             }
         });
-        if let Err(e) = result {
-            warn!("failed to run SSDP/UPNP discovery: {e:#}");
+        if result.is_ok() {
+            search_failed.clear(format_args!("SSDP/UPNP discovery works again"));
+        }
+        let found = match result {
+            Ok(0) => {
+                no_gateway.fail(format_args!(
+                    "no UPnP gateway answered; searching again in {backoff:?}"
+                ));
+                false
+            }
+            Ok(_) => {
+                no_gateway.clear(format_args!("a UPnP gateway answered"));
+                true
+            }
+            Err(e) => {
+                search_failed.fail(format_args!(
+                    "failed to run SSDP/UPNP discovery: {e:#}; searching again in {backoff:?}"
+                ));
+                false
+            }
+        };
+        let wait = if found {
+            backoff = base;
+            base
+        } else {
+            let wait = backoff;
+            backoff = (backoff * 2).min(max);
+            wait
+        };
+
+        let mut next = started + wait;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(next) => break,
+                Some(()) = mapping_lost.recv() => {
+                    // The gateway stopped renewing: look for it, or its successor, soon.
+                    backoff = base;
+                    next = next.min(Instant::now() + base);
+                }
+            }
         }
     }
 }
@@ -674,6 +749,7 @@ async fn manage_port<G: Gateways>(
     port: u16,
     lease_duration: Duration,
     state: &watch::Sender<PortForwardingState>,
+    mapping_lost: &UnboundedSender<()>,
 ) {
     let mut interval = tokio::time::interval(lease_duration / 2);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -688,7 +764,9 @@ async fn manage_port<G: Gateways>(
                 p.held = !p.held_via.is_empty();
             }
         });
+        let _ = mapping_lost.send(());
     };
+    let mut refused = Standing::default();
 
     loop {
         tokio::select! {
@@ -715,6 +793,7 @@ async fn manage_port<G: Gateways>(
         match result {
             Ok(()) => {
                 debug!(%local_ip, port, "successfully port forwarded");
+                refused.clear(format_args!("port {port} is forwarded again"));
                 lease_ends = Some(sent + lease_duration);
                 update_state(state, |s| {
                     if let Some(p) = s.port_mut(port) {
@@ -728,7 +807,7 @@ async fn manage_port<G: Gateways>(
                 });
             }
             Err(e) => {
-                warn!("failed to forward port: {e:#}");
+                refused.fail(format_args!("failed to forward port {port}: {e:#}"));
                 update_state(state, |s| {
                     if let Some(p) = s.port_mut(port) {
                         p.error = Some(format!("{e:#}"));
@@ -746,6 +825,7 @@ async fn manage_service<G: Gateways>(
     ports: &[u16],
     opts: &UpnpPortForwarderOptions,
     state: &watch::Sender<PortForwardingState>,
+    mapping_lost: &UnboundedSender<()>,
 ) {
     futures::future::join_all(ports.iter().map(|&port| {
         manage_port(
@@ -755,6 +835,7 @@ async fn manage_service<G: Gateways>(
             port,
             opts.lease_duration,
             state,
+            mapping_lost,
         )
         .instrument(debug_span!("manage_port", port = port))
     }))
@@ -768,7 +849,9 @@ async fn run<G: Gateways>(
     state: &watch::Sender<PortForwardingState>,
 ) -> ! {
     let (discover_tx, mut discover_rx) = unbounded_channel();
-    let discovery = discovery(gateways, opts, discover_tx, state);
+    let (mapping_lost_tx, mapping_lost_rx) = unbounded_channel();
+    let discovery = discovery(gateways, opts, discover_tx, mapping_lost_rx, state);
+    let mut no_local_ip = Standing::default();
 
     let mut spawned_tasks = HashSet::<Url>::new();
 
@@ -805,16 +888,20 @@ async fn run<G: Gateways>(
                         continue;
                     }
                     let ip = match &gateway.local_ip {
-                        Ok(ip) => *ip,
+                        Ok(ip) => {
+                            no_local_ip.clear(format_args!("determined local IP {ip} for endpoint at {}", gateway.location));
+                            *ip
+                        },
                         Err(e) => {
-                            warn!("failed to determine local IP for endpoint at {}: {:#}", gateway.location, e);
+                            no_local_ip.fail(format_args!("failed to determine local IP for endpoint at {}: {:#}", gateway.location, e));
                             break;
                         }
                     };
                     spawned_tasks.insert(service.control_url.clone());
                     let span = debug_span!("manage_service", url = %service.control_url);
                     service_managers.push(
-                        manage_service(gateways, service, ip, ports, opts, state).instrument(span),
+                        manage_service(gateways, service, ip, ports, opts, state, &mapping_lost_tx)
+                            .instrument(span),
                     );
                 }
             },
@@ -889,7 +976,10 @@ mod tests {
 mod forwarder_tests {
     use std::{
         net::IpAddr,
-        sync::atomic::{AtomicBool, Ordering},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        },
         time::Duration,
     };
 
@@ -909,14 +999,19 @@ mod forwarder_tests {
     const CONTROL_URL: &str = "http://192.168.1.1:5000/ctl/IPConn";
 
     /// A router that answers searches while `present`, and accepts mappings
-    /// while `accepts`.
+    /// while `accepts`. It records when each search happened.
     struct FakeRouter {
         present: AtomicBool,
         search_fails: AtomicBool,
         accepts: AtomicBool,
         /// AddPortMapping never answers.
         hangs: AtomicBool,
+        /// How long a search takes, in seconds.
+        search_secs: AtomicU64,
+        /// We cannot tell our address on the gateway's network.
+        no_local_ip: AtomicBool,
         start: Instant,
+        searches: Mutex<Vec<Duration>>,
     }
 
     impl FakeRouter {
@@ -926,8 +1021,16 @@ mod forwarder_tests {
                 search_fails: AtomicBool::new(false),
                 accepts: AtomicBool::new(accepts),
                 hangs: AtomicBool::new(false),
+                search_secs: AtomicU64::new(0),
+                no_local_ip: AtomicBool::new(false),
                 start: Instant::now(),
+                searches: Mutex::new(Vec::new()),
             }
+        }
+
+        fn searched_at_secs(&self) -> Vec<u64> {
+            let searches = self.searches.lock().unwrap();
+            searches.iter().map(|d| d.as_secs()).collect()
         }
     }
 
@@ -936,6 +1039,9 @@ mod forwarder_tests {
             &self,
             found: &UnboundedSender<UpnpDiscoverResponse>,
         ) -> anyhow::Result<usize> {
+            self.searches.lock().unwrap().push(self.start.elapsed());
+            let takes = Duration::from_secs(self.search_secs.load(Ordering::SeqCst));
+            tokio::time::sleep(takes).await;
             if self.search_fails.load(Ordering::SeqCst) {
                 anyhow::bail!("failed to send SSDP search request: Network is unreachable");
             }
@@ -957,7 +1063,11 @@ mod forwarder_tests {
                     control_url: Url::parse(CONTROL_URL).unwrap(),
                     service_type: SERVICE_TYPE_WAN_IP_CONNECTION,
                 }],
-                local_ip: Ok("192.168.1.2".parse().unwrap()),
+                local_ip: if self.no_local_ip.load(Ordering::SeqCst) {
+                    Err(anyhow::anyhow!("couldn't find a local ip address"))
+                } else {
+                    Ok("192.168.1.2".parse().unwrap())
+                },
             })
         }
 
@@ -1130,5 +1240,290 @@ mod forwarder_tests {
             assert_eq!(s.discovery_error, None);
         })
         .await
+    }
+
+    type Captured = Arc<Mutex<Vec<(tracing::Level, String)>>>;
+
+    std::thread_local! {
+        static CAPTURING: std::cell::RefCell<Option<Captured>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Collects this crate's log events on this thread, by level and message,
+    /// while capturing. The tests run on a current-thread runtime, so that is
+    /// all of the forwarder's events.
+    ///
+    /// The collector is the process-wide default, installed once, rather than
+    /// a per-test scoped one: tracing caches whether a call site is wanted, and
+    /// a call site first reached on another thread while no scoped collector
+    /// wanted it can stay unwanted.
+    #[derive(Default)]
+    struct Logs(Captured);
+
+    struct CaptureGuard;
+
+    impl Drop for CaptureGuard {
+        fn drop(&mut self) {
+            CAPTURING.with(|c| c.borrow_mut().take());
+        }
+    }
+
+    impl Logs {
+        fn capture(&self) -> CaptureGuard {
+            static INSTALL: std::sync::Once = std::sync::Once::new();
+            INSTALL.call_once(|| {
+                use tracing_subscriber::layer::SubscriberExt;
+                tracing::subscriber::set_global_default(
+                    tracing_subscriber::registry().with(ThreadCapture),
+                )
+                .expect("nothing else in these tests installs a global collector");
+            });
+            CAPTURING.with(|c| *c.borrow_mut() = Some(self.0.clone()));
+            CaptureGuard
+        }
+
+        fn at(&self, level: tracing::Level) -> Vec<String> {
+            let events = self.0.lock().unwrap();
+            events
+                .iter()
+                .filter(|(l, _)| *l == level)
+                .map(|(_, m)| m.clone())
+                .collect()
+        }
+    }
+
+    struct ThreadCapture;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ThreadCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            if !event.metadata().target().starts_with("librqbit_upnp") {
+                return;
+            }
+            CAPTURING.with(|c| {
+                if let Some(captured) = c.borrow().as_ref() {
+                    let mut message = Message(String::new());
+                    event.record(&mut message);
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push((*event.metadata().level(), message.0));
+                }
+            });
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discovery_backs_off_while_no_gateway_answers() {
+        let router = &FakeRouter::new(false, true);
+        with_forwarder(router, Default::default(), |_rx| async move {
+            sleep_until_secs(router.start, 2200).await;
+            // 60 s, doubling, up to 10 minutes.
+            assert_eq!(
+                router.searched_at_secs(),
+                vec![0, 60, 180, 420, 900, 1500, 2100]
+            );
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discovery_backs_off_while_the_search_fails() {
+        let router = &FakeRouter::new(true, true);
+        router.search_fails.store(true, Ordering::SeqCst);
+        with_forwarder(router, Default::default(), |_rx| async move {
+            sleep_until_secs(router.start, 2200).await;
+            assert_eq!(
+                router.searched_at_secs(),
+                vec![0, 60, 180, 420, 900, 1500, 2100]
+            );
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discovery_backoff_resets_when_a_gateway_answers() {
+        let router = &FakeRouter::new(false, true);
+        with_forwarder(router, Default::default(), |_rx| async move {
+            sleep_until_secs(router.start, 500).await;
+            router.present.store(true, Ordering::SeqCst);
+            sleep_until_secs(router.start, 1030).await;
+            // Found at 900; every minute from then on, as without back-off.
+            assert_eq!(
+                router.searched_at_secs(),
+                vec![0, 60, 180, 420, 900, 960, 1020]
+            );
+            // Gone again: the back-off starts over from a minute.
+            router.present.store(false, Ordering::SeqCst);
+            sleep_until_secs(router.start, 1270).await;
+            assert_eq!(
+                router.searched_at_secs(),
+                vec![0, 60, 180, 420, 900, 960, 1020, 1080, 1140, 1260]
+            );
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discovery_backoff_resets_when_a_mapping_is_lost() {
+        let router = &FakeRouter::new(true, true);
+        let opts = UpnpPortForwarderOptions {
+            lease_duration: Duration::from_secs(600),
+            ..Default::default()
+        };
+        with_forwarder(router, opts, |rx| async move {
+            sleep_until_secs(router.start, 1).await;
+            assert!(rx.borrow().port(PORT).unwrap().held);
+            // The gateway goes away: searches find nothing, renewals at 300
+            // and 600 fail, and the lease taken at 0 ends at 600.
+            router.present.store(false, Ordering::SeqCst);
+            router.accepts.store(false, Ordering::SeqCst);
+            sleep_until_secs(router.start, 850).await;
+            assert!(!rx.borrow().port(PORT).unwrap().held);
+            // Backing off from 60: the search due at 960 comes at 660
+            // instead, a minute after the loss, and backs off from there.
+            assert_eq!(
+                router.searched_at_secs(),
+                vec![0, 60, 120, 240, 480, 660, 720, 840]
+            );
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_gateway_warns_once_then_informs_when_one_answers() {
+        let logs = Logs::default();
+        let _guard = logs.capture();
+        let router = &FakeRouter::new(false, true);
+        with_forwarder(router, Default::default(), |rx| async move {
+            sleep_until_secs(router.start, 500).await;
+            assert!(rx.borrow().searched);
+            assert_eq!(rx.borrow().discovery_error, None);
+            router.present.store(true, Ordering::SeqCst);
+            sleep_until_secs(router.start, 1000).await;
+        })
+        .await;
+        // Searches at 0, 60, 180 and 420 found nothing; the one at 900 a gateway.
+        let warns = logs.at(tracing::Level::WARN);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].starts_with("no UPnP gateway answered"),
+            "{warns:?}"
+        );
+        let quiet = logs.at(tracing::Level::DEBUG);
+        assert_eq!(
+            quiet
+                .iter()
+                .filter(|m| m.starts_with("no UPnP gateway answered"))
+                .count(),
+            3,
+            "{quiet:?}"
+        );
+        assert_eq!(
+            logs.at(tracing::Level::INFO),
+            vec!["a UPnP gateway answered".to_owned()]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failing_search_warns_once_then_informs_when_it_works() {
+        let logs = Logs::default();
+        let _guard = logs.capture();
+        let router = &FakeRouter::new(true, true);
+        router.search_fails.store(true, Ordering::SeqCst);
+        with_forwarder(router, Default::default(), |_rx| async move {
+            sleep_until_secs(router.start, 500).await;
+            router.search_fails.store(false, Ordering::SeqCst);
+            sleep_until_secs(router.start, 1000).await;
+        })
+        .await;
+        let warns = logs.at(tracing::Level::WARN);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].starts_with("failed to run SSDP/UPNP discovery"),
+            "{warns:?}"
+        );
+        assert_eq!(
+            logs.at(tracing::Level::INFO),
+            vec!["SSDP/UPNP discovery works again".to_owned()]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refused_mapping_warns_once_then_informs_when_it_is_taken() {
+        let logs = Logs::default();
+        let _guard = logs.capture();
+        let router = &FakeRouter::new(true, false);
+        with_forwarder(router, Default::default(), |rx| async move {
+            // Refused at 0, 30, 60 and 90; taken at 120.
+            sleep_until_secs(router.start, 100).await;
+            router.accepts.store(true, Ordering::SeqCst);
+            sleep_until_secs(router.start, 121).await;
+            let s = rx.borrow().clone();
+            let p = s.port(PORT).unwrap();
+            assert!(p.held);
+            assert_eq!(p.error, None, "a mapping that is taken clears the error");
+        })
+        .await;
+        let warns = logs.at(tracing::Level::WARN);
+        assert_eq!(
+            warns,
+            vec!["failed to forward port 6881: failed port forwarding: 500 Internal Server Error"]
+        );
+        assert_eq!(
+            logs.at(tracing::Level::INFO),
+            vec!["port 6881 is forwarded again".to_owned()]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn searches_keep_their_interval_however_long_they_take() {
+        let router = &FakeRouter::new(true, true);
+        router.search_secs.store(10, Ordering::SeqCst);
+        with_forwarder(router, Default::default(), |_rx| async move {
+            sleep_until_secs(router.start, 130).await;
+            assert_eq!(router.searched_at_secs(), vec![0, 60, 120]);
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unknown_local_address_warns_once() {
+        let logs = Logs::default();
+        let _guard = logs.capture();
+        let router = &FakeRouter::new(true, true);
+        router.no_local_ip.store(true, Ordering::SeqCst);
+        with_forwarder(router, Default::default(), |rx| async move {
+            sleep_until_secs(router.start, 200).await;
+            assert!(!rx.borrow().port(PORT).unwrap().held);
+            router.no_local_ip.store(false, Ordering::SeqCst);
+            sleep_until_secs(router.start, 250).await;
+            assert!(rx.borrow().port(PORT).unwrap().held);
+        })
+        .await;
+        // Searches at 0, 60, 120 and 180 found the gateway; none could map.
+        let warns = logs.at(tracing::Level::WARN);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].starts_with("failed to determine local IP"),
+            "{warns:?}"
+        );
+        let infos = logs.at(tracing::Level::INFO);
+        assert_eq!(infos.len(), 1, "{infos:?}");
+        assert!(infos[0].starts_with("determined local IP"), "{infos:?}");
     }
 }
