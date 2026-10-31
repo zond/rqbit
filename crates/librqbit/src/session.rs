@@ -133,6 +133,8 @@ pub struct Session {
     trackers: HashSet<url::Url>,
 
     lsd: Option<LocalServiceDiscovery>,
+    /// The UPnP port forwarder's state; `None` when forwarding is off.
+    port_forwarding: Option<tokio::sync::watch::Receiver<librqbit_upnp::PortForwardingState>>,
 
     // Limits and throttling
     pub(crate) concurrent_initialize_semaphore: Arc<tokio::sync::Semaphore>,
@@ -839,7 +841,20 @@ impl Session {
                 }
             };
 
+            // Built before the session so the session keeps its state receiver; it starts
+            // with the listeners below.
+            let port_forwarder = match listen_result.as_ref() {
+                Some(listen) if listen.enable_upnp_port_forwarding => listen
+                    .announce_port
+                    .map(|port| {
+                        librqbit_upnp::UpnpPortForwarder::new(vec![port], None, bind_device.clone())
+                    })
+                    .transpose()?,
+                _ => None,
+            };
+
             let session = Arc::new(Self {
+                port_forwarding: port_forwarder.as_ref().map(|f| f.subscribe()),
                 persistence,
                 bitv_factory,
                 peer_id,
@@ -909,15 +924,14 @@ impl Session {
                         },
                     );
                 }
-                if listen.enable_upnp_port_forwarding
+                if let Some(port_forwarder) = port_forwarder
                     && let Some(announce_port) = listen.announce_port
                 {
                     info!(port = announce_port, "starting UPnP port forwarder");
-                    let bind_device = bind_device.clone();
                     session.spawn(
                         debug_span!(parent: session.rs(), "upnp_forward", port = announce_port),
                         "upnp_forward",
-                        Self::task_upnp_port_forwarder(announce_port, bind_device),
+                        async move { port_forwarder.run_forever().await },
                     );
                 }
             }
@@ -1091,14 +1105,6 @@ impl Session {
                 else => continue,
             }
         }
-    }
-
-    async fn task_upnp_port_forwarder(
-        port: u16,
-        bind_device: Option<BindDevice>,
-    ) -> anyhow::Result<()> {
-        let pf = librqbit_upnp::UpnpPortForwarder::new(vec![port], None, bind_device)?;
-        pf.run_forever().await
     }
 
     pub fn get_dht(&self) -> Option<&Dht> {
@@ -1785,6 +1791,15 @@ impl Session {
 
     pub fn announce_port(&self) -> Option<u16> {
         self.announce_port
+    }
+
+    /// The UPnP port forwarder's state as it changes: whether a gateway was
+    /// found and whether it holds a mapping for [`Self::announce_port`].
+    /// `None` when forwarding is off, or there is no announce port to forward.
+    pub fn port_forwarding(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<librqbit_upnp::PortForwardingState>> {
+        self.port_forwarding.clone()
     }
 
     async fn resolve_magnet(

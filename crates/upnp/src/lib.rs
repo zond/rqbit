@@ -3,13 +3,19 @@ use bstr::BStr;
 use futures::{StreamExt, TryFutureExt, stream::FuturesUnordered};
 use librqbit_dualstack_sockets::{BindDevice, UdpSocket};
 use network_interface::{NetworkInterface, NetworkInterfaceConfig};
-use serde_derive::Deserialize;
+use serde_derive::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::{
+    sync::{
+        mpsc::{UnboundedSender, unbounded_channel},
+        watch,
+    },
+    time::Instant,
+};
 use tracing::{Instrument, Span, debug, debug_span, trace, warn};
 use url::Url;
 
@@ -81,7 +87,7 @@ pub fn get_local_ip_relative_to(
 }
 
 async fn forward_port(
-    control_url: Url,
+    service: &WanService,
     local_ip: IpAddr,
     port: u16,
     lease_duration: Duration,
@@ -91,7 +97,7 @@ async fn forward_port(
         <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
             s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
             <s:Body>
-                <u:AddPortMapping xmlns:u="{SERVICE_TYPE_WAN_IP_CONNECTION}">
+                <u:AddPortMapping xmlns:u="{service_type}">
                     <NewRemoteHost></NewRemoteHost>
                     <NewExternalPort>{port}</NewExternalPort>
                     <NewProtocol>TCP</NewProtocol>
@@ -104,10 +110,11 @@ async fn forward_port(
             </s:Body>
         </s:Envelope>
     "#,
-        lease_duration.as_secs()
+        lease_duration.as_secs(),
+        service_type = service.service_type,
     );
 
-    let url = control_url;
+    let url = service.control_url.clone();
 
     let client = http_client::http_client_builder()
         .build()
@@ -117,7 +124,7 @@ async fn forward_port(
         .header("Content-Type", "text/xml")
         .header(
             "SOAPAction",
-            format!("\"{SERVICE_TYPE_WAN_IP_CONNECTION}#AddPortMapping\""),
+            format!("\"{}#AddPortMapping\"", service.service_type),
         )
         .body(request_body)
         .send()
@@ -226,12 +233,8 @@ struct UpnpEndpoint {
 }
 
 impl UpnpEndpoint {
-    fn location(&self) -> &Url {
-        &self.discover_response.location
-    }
-
     fn span(&self) -> tracing::Span {
-        debug_span!("upnp_endpoint", location = %self.location())
+        debug_span!("upnp_endpoint", location = %self.discover_response.location)
     }
 
     fn iter_services(&self) -> impl Iterator<Item = (tracing::Span, &Service)> + '_ {
@@ -249,12 +252,22 @@ impl UpnpEndpoint {
         Ok(local_ip)
     }
 
-    fn get_wan_ip_control_urls(&self) -> impl Iterator<Item = (tracing::Span, Url)> + '_ {
+    fn get_wan_services(&self) -> impl Iterator<Item = WanService> + '_ {
         self.iter_services()
-            .filter(|(_, s)| s.service_type == SERVICE_TYPE_WAN_IP_CONNECTION)
-            .map(|(span, s)| (span, self.discover_response.location.join(&s.control_url)))
-            .filter_map(|(span, url)| match url {
-                Ok(url) => Some((span, url)),
+            .filter_map(|(_, s)| {
+                let service_type = [SERVICE_TYPE_WAN_IP_CONNECTION]
+                    .into_iter()
+                    .find(|t| *t == s.service_type)?;
+                Some((
+                    service_type,
+                    self.discover_response.location.join(&s.control_url),
+                ))
+            })
+            .filter_map(|(service_type, url)| match url {
+                Ok(control_url) => Some(WanService {
+                    control_url,
+                    service_type,
+                }),
                 Err(e) => {
                     debug!("bad control url: {e:#}");
                     None
@@ -328,6 +341,17 @@ pub async fn discover_once(
     timeout: Duration,
     bind_device: Option<&BindDevice>,
 ) -> anyhow::Result<()> {
+    search(tx, kind, timeout, bind_device).await.map(|_| ())
+}
+
+/// One SSDP search: what [`discover_once`] does, returning how many
+/// endpoints answered.
+async fn search(
+    tx: &UnboundedSender<UpnpDiscoverResponse>,
+    kind: &str,
+    timeout: Duration,
+    bind_device: Option<&BindDevice>,
+) -> anyhow::Result<usize> {
     // TODO: do we need IPv6 support here? I can't test it, don't have the hardware for it (router / IPv6 provider).
     let socket = UdpSocket::bind_udp(
         (Ipv4Addr::UNSPECIFIED, 0).into(),
@@ -370,7 +394,7 @@ pub async fn discover_once(
     }
 
     debug!("discovered {discovered} endpoints");
-    Ok(())
+    Ok(discovered)
 }
 
 pub struct UpnpPortForwarderOptions {
@@ -389,10 +413,184 @@ impl Default for UpnpPortForwarderOptions {
     }
 }
 
+/// What a [`UpnpPortForwarder`] knows about the network and its mappings,
+/// published on the channel [`UpnpPortForwarder::subscribe`] returns.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PortForwardingState {
+    /// Whether an SSDP search has finished yet, whatever it found. Until one
+    /// has, no gateway is not news.
+    pub searched: bool,
+    /// The gateway that answered the latest search, once its description has
+    /// been read and it offers a WAN connection service. A search nothing
+    /// answers, or one that fails, clears it.
+    pub gateway: Option<PortForwardingGateway>,
+    /// Why the latest search failed, if it did. A search nobody answers has
+    /// not failed: that is `gateway` being empty.
+    pub discovery_error: Option<String>,
+    /// One entry per port the forwarder was asked to map, in that order.
+    pub ports: Vec<PortMappingState>,
+}
+
+/// A UPnP gateway that answered the search.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PortForwardingGateway {
+    /// The device's friendly name, or its device type if it has none.
+    pub name: String,
+    /// Where its description lives, as the gateway announced it.
+    pub location: String,
+}
+
+/// One port the forwarder maps.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PortMappingState {
+    pub port: u16,
+    /// Whether a gateway holds a mapping for this port right now: an
+    /// AddPortMapping succeeded and its lease has not run out since. A
+    /// mapping that fails to renew stops being held when its lease ends.
+    pub held: bool,
+    /// The control URLs of the gateway services holding the mapping; empty
+    /// exactly when `held` is false.
+    pub held_via: Vec<String>,
+    /// When an AddPortMapping for this port last succeeded.
+    pub mapped_at: Option<SystemTime>,
+    /// Why the latest AddPortMapping for this port failed, until one
+    /// succeeds.
+    pub error: Option<String>,
+}
+
+impl PortForwardingState {
+    fn new(ports: &[u16]) -> Self {
+        Self {
+            searched: false,
+            gateway: None,
+            discovery_error: None,
+            ports: ports
+                .iter()
+                .map(|&port| PortMappingState {
+                    port,
+                    held: false,
+                    held_via: Vec::new(),
+                    mapped_at: None,
+                    error: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// The entry for `port`, if the forwarder maps it.
+    pub fn port(&self, port: u16) -> Option<&PortMappingState> {
+        self.ports.iter().find(|p| p.port == port)
+    }
+
+    fn port_mut(&mut self, port: u16) -> Option<&mut PortMappingState> {
+        self.ports.iter_mut().find(|p| p.port == port)
+    }
+}
+
+/// Changes the published state, waking subscribers only if it changed.
+fn update_state(
+    state: &watch::Sender<PortForwardingState>,
+    f: impl FnOnce(&mut PortForwardingState),
+) {
+    state.send_if_modified(|s| {
+        let before = s.clone();
+        f(s);
+        *s != before
+    });
+}
+
+/// A WAN connection service on a gateway: where to send AddPortMapping, and
+/// the service type the SOAP action must name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WanService {
+    control_url: Url,
+    service_type: &'static str,
+}
+
+/// A gateway's description, read after it answered a search.
+struct FoundGateway {
+    name: String,
+    location: Url,
+    services: Vec<WanService>,
+    /// Our address on the gateway's network, which the mapping points at.
+    local_ip: anyhow::Result<IpAddr>,
+}
+
+/// The network as the forwarder's loops see it, so that tests can stand in
+/// for a router.
+trait Gateways {
+    /// Searches for gateways, sending each answer to `found`, and returns how
+    /// many answered.
+    async fn search(&self, found: &UnboundedSender<UpnpDiscoverResponse>) -> anyhow::Result<usize>;
+
+    /// Reads the description of a gateway that answered.
+    async fn describe(&self, response: UpnpDiscoverResponse) -> anyhow::Result<FoundGateway>;
+
+    async fn add_port_mapping(
+        &self,
+        service: &WanService,
+        local_ip: IpAddr,
+        port: u16,
+        lease_duration: Duration,
+    ) -> anyhow::Result<()>;
+}
+
+/// The real network: SSDP, HTTP and SOAP.
+struct NetworkGateways {
+    bind_device: Option<BindDevice>,
+    discover_timeout: Duration,
+}
+
+impl Gateways for NetworkGateways {
+    async fn search(&self, found: &UnboundedSender<UpnpDiscoverResponse>) -> anyhow::Result<usize> {
+        search(
+            found,
+            SSDP_SEARCH_WAN_IPCONNECTION_ST,
+            self.discover_timeout,
+            self.bind_device.as_ref(),
+        )
+        .await
+    }
+
+    async fn describe(&self, response: UpnpDiscoverResponse) -> anyhow::Result<FoundGateway> {
+        let location = response.location.clone();
+        let data = discover_services(location.clone()).await?;
+        let nics = network_interface::NetworkInterface::show()
+            .context("error listing network interfaces")?;
+        let endpoint = UpnpEndpoint {
+            discover_response: response,
+            data,
+            nics,
+        };
+        Ok(FoundGateway {
+            name: endpoint
+                .data
+                .devices
+                .first()
+                .map(|d| d.name().to_owned())
+                .unwrap_or_default(),
+            location,
+            services: endpoint.get_wan_services().collect(),
+            local_ip: endpoint.my_local_ip(),
+        })
+    }
+
+    async fn add_port_mapping(
+        &self,
+        service: &WanService,
+        local_ip: IpAddr,
+        port: u16,
+        lease_duration: Duration,
+    ) -> anyhow::Result<()> {
+        forward_port(service, local_ip, port, lease_duration).await
+    }
+}
+
 pub struct UpnpPortForwarder {
     ports: Vec<u16>,
     opts: UpnpPortForwarderOptions,
     bind_device: Option<BindDevice>,
+    state: watch::Sender<PortForwardingState>,
 }
 
 impl UpnpPortForwarder {
@@ -404,127 +602,225 @@ impl UpnpPortForwarder {
         if ports.is_empty() {
             bail!("empty ports")
         }
+        let state = watch::Sender::new(PortForwardingState::new(&ports));
         Ok(Self {
             ports,
             opts: opts.unwrap_or_default(),
             bind_device,
+            state,
         })
     }
 
-    async fn parse_endpoint(
-        &self,
-        discover_response: UpnpDiscoverResponse,
-    ) -> anyhow::Result<UpnpEndpoint> {
-        let services = discover_services(discover_response.location.clone()).await?;
-        let nics = network_interface::NetworkInterface::show()
-            .context("error listing network interfaces")?;
-        Ok(UpnpEndpoint {
-            discover_response,
-            data: services,
-            nics,
-        })
-    }
-
-    async fn discover_once(
-        &self,
-        tx: &UnboundedSender<UpnpDiscoverResponse>,
-    ) -> anyhow::Result<()> {
-        discover_once(
-            tx,
-            SSDP_SEARCH_WAN_IPCONNECTION_ST,
-            self.opts.discover_timeout,
-            self.bind_device.as_ref(),
-        )
-        .await
-    }
-
-    async fn discovery(&self, tx: UnboundedSender<UpnpDiscoverResponse>) -> anyhow::Result<()> {
-        let mut discover_interval = tokio::time::interval(self.opts.discover_interval);
-        discover_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-        loop {
-            discover_interval.tick().await;
-            if let Err(e) = self.discover_once(&tx).await {
-                warn!("failed to run SSDP/UPNP discovery: {e:#}");
-            }
-        }
-    }
-
-    async fn manage_port(&self, control_url: Url, local_ip: IpAddr, port: u16) -> ! {
-        let lease_duration = self.opts.lease_duration;
-        let mut interval = tokio::time::interval(lease_duration / 2);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-        loop {
-            interval.tick().await;
-            if let Err(e) = forward_port(control_url.clone(), local_ip, port, lease_duration).await
-            {
-                warn!("failed to forward port: {e:#}");
-            }
-        }
-    }
-
-    async fn manage_service(&self, control_url: Url, local_ip: IpAddr) -> anyhow::Result<()> {
-        futures::future::join_all(self.ports.iter().cloned().map(|port| {
-            self.manage_port(control_url.clone(), local_ip, port)
-                .instrument(debug_span!("manage_port", port = port))
-        }))
-        .await;
-        Ok(())
+    /// The forwarder's state as it changes. Subscribe before
+    /// [`Self::run_forever`] consumes the forwarder; receivers keep working
+    /// while it runs.
+    pub fn subscribe(&self) -> watch::Receiver<PortForwardingState> {
+        self.state.subscribe()
     }
 
     pub async fn run_forever(self) -> ! {
-        let (discover_tx, mut discover_rx) = unbounded_channel();
-        let discovery = self.discovery(discover_tx);
+        let gateways = NetworkGateways {
+            bind_device: self.bind_device,
+            discover_timeout: self.opts.discover_timeout,
+        };
+        run(&self.ports, &self.opts, &gateways, &self.state).await
+    }
+}
 
-        let mut spawned_tasks = HashSet::<Url>::new();
+async fn discovery<G: Gateways>(
+    gateways: &G,
+    opts: &UpnpPortForwarderOptions,
+    tx: UnboundedSender<UpnpDiscoverResponse>,
+    state: &watch::Sender<PortForwardingState>,
+) {
+    let mut discover_interval = tokio::time::interval(opts.discover_interval);
+    discover_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        let mut endpoints = FuturesUnordered::new();
-        let mut service_managers = FuturesUnordered::new();
-
-        tokio::pin!(discovery);
-
-        loop {
-            tokio::select! {
-                _ = &mut discovery => {},
-                r = discover_rx.recv() => {
-                    let r = r.unwrap();
-                    let location = r.location.clone();
-                    endpoints.push(self.parse_endpoint(r).map_err(|e| {
-                        debug!("error parsing endpoint: {e:#}");
-                        e
-                    }).instrument(debug_span!("parse endpoint", location=location.to_string())));
-                },
-                Some(Ok(endpoint)) = endpoints.next(), if !endpoints.is_empty() => {
-                    let mut local_ip = None;
-                    for (span, control_url) in endpoint.get_wan_ip_control_urls() {
-                        if spawned_tasks.contains(&control_url) {
-                            debug!("already spawned for {}", control_url);
-                            continue;
-                        }
-                        let ip = match local_ip {
-                            Some(ip) => ip,
-                            None => {
-                                match endpoint.my_local_ip() {
-                                    Ok(ip) => {
-                                        local_ip = Some(ip);
-                                        ip
-                                    },
-                                    Err(e) => {
-                                        warn!("failed to determine local IP for endpoint at {}: {:#}", endpoint.location(), e);
-                                        break;
-                                    }
-                                }
-                            }
-                        };
-                        spawned_tasks.insert(control_url.clone());
-                        service_managers.push(self.manage_service(control_url, ip).instrument(span))
-                    }
-                },
-                _ = service_managers.next(), if !service_managers.is_empty() => {
-
-                },
+    loop {
+        discover_interval.tick().await;
+        let result = gateways.search(&tx).await;
+        update_state(state, |s| {
+            s.searched = true;
+            match &result {
+                Ok(0) => {
+                    s.gateway = None;
+                    s.discovery_error = None;
+                }
+                Ok(_) => s.discovery_error = None,
+                Err(e) => {
+                    s.gateway = None;
+                    s.discovery_error = Some(format!("{e:#}"));
+                }
             }
+        });
+        if let Err(e) = result {
+            warn!("failed to run SSDP/UPNP discovery: {e:#}");
+        }
+    }
+}
+
+/// Resolves when the lease ending at `at` runs out; never, if none is held.
+async fn lease_end(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn manage_port<G: Gateways>(
+    gateways: &G,
+    service: &WanService,
+    local_ip: IpAddr,
+    port: u16,
+    lease_duration: Duration,
+    state: &watch::Sender<PortForwardingState>,
+) {
+    let mut interval = tokio::time::interval(lease_duration / 2);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let via = service.control_url.to_string();
+    // When the gateway drops the mapping unless we renew it first.
+    let mut lease_ends: Option<Instant> = None;
+    let lost = |lease_ends: &mut Option<Instant>| {
+        *lease_ends = None;
+        update_state(state, |s| {
+            if let Some(p) = s.port_mut(port) {
+                p.held_via.retain(|v| *v != via);
+                p.held = !p.held_via.is_empty();
+            }
+        });
+    };
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = interval.tick() => {}
+            _ = lease_end(lease_ends) => {
+                lost(&mut lease_ends);
+                continue;
+            }
+        }
+
+        // The lease counts from when we asked, not from when the gateway answered.
+        let sent = Instant::now();
+        let attempt = gateways.add_port_mapping(service, local_ip, port, lease_duration);
+        tokio::pin!(attempt);
+        let result = loop {
+            tokio::select! {
+                biased;
+                r = &mut attempt => break r,
+                _ = lease_end(lease_ends) => lost(&mut lease_ends),
+            }
+        };
+
+        match result {
+            Ok(()) => {
+                debug!(%local_ip, port, "successfully port forwarded");
+                lease_ends = Some(sent + lease_duration);
+                update_state(state, |s| {
+                    if let Some(p) = s.port_mut(port) {
+                        if !p.held_via.contains(&via) {
+                            p.held_via.push(via.clone());
+                        }
+                        p.held = true;
+                        p.mapped_at = Some(SystemTime::now());
+                        p.error = None;
+                    }
+                });
+            }
+            Err(e) => {
+                warn!("failed to forward port: {e:#}");
+                update_state(state, |s| {
+                    if let Some(p) = s.port_mut(port) {
+                        p.error = Some(format!("{e:#}"));
+                    }
+                });
+            }
+        }
+    }
+}
+
+async fn manage_service<G: Gateways>(
+    gateways: &G,
+    service: WanService,
+    local_ip: IpAddr,
+    ports: &[u16],
+    opts: &UpnpPortForwarderOptions,
+    state: &watch::Sender<PortForwardingState>,
+) {
+    futures::future::join_all(ports.iter().map(|&port| {
+        manage_port(
+            gateways,
+            &service,
+            local_ip,
+            port,
+            opts.lease_duration,
+            state,
+        )
+        .instrument(debug_span!("manage_port", port = port))
+    }))
+    .await;
+}
+
+async fn run<G: Gateways>(
+    ports: &[u16],
+    opts: &UpnpPortForwarderOptions,
+    gateways: &G,
+    state: &watch::Sender<PortForwardingState>,
+) -> ! {
+    let (discover_tx, mut discover_rx) = unbounded_channel();
+    let discovery = discovery(gateways, opts, discover_tx, state);
+
+    let mut spawned_tasks = HashSet::<Url>::new();
+
+    let mut endpoints = FuturesUnordered::new();
+    let mut service_managers = FuturesUnordered::new();
+
+    tokio::pin!(discovery);
+
+    loop {
+        tokio::select! {
+            _ = &mut discovery => {},
+            r = discover_rx.recv() => {
+                let r = r.unwrap();
+                let location = r.location.clone();
+                endpoints.push(gateways.describe(r).map_err(|e| {
+                    debug!("error parsing endpoint: {e:#}");
+                    e
+                }).instrument(debug_span!("parse endpoint", location=location.to_string())));
+            },
+            Some(Ok(gateway)) = endpoints.next(), if !endpoints.is_empty() => {
+                if gateway.services.is_empty() {
+                    debug!(location = %gateway.location, "no WAN connection service");
+                    continue;
+                }
+                update_state(state, |s| {
+                    s.gateway = Some(PortForwardingGateway {
+                        name: gateway.name.clone(),
+                        location: gateway.location.to_string(),
+                    })
+                });
+                for service in gateway.services {
+                    if spawned_tasks.contains(&service.control_url) {
+                        debug!("already spawned for {}", service.control_url);
+                        continue;
+                    }
+                    let ip = match &gateway.local_ip {
+                        Ok(ip) => *ip,
+                        Err(e) => {
+                            warn!("failed to determine local IP for endpoint at {}: {:#}", gateway.location, e);
+                            break;
+                        }
+                    };
+                    spawned_tasks.insert(service.control_url.clone());
+                    let span = debug_span!("manage_service", url = %service.control_url);
+                    service_managers.push(
+                        manage_service(gateways, service, ip, ports, opts, state).instrument(span),
+                    );
+                }
+            },
+            _ = service_managers.next(), if !service_managers.is_empty() => {
+
+            },
         }
     }
 }
@@ -585,5 +881,254 @@ mod tests {
             }],
         };
         assert_eq!(actual, expected);
+    }
+}
+
+/// The forwarder's loops against a stand-in router, on tokio's paused clock.
+#[cfg(test)]
+mod forwarder_tests {
+    use std::{
+        net::IpAddr,
+        sync::atomic::{AtomicBool, Ordering},
+        time::Duration,
+    };
+
+    use tokio::{
+        sync::{mpsc::UnboundedSender, watch},
+        time::Instant,
+    };
+    use url::Url;
+
+    use crate::{
+        FoundGateway, Gateways, PortForwardingState, SERVICE_TYPE_WAN_IP_CONNECTION,
+        UpnpDiscoverResponse, UpnpPortForwarderOptions, WanService, run,
+    };
+
+    const PORT: u16 = 6881;
+    const LOCATION: &str = "http://192.168.1.1:5000/rootDesc.xml";
+    const CONTROL_URL: &str = "http://192.168.1.1:5000/ctl/IPConn";
+
+    /// A router that answers searches while `present`, and accepts mappings
+    /// while `accepts`.
+    struct FakeRouter {
+        present: AtomicBool,
+        search_fails: AtomicBool,
+        accepts: AtomicBool,
+        /// AddPortMapping never answers.
+        hangs: AtomicBool,
+        start: Instant,
+    }
+
+    impl FakeRouter {
+        fn new(present: bool, accepts: bool) -> Self {
+            Self {
+                present: AtomicBool::new(present),
+                search_fails: AtomicBool::new(false),
+                accepts: AtomicBool::new(accepts),
+                hangs: AtomicBool::new(false),
+                start: Instant::now(),
+            }
+        }
+    }
+
+    impl Gateways for FakeRouter {
+        async fn search(
+            &self,
+            found: &UnboundedSender<UpnpDiscoverResponse>,
+        ) -> anyhow::Result<usize> {
+            if self.search_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("failed to send SSDP search request: Network is unreachable");
+            }
+            if !self.present.load(Ordering::SeqCst) {
+                return Ok(0);
+            }
+            found.send(UpnpDiscoverResponse {
+                received_from: "192.168.1.1:1900".parse().unwrap(),
+                location: Url::parse(LOCATION).unwrap(),
+            })?;
+            Ok(1)
+        }
+
+        async fn describe(&self, response: UpnpDiscoverResponse) -> anyhow::Result<FoundGateway> {
+            Ok(FoundGateway {
+                name: "Test Router".into(),
+                location: response.location,
+                services: vec![WanService {
+                    control_url: Url::parse(CONTROL_URL).unwrap(),
+                    service_type: SERVICE_TYPE_WAN_IP_CONNECTION,
+                }],
+                local_ip: Ok("192.168.1.2".parse().unwrap()),
+            })
+        }
+
+        async fn add_port_mapping(
+            &self,
+            _service: &WanService,
+            _local_ip: IpAddr,
+            _port: u16,
+            _lease_duration: Duration,
+        ) -> anyhow::Result<()> {
+            if self.hangs.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if self.accepts.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                anyhow::bail!("failed port forwarding: 500 Internal Server Error")
+            }
+        }
+    }
+
+    /// Runs the forwarder against `router` while `body` runs, then returns
+    /// what `body` returned. The body is polled first, so it sees the state
+    /// before the forwarder has done anything.
+    async fn with_forwarder<F: Future>(
+        router: &FakeRouter,
+        opts: UpnpPortForwarderOptions,
+        body: impl FnOnce(watch::Receiver<PortForwardingState>) -> F,
+    ) -> F::Output {
+        let state = watch::Sender::new(PortForwardingState::new(&[PORT]));
+        let body = body(state.subscribe());
+        let forwarder = run(&[PORT], &opts, router, &state);
+        tokio::select! {
+            biased;
+            out = body => out,
+            _ = forwarder => unreachable!("the forwarder runs forever"),
+        }
+    }
+
+    async fn sleep_until_secs(start: Instant, secs: u64) {
+        tokio::time::sleep_until(start + Duration::from_secs(secs)).await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn state_reports_search_gateway_and_held_mapping() {
+        let router = &FakeRouter::new(true, true);
+        with_forwarder(router, Default::default(), |rx| async move {
+            {
+                let s = rx.borrow();
+                assert!(!s.searched);
+                assert_eq!(s.gateway, None);
+                assert!(!s.port(PORT).unwrap().held);
+            }
+            sleep_until_secs(router.start, 1).await;
+            let s = rx.borrow().clone();
+            assert!(s.searched);
+            assert_eq!(s.discovery_error, None);
+            let gateway = s.gateway.clone().unwrap();
+            assert_eq!(gateway.name, "Test Router");
+            assert_eq!(gateway.location, LOCATION);
+            let p = s.port(PORT).unwrap();
+            assert!(p.held);
+            assert_eq!(p.held_via, vec![CONTROL_URL.to_owned()]);
+            assert!(p.mapped_at.is_some());
+            assert_eq!(p.error, None);
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mapping_that_fails_to_renew_stops_being_held_when_its_lease_ends() {
+        let router = &FakeRouter::new(true, true);
+        // Lease 60 s, renewed every 30 s: mapped at 0, refused at 30 and 60.
+        with_forwarder(router, Default::default(), |rx| async move {
+            sleep_until_secs(router.start, 1).await;
+            assert!(rx.borrow().port(PORT).unwrap().held);
+            router.accepts.store(false, Ordering::SeqCst);
+
+            sleep_until_secs(router.start, 59).await;
+            let s = rx.borrow().clone();
+            let p = s.port(PORT).unwrap();
+            assert!(p.held, "the lease taken at 0 runs until 60");
+            assert!(p.error.is_some(), "the renewal at 30 was refused");
+
+            sleep_until_secs(router.start, 61).await;
+            let s = rx.borrow().clone();
+            let p = s.port(PORT).unwrap();
+            assert!(!p.held, "nothing renewed the lease that ended at 60");
+            assert!(p.held_via.is_empty());
+            assert!(p.error.is_some());
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mapping_stops_being_held_when_its_lease_ends_during_a_renewal_that_hangs() {
+        let router = &FakeRouter::new(true, true);
+        with_forwarder(router, Default::default(), |rx| async move {
+            sleep_until_secs(router.start, 1).await;
+            assert!(rx.borrow().port(PORT).unwrap().held);
+            // The renewal at 30 never comes back.
+            router.hangs.store(true, Ordering::SeqCst);
+            sleep_until_secs(router.start, 59).await;
+            assert!(rx.borrow().port(PORT).unwrap().held);
+            sleep_until_secs(router.start, 61).await;
+            assert!(!rx.borrow().port(PORT).unwrap().held);
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refused_mapping_is_not_held_and_says_why() {
+        let router = &FakeRouter::new(true, false);
+        with_forwarder(router, Default::default(), |rx| async move {
+            sleep_until_secs(router.start, 1).await;
+            let s = rx.borrow().clone();
+            assert!(s.gateway.is_some());
+            let p = s.port(PORT).unwrap();
+            assert!(!p.held);
+            assert_eq!(p.mapped_at, None);
+            assert_eq!(
+                p.error.as_deref(),
+                Some("failed port forwarding: 500 Internal Server Error")
+            );
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unanswered_search_clears_the_gateway_without_an_error() {
+        let router = &FakeRouter::new(true, true);
+        with_forwarder(router, Default::default(), |rx| async move {
+            sleep_until_secs(router.start, 1).await;
+            assert!(rx.borrow().gateway.is_some());
+
+            // Nobody answers the search at 60.
+            router.present.store(false, Ordering::SeqCst);
+            sleep_until_secs(router.start, 61).await;
+            let s = rx.borrow().clone();
+            assert_eq!(s.gateway, None);
+            assert_eq!(s.discovery_error, None);
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_search_is_a_discovery_error_and_no_answer_is_not() {
+        let router = &FakeRouter::new(true, true);
+        with_forwarder(router, Default::default(), |rx| async move {
+            sleep_until_secs(router.start, 1).await;
+            assert!(rx.borrow().gateway.is_some());
+
+            // The next search, at 60, cannot even be sent.
+            router.search_fails.store(true, Ordering::SeqCst);
+            sleep_until_secs(router.start, 61).await;
+            let s = rx.borrow().clone();
+            assert!(s.searched);
+            assert_eq!(s.gateway, None);
+            assert_eq!(
+                s.discovery_error.as_deref(),
+                Some("failed to send SSDP search request: Network is unreachable")
+            );
+
+            // The one at 120 is sent, and nobody answers: no gateway, but no error.
+            router.search_fails.store(false, Ordering::SeqCst);
+            router.present.store(false, Ordering::SeqCst);
+            sleep_until_secs(router.start, 121).await;
+            let s = rx.borrow().clone();
+            assert_eq!(s.gateway, None);
+            assert_eq!(s.discovery_error, None);
+        })
+        .await
     }
 }

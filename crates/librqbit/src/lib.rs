@@ -88,6 +88,7 @@ pub use error::{Error, Result};
 /// depends on, and follows this crate's `rust-tls` / `default-tls` features
 /// because they are forwarded there.
 pub use librqbit_upnp::http_client_builder;
+pub use librqbit_upnp::{PortForwardingGateway, PortForwardingState, PortMappingState};
 
 pub use api::Api;
 pub use api_error::{ApiError, WithStatus, WithStatusError};

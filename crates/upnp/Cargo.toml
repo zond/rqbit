@@ -24,7 +24,7 @@ reqwest.workspace = true
 webpki-root-certs = { workspace = true, optional = true }
 serde.workspace = true
 serde_derive.workspace = true
-tokio = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["macros", "sync", "time"] }
 futures.workspace = true
 url.workspace = true
 network-interface.workspace = true
@@ -35,5 +35,5 @@ librqbit-dualstack-sockets.workspace = true
 socket2.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tracing-subscriber.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tracing-subscriber = { workspace = true, features = ["fmt"] }

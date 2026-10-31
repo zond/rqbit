@@ -10,6 +10,7 @@ mod e2e_unadvertised_pieces;
 mod e2e_upload_switch;
 mod initial_check_pause;
 mod lock_order;
+mod port_forwarding;
 mod session_drop;
 mod session_persistence;
 pub mod test_util;
