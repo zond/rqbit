@@ -1,11 +1,15 @@
 use anyhow::{Context, bail};
 use bstr::BStr;
-use futures::{StreamExt, TryFutureExt, stream::FuturesUnordered};
+use futures::{
+    StreamExt, TryFutureExt,
+    future::{AbortHandle, abortable},
+    stream::FuturesUnordered,
+};
 use librqbit_dualstack_sockets::{BindDevice, UdpSocket};
 use network_interface::{NetworkInterface, NetworkInterfaceConfig};
 use serde_derive::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4},
     time::{Duration, SystemTime},
 };
@@ -476,7 +480,9 @@ pub struct PortMappingState {
     pub port: u16,
     /// Whether a gateway holds a mapping for this port right now: an
     /// AddPortMapping succeeded and its lease has not run out since. A
-    /// mapping that fails to renew stops being held when its lease ends.
+    /// mapping that fails to renew stops being held when its lease ends, and
+    /// one on a gateway that stopped answering searches when the forwarder
+    /// stops renewing it (see [`SEARCHES_MISSED_BEFORE_FORGOTTEN`]).
     pub held: bool,
     /// The control URLs of the gateway services holding the mapping; empty
     /// exactly when `held` is false.
@@ -683,10 +689,19 @@ impl Standing {
     }
 }
 
+/// What [`discovery`] tells the loop that manages gateways.
+enum Discovery {
+    /// A gateway answered the search under way.
+    Found(UpnpDiscoverResponse),
+    /// The search under way ran to its end. Every gateway that answered it
+    /// was sent as [`Self::Found`] before this.
+    SearchDone,
+}
+
 async fn discovery<G: Gateways>(
     gateways: &G,
     opts: &UpnpPortForwarderOptions,
-    tx: UnboundedSender<UpnpDiscoverResponse>,
+    tx: UnboundedSender<Discovery>,
     mut mapping_lost: UnboundedReceiver<()>,
     state: &watch::Sender<PortForwardingState>,
 ) {
@@ -699,7 +714,19 @@ async fn discovery<G: Gateways>(
 
     loop {
         let started = Instant::now();
-        let result = gateways.search(&tx).await;
+        // Answers are passed on as they come, then the end of the search,
+        // so the receiver can tell which managed gateways did not answer.
+        let (found_tx, mut found_rx) = unbounded_channel();
+        let searched = async move { gateways.search(&found_tx).await };
+        let forwarded = async {
+            while let Some(found) = found_rx.recv().await {
+                let _ = tx.send(Discovery::Found(found));
+            }
+        };
+        let (result, ()) = tokio::join!(searched, forwarded);
+        if result.is_ok() {
+            let _ = tx.send(Discovery::SearchDone);
+        }
         update_state(state, |s| {
             s.searched = true;
             match &result {
@@ -866,6 +893,23 @@ async fn manage_service<G: Gateways>(
     .await;
 }
 
+/// Completed searches in a row a gateway may leave unanswered before the
+/// forwarder stops renewing its mappings and forgets it, as it must after a
+/// move to another network, where the old gateway's control URL may belong
+/// to something else. One is not enough: SSDP is UDP, and a reply lost on
+/// the way is not a gateway gone. A forgotten gateway that answers again is
+/// managed again.
+const SEARCHES_MISSED_BEFORE_FORGOTTEN: u32 = 2;
+
+/// A gateway service whose mappings are being renewed.
+struct Managed {
+    /// The gateway's description URL, which its answers to searches name.
+    location: Url,
+    /// Completed searches in a row the gateway has not answered.
+    missed: u32,
+    stop: AbortHandle,
+}
+
 async fn run<G: Gateways>(
     ports: &[u16],
     opts: &UpnpPortForwarderOptions,
@@ -877,7 +921,10 @@ async fn run<G: Gateways>(
     let discovery = discovery(gateways, opts, discover_tx, mapping_lost_rx, state);
     let mut no_local_ip = Standing::default();
 
-    let mut spawned_tasks = HashSet::<Url>::new();
+    // By control URL.
+    let mut managed = HashMap::<Url, Managed>::new();
+    // The gateways that answered the search under way.
+    let mut answered = HashSet::<Url>::new();
 
     let mut endpoints = FuturesUnordered::new();
     let mut service_managers = FuturesUnordered::new();
@@ -887,13 +934,45 @@ async fn run<G: Gateways>(
     loop {
         tokio::select! {
             _ = &mut discovery => {},
-            r = discover_rx.recv() => {
-                let r = r.unwrap();
-                let location = r.location.clone();
-                endpoints.push(gateways.describe(r).map_err(|e| {
-                    debug!("error parsing endpoint: {e:#}");
-                    e
-                }).instrument(debug_span!("parse endpoint", location=location.to_string())));
+            r = discover_rx.recv() => match r.unwrap() {
+                Discovery::Found(r) => {
+                    answered.insert(r.location.clone());
+                    let location = r.location.clone();
+                    endpoints.push(gateways.describe(r).map_err(|e| {
+                        debug!("error parsing endpoint: {e:#}");
+                        e
+                    }).instrument(debug_span!("parse endpoint", location=location.to_string())));
+                },
+                Discovery::SearchDone => {
+                    let answered = std::mem::take(&mut answered);
+                    managed.retain(|control_url, m| {
+                        if answered.contains(&m.location) {
+                            m.missed = 0;
+                            return true;
+                        }
+                        m.missed += 1;
+                        if m.missed < SEARCHES_MISSED_BEFORE_FORGOTTEN {
+                            return true;
+                        }
+                        info!(
+                            "gateway at {} stopped answering searches; no longer renewing its mappings",
+                            m.location
+                        );
+                        m.stop.abort();
+                        let via = control_url.to_string();
+                        update_state(state, |s| {
+                            for p in &mut s.ports {
+                                p.held_via.retain(|v| *v != via);
+                                p.held = !p.held_via.is_empty();
+                                // Whatever it last said about this port is as gone as it is.
+                                if !p.held {
+                                    p.error = None;
+                                }
+                            }
+                        });
+                        false
+                    });
+                },
             },
             Some(Ok(gateway)) = endpoints.next(), if !endpoints.is_empty() => {
                 if gateway.services.is_empty() {
@@ -907,7 +986,7 @@ async fn run<G: Gateways>(
                     })
                 });
                 for service in gateway.services {
-                    if spawned_tasks.contains(&service.control_url) {
+                    if managed.contains_key(&service.control_url) {
                         debug!("already spawned for {}", service.control_url);
                         continue;
                     }
@@ -921,12 +1000,18 @@ async fn run<G: Gateways>(
                             break;
                         }
                     };
-                    spawned_tasks.insert(service.control_url.clone());
-                    let span = debug_span!("manage_service", url = %service.control_url);
-                    service_managers.push(
+                    let control_url = service.control_url.clone();
+                    let span = debug_span!("manage_service", url = %control_url);
+                    let (manager, stop) = abortable(
                         manage_service(gateways, service, ip, ports, opts, state, &mapping_lost_tx)
                             .instrument(span),
                     );
+                    managed.insert(control_url, Managed {
+                        location: gateway.location.clone(),
+                        missed: 0,
+                        stop,
+                    });
+                    service_managers.push(manager);
                 }
             },
             _ = service_managers.next(), if !service_managers.is_empty() => {
@@ -1036,6 +1121,8 @@ mod forwarder_tests {
         no_local_ip: AtomicBool,
         start: Instant,
         searches: Mutex<Vec<Duration>>,
+        /// How many AddPortMapping requests came in.
+        mappings: AtomicU64,
     }
 
     impl FakeRouter {
@@ -1049,6 +1136,7 @@ mod forwarder_tests {
                 no_local_ip: AtomicBool::new(false),
                 start: Instant::now(),
                 searches: Mutex::new(Vec::new()),
+                mappings: AtomicU64::new(0),
             }
         }
 
@@ -1102,6 +1190,7 @@ mod forwarder_tests {
             _port: u16,
             _lease_duration: Duration,
         ) -> anyhow::Result<()> {
+            self.mappings.fetch_add(1, Ordering::SeqCst);
             if self.hangs.load(Ordering::SeqCst) {
                 std::future::pending::<()>().await;
             }
@@ -1412,9 +1501,10 @@ mod forwarder_tests {
         with_forwarder(router, opts, |rx| async move {
             sleep_until_secs(router.start, 1).await;
             assert!(rx.borrow().port(PORT).unwrap().held);
-            // The gateway goes away: searches find nothing, renewals at 300
-            // and 600 fail, and the lease taken at 0 ends at 600.
-            router.present.store(false, Ordering::SeqCst);
+            // The network goes away: searches cannot be sent (so the gateway
+            // is not forgotten for not answering them), renewals at 300 and
+            // 600 fail, and the lease taken at 0 ends at 600.
+            router.search_fails.store(true, Ordering::SeqCst);
             router.accepts.store(false, Ordering::SeqCst);
             sleep_until_secs(router.start, 850).await;
             assert!(!rx.borrow().port(PORT).unwrap().held);
@@ -1549,6 +1639,108 @@ mod forwarder_tests {
         let infos = logs.at(tracing::Level::INFO);
         assert_eq!(infos.len(), 1, "{infos:?}");
         assert!(infos[0].starts_with("determined local IP"), "{infos:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gateway_that_stops_answering_two_searches_is_forgotten() {
+        let logs = Logs::default();
+        let _guard = logs.capture();
+        let router = &FakeRouter::new(true, true);
+        with_forwarder(router, Default::default(), |rx| async move {
+            sleep_until_secs(router.start, 1).await;
+            assert!(rx.borrow().port(PORT).unwrap().held);
+            // This network no longer has the router, though its control URL
+            // still takes renewals: another network with the same addresses.
+            router.present.store(false, Ordering::SeqCst);
+            // The searches at 60 and 120 go unanswered.
+            sleep_until_secs(router.start, 121).await;
+            let s = rx.borrow().clone();
+            let p = s.port(PORT).unwrap();
+            assert!(!p.held, "a forgotten gateway's mapping is not renewed");
+            assert!(p.held_via.is_empty());
+            assert_eq!(p.error, None);
+            assert_eq!(s.gateway, None);
+            let renewals = router.mappings.load(Ordering::SeqCst);
+            sleep_until_secs(router.start, 600).await;
+            assert_eq!(
+                router.mappings.load(Ordering::SeqCst),
+                renewals,
+                "a forgotten gateway is not asked again"
+            );
+        })
+        .await;
+        let infos = logs.at(tracing::Level::INFO);
+        assert_eq!(infos.len(), 1, "{infos:?}");
+        assert_eq!(
+            infos[0],
+            format!(
+                "gateway at {LOCATION} stopped answering searches; no longer renewing its mappings"
+            )
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forgotten_gateway_takes_its_refusal_with_it() {
+        let router = &FakeRouter::new(true, false);
+        with_forwarder(router, Default::default(), |rx| async move {
+            sleep_until_secs(router.start, 1).await;
+            assert!(rx.borrow().port(PORT).unwrap().error.is_some());
+            router.present.store(false, Ordering::SeqCst);
+            sleep_until_secs(router.start, 121).await;
+            // What a gateway that is gone said about the port is gone with it:
+            // a stale refusal would be read as the next network's answer.
+            let s = rx.borrow().clone();
+            assert_eq!(s.gateway, None);
+            assert_eq!(s.port(PORT).unwrap().error, None);
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_unanswered_search_keeps_the_gateway() {
+        let router = &FakeRouter::new(true, true);
+        with_forwarder(router, Default::default(), |rx| async move {
+            sleep_until_secs(router.start, 1).await;
+            // A reply lost on the way: the search at 60 goes unanswered.
+            router.present.store(false, Ordering::SeqCst);
+            sleep_until_secs(router.start, 61).await;
+            assert!(rx.borrow().port(PORT).unwrap().held);
+            // The one at 120 is answered, so the unanswered one at 180 is a
+            // first miss again, not a second.
+            router.present.store(true, Ordering::SeqCst);
+            sleep_until_secs(router.start, 121).await;
+            router.present.store(false, Ordering::SeqCst);
+            sleep_until_secs(router.start, 181).await;
+            let s = rx.borrow().clone();
+            let p = s.port(PORT).unwrap();
+            assert!(p.held);
+            assert_eq!(p.held_via, vec![CONTROL_URL.to_owned()]);
+            // The one at 240 is the second in a row.
+            sleep_until_secs(router.start, 241).await;
+            assert!(!rx.borrow().port(PORT).unwrap().held);
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forgotten_gateway_is_managed_again_when_it_answers() {
+        let router = &FakeRouter::new(true, true);
+        with_forwarder(router, Default::default(), |rx| async move {
+            sleep_until_secs(router.start, 1).await;
+            router.present.store(false, Ordering::SeqCst);
+            sleep_until_secs(router.start, 121).await;
+            assert!(!rx.borrow().port(PORT).unwrap().held);
+            // Back on the network. Discovery backed off to 120 s after the
+            // two unanswered searches, so the one at 240 finds it.
+            router.present.store(true, Ordering::SeqCst);
+            sleep_until_secs(router.start, 241).await;
+            let s = rx.borrow().clone();
+            assert!(s.gateway.is_some());
+            let p = s.port(PORT).unwrap();
+            assert!(p.held);
+            assert_eq!(p.held_via, vec![CONTROL_URL.to_owned()]);
+        })
+        .await
     }
 
     #[tokio::test]
