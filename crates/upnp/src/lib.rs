@@ -406,7 +406,11 @@ async fn search(
                         tx.send(r)?;
                         discovered += 1;
                     },
-                    Err(e) => warn!(response=?BStr::new(response), "failed to parse SSDP response: {e:#}"),
+                    // A device that answers the search with something that is
+                    // not a gateway's reply does so every search; a line a
+                    // minute about it is noise, and the state already says
+                    // whether a gateway was found.
+                    Err(e) => debug!(response=?BStr::new(response), "failed to parse SSDP response: {e:#}"),
                 };
             },
         }
@@ -1545,6 +1549,44 @@ mod forwarder_tests {
         let infos = logs.at(tracing::Level::INFO);
         assert_eq!(infos.len(), 1, "{infos:?}");
         assert!(infos[0].starts_with("determined local IP"), "{infos:?}");
+    }
+
+    #[tokio::test]
+    async fn reply_nobody_can_read_is_not_a_warning() {
+        let logs = Logs::default();
+        let _guard = logs.capture();
+        // Stands in for the multicast group: answers the first search with
+        // something that is not a gateway's reply.
+        let device = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let to = device.local_addr().unwrap();
+        let answer = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (_, from) = device.recv_from(&mut buf).await.unwrap();
+            device
+                .send_to(b"NOTIFY * HTTP/1.1\r\nNTS: ssdp:alive\r\n\r\n", from)
+                .await
+                .unwrap();
+        });
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let answered = crate::search(
+            &tx,
+            &crate::WAN_CONNECTION_SEARCH_TARGETS,
+            Duration::from_secs(2),
+            None,
+            to,
+        )
+        .await
+        .unwrap();
+        answer.await.unwrap();
+        assert_eq!(answered, 0);
+        let parse_failures = |level| {
+            logs.at(level)
+                .into_iter()
+                .filter(|m| m.starts_with("failed to parse SSDP response"))
+                .count()
+        };
+        assert_eq!(parse_failures(tracing::Level::WARN), 0);
+        assert_eq!(parse_failures(tracing::Level::DEBUG), 1);
     }
 }
 
