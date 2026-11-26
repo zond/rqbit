@@ -3736,12 +3736,16 @@ impl PeerHandler {
 
 /// Subtract up to `by` from `counter`, stopping at zero; returns how much was subtracted.
 fn sub_saturating(counter: &AtomicUsize, by: usize) -> usize {
-    counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            Some(current.saturating_sub(by))
-        })
-        .map(|previous| previous.min(by))
-        .unwrap_or(0)
+    // A loop of our own: `fetch_update` is deprecated from Rust 1.100 and its
+    // replacement is not in the oldest compiler this builds with.
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = current.saturating_sub(by);
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(previous) => return previous.min(by),
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 /// What [`TorrentStateLive::forget_disconnected_peers`] may drop: a parked peer, or a
