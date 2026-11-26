@@ -1,5 +1,6 @@
 mod e2e;
 mod e2e_another_local_client;
+mod e2e_have;
 mod e2e_padded_files;
 mod e2e_pause;
 mod e2e_peer_limit;
@@ -8,6 +9,7 @@ mod e2e_stream;
 mod e2e_thin_swarm;
 mod e2e_unadvertised_pieces;
 mod e2e_upload_switch;
+mod fake_peer;
 mod initial_check_pause;
 mod lock_order;
 mod port_forwarding;
